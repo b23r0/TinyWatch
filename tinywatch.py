@@ -26,12 +26,10 @@ import subprocess
 import sys
 import threading
 import time
-import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
 from datetime import datetime, timezone
-from http.client import HTTPException
 from http import HTTPStatus
 from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -46,6 +44,7 @@ MAX_BODY_BYTES = 1_000_000
 MAX_ASSETS = 16
 MAX_WIDGETS = 32
 HISTORY_INTERVAL = 60
+CLUSTER_CACHE_SECONDS = 5
 HISTORY_RETENTION_DEFAULT_DAYS = 7
 HISTORY_RETENTION_OPTIONS = (1, 3, 7, 14, 30)
 HISTORY_RETENTION_MAX = 30 * 24 * 60 * 60
@@ -57,6 +56,17 @@ SNAPSHOT_CACHE = {"sampled_at": 0.0, "data": None}
 STATE_LOCK = threading.RLock()
 SESSIONS = {}
 LOGIN_FAILURES = {}
+AUTH_STATE_LAST_CLEANUP = 0.0
+AUTH_STATE_CLEANUP_INTERVAL = 60
+MAX_ACTIVE_SESSIONS = 4096
+MAX_LOGIN_FAILURE_ADDRESSES = 4096
+SETUP_TOKEN = None
+SECURE_COOKIE = False
+CLUSTER_SNAPSHOT_LOCK = threading.Lock()
+CLUSTER_REFRESH_LOCK = threading.Lock()
+CLUSTER_SNAPSHOT_CACHE = {"sampled_at": 0.0, "data": None, "generation": 0}
+REMOTE_STATUS_LOCK = threading.Lock()
+REMOTE_LAST_SUCCESS = {}
 PREVIOUS = {"cpu": None, "processes": {}, "network_processes": {}, "interfaces": None, "sampled_at": None}
 TICKS_PER_SECOND = None
 PAGE_SIZE = 60
@@ -309,7 +319,8 @@ def _memory_snapshot():
         except (ValueError, OSError, AttributeError):
             pass
     return {"total": total, "used": used, "available": available,
-            "percent": round(100.0 * used / total, 1) if total else 0.0}
+            "percent": round(100.0 * used / total, 1) if total else 0.0,
+            "supported": bool(total)}
 
 
 def _disk_snapshot():
@@ -367,7 +378,8 @@ def _disk_snapshot():
     total = sum(item["total"] for item in unique_spaces.values())
     used = sum(item["used"] for item in unique_spaces.values())
     return {"partitions": result[:120], "total": total, "used": used,
-            "percent": round(100.0 * used / total, 1) if total else 0.0}
+            "percent": round(100.0 * used / total, 1) if total else 0.0,
+            "supported": bool(total)}
 
 
 def _linux_interfaces():
@@ -436,7 +448,7 @@ def _network_snapshot():
                            "rx_rate": round(rx_rate, 1), "tx_rate": round(tx_rate, 1)})
     PREVIOUS["interfaces"] = current
     PREVIOUS["sampled_at"] = now
-    return {"interfaces": interfaces,
+    return {"interfaces": interfaces, "supported": bool(current),
             "rx_rate": round(sum(item["rx_rate"] for item in interfaces), 1),
             "tx_rate": round(sum(item["tx_rate"] for item in interfaces), 1)}
 
@@ -839,33 +851,66 @@ def collect_snapshot():
         return data
 
 
+def _collect_safely(name, collector, fallback, errors):
+    """Keep one failing platform collector from taking down the full snapshot."""
+    try:
+        return collector()
+    except Exception as exc:
+        errors[name] = _safe_text(exc, 180) or "collector failed"
+        return fallback
+
+
 def _collect_snapshot_now():
-    """Collect current host metrics and return JSON-safe, bounded data."""
+    """Collect current host metrics and report independent collector failures."""
     with SAMPLE_LOCK:
-        cpu = _cpu_snapshot()
-        memory = _memory_snapshot()
-        disks = _disk_snapshot()
-        network = _network_snapshot()
-        load = _load_snapshot()
-        if platform.system().lower() == "windows" and not load:
+        errors = {}
+        logical_cores = os.cpu_count() or 1
+        cpu = _collect_safely("cpu", _cpu_snapshot,
+                              {"percent": 0.0, "available": False, "cores": [],
+                               "logical_cores": logical_cores}, errors)
+        memory = _collect_safely("memory", _memory_snapshot,
+                                 {"total": 0, "used": 0, "available": 0, "percent": 0.0,
+                                  "supported": False}, errors)
+        disks = _collect_safely("disk", _disk_snapshot,
+                                {"partitions": [], "total": 0, "used": 0, "percent": 0.0,
+                                 "supported": False}, errors)
+        network = _collect_safely("network", _network_snapshot,
+                                  {"interfaces": [], "rx_rate": 0.0, "tx_rate": 0.0,
+                                   "supported": False}, errors)
+        load = _collect_safely("load", _load_snapshot, [], errors)
+        if platform.system().lower() == "windows" and not load and cpu.get("available"):
             load = [round(cpu["percent"] / 100.0, 2)]
-        if platform.system().lower() == "linux":
-            processes = _processes_linux()
-        elif platform.system().lower() == "windows":
-            processes = _processes_windows()
-        else:
-            processes = _processes_other()
-        uname = platform.uname()
-        info = {"hostname": _safe_text(socket.gethostname(), 160), "cpu": _cpu_brand(),
-                "logical_cores": os.cpu_count() or 1, "memory_total": memory["total"],
-                "system": _safe_text(platform.platform(), 240), "os": _safe_text(uname.system, 80),
-                "release": _safe_text(uname.release, 120), "version": _safe_text(uname.version, 220),
-                "architecture": _safe_text(uname.machine, 80), "uptime_seconds": _uptime_seconds(),
-                "uptime": _format_uptime(_uptime_seconds()), "sessions": _sessions(),
-                "python": platform.python_version()}
+        system = platform.system().lower()
+        process_collector = (_processes_linux if system == "linux" else
+                             _processes_windows if system == "windows" else _processes_other)
+        processes = _collect_safely("processes", process_collector, [], errors)
+        logins = _collect_safely("logins", _login_events, [], errors)
+        dns = _collect_safely("dns", _dns_cache,
+                              {"source": "unavailable", "count": 0, "entries": []}, errors)
+
+        def collect_host_profile():
+            uname = platform.uname()
+            uptime_seconds = _uptime_seconds()
+            return {"hostname": _safe_text(socket.gethostname(), 160), "cpu": _cpu_brand(),
+                    "logical_cores": logical_cores, "memory_total": memory["total"],
+                    "system": _safe_text(platform.platform(), 240), "os": _safe_text(uname.system, 80),
+                    "release": _safe_text(uname.release, 120), "version": _safe_text(uname.version, 220),
+                    "architecture": _safe_text(uname.machine, 80), "uptime_seconds": uptime_seconds,
+                    "uptime": _format_uptime(uptime_seconds), "sessions": _sessions(),
+                    "python": platform.python_version()}
+
+        info = _collect_safely("info", collect_host_profile,
+                               {"hostname": "unknown", "cpu": "unavailable",
+                                "logical_cores": logical_cores, "memory_total": memory["total"],
+                                "system": "unavailable", "os": system or "unknown",
+                                "release": "unavailable", "version": "unavailable",
+                                "architecture": "unavailable", "uptime_seconds": 0,
+                                "uptime": "unavailable", "sessions": [],
+                                "python": platform.python_version()}, errors)
         return {"sampled_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                 "cpu": cpu, "memory": memory, "disk": disks, "network": network, "load": load,
-                "processes": processes, "logins": _login_events(), "dns": _dns_cache(), "info": info}
+                "processes": processes, "logins": logins, "dns": dns, "info": info,
+                "collector_errors": errors}
 
 
 def default_store_path():
@@ -1148,11 +1193,39 @@ class _RejectRedirectHandler(urllib.request.HTTPRedirectHandler):
         return None
 
 
+def _historical_last_success(asset_id):
+    """Recover a node's last successful sample time after a service restart."""
+    if STORE is None:
+        return None
+    with STORE.lock:
+        history = STORE.data.get("history", {})
+        series = history.get(asset_id, {}) if isinstance(history, dict) else {}
+        if not isinstance(series, dict):
+            return None
+        timestamps = [int(_number(point[0])) for points in series.values() if isinstance(points, list)
+                      for point in points if isinstance(point, list) and point and _number(point[0]) > 0]
+    if not timestamps:
+        return None
+    try:
+        return datetime.fromtimestamp(max(timestamps), timezone.utc).isoformat(timespec="seconds")
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
 def _remote_snapshot(asset):
+    asset_id = asset["id"]
+    last_success_at = None
+    with REMOTE_STATUS_LOCK:
+        previous = REMOTE_LAST_SUCCESS.get(asset_id)
+        if previous and previous.get("url") == asset["url"]:
+            last_success_at = previous.get("sampled_at")
+    if last_success_at is None:
+        last_success_at = _historical_last_success(asset_id)
     parsed = urllib.parse.urlsplit(asset["url"])
     if parsed.scheme != "https" and not _is_loopback_host(parsed.hostname):
-        return {"id": asset["id"], "name": asset["name"], "online": False,
-                "error": "远程资产必须使用 HTTPS；HTTP 仅限 localhost / 回环地址", "metrics": None}
+        return {"id": asset_id, "name": asset["name"], "online": False,
+                "error": "远程资产必须使用 HTTPS；HTTP 仅限 localhost / 回环地址",
+                "metrics": None, "last_success_at": last_success_at}
     endpoint = asset["url"].rstrip("/") + "/api/agent/metrics"
     request = urllib.request.Request(endpoint, headers={"X-TinyWatch-Token": asset["password"],
                                                         "Accept": "application/json", "User-Agent": "TinyWatch/" + APP_VERSION})
@@ -1163,13 +1236,28 @@ def _remote_snapshot(asset):
                 raise OSError("HTTP " + str(response.status))
             payload = response.read(2_000_000)
             data = json.loads(payload.decode("utf-8"))
-            if not isinstance(data, dict) or "info" not in data or "cpu" not in data:
+            required_objects = ("info", "cpu", "memory", "disk", "network")
+            if (not isinstance(data, dict)
+                    or any(not isinstance(data.get(key), dict) for key in required_objects)
+                    or not isinstance(data.get("load", []), list)
+                    or not isinstance(data["network"].get("interfaces", []), list)):
                 raise ValueError("invalid metric response")
-            return {"id": asset["id"], "name": asset["name"], "online": True, "metrics": data}
-    except (OSError, urllib.error.URLError, HTTPException, ValueError) as exc:
+            try:
+                sampled = datetime.fromisoformat(str(data.get("sampled_at", "")).replace("Z", "+00:00"))
+                if sampled.tzinfo is None:
+                    sampled = sampled.replace(tzinfo=timezone.utc)
+                last_success_at = sampled.astimezone(timezone.utc).isoformat(timespec="seconds")
+            except (TypeError, ValueError, OverflowError):
+                last_success_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            with REMOTE_STATUS_LOCK:
+                REMOTE_LAST_SUCCESS[asset_id] = {"url": asset["url"], "sampled_at": last_success_at}
+            return {"id": asset_id, "name": asset["name"], "online": True,
+                    "metrics": data, "last_success_at": last_success_at}
+    except Exception as exc:
         reason = getattr(exc, "reason", exc)
-        return {"id": asset["id"], "name": asset["name"], "online": False,
-                "error": _safe_text(reason, 140), "metrics": None}
+        return {"id": asset_id, "name": asset["name"], "online": False,
+                "error": _safe_text(reason, 140), "metrics": None,
+                "last_success_at": last_success_at}
 
 
 def _record_history(nodes, now=None):
@@ -1215,7 +1303,17 @@ def _record_history(nodes, now=None):
                 "network": [interfaces],
                 "load": [round(_number(value), 3) for value in load[:3]],
             }
+            collector_errors = metrics.get("collector_errors", {})
+            if not isinstance(collector_errors, dict):
+                collector_errors = {}
+            metric_available = {"cpu": cpu.get("available", True),
+                                "memory": memory.get("supported", True),
+                                "disk": disk.get("supported", True),
+                                "network": network.get("supported", True),
+                                "load": bool(load)}
             for metric, values in samples.items():
+                if metric in collector_errors or not metric_available.get(metric, True):
+                    continue
                 points = series.setdefault(metric, [])
                 if not isinstance(points, list):
                     points = series[metric] = []
@@ -1269,28 +1367,83 @@ def _history_response(node_id, metric, range_name, interface="", start=None, end
             "start": start, "end": end, "points": result}
 
 
-def collect_cluster_snapshot():
-    nodes = {"local": {"id": "local", "name": socket.gethostname(), "online": True, "metrics": collect_snapshot()}}
-    with STORE.lock:
-        assets = list(STORE.data.get("assets", []))[:MAX_ASSETS]
-    if assets:
-        with ThreadPoolExecutor(max_workers=min(8, len(assets))) as pool:
-            futures = [pool.submit(_remote_snapshot, item) for item in assets]
-            for future in as_completed(futures):
-                result = future.result()
-                nodes[result["id"]] = result
-    _record_history(nodes)
-    return {"nodes": nodes, "sampled_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+def _invalidate_cluster_snapshot():
+    with CLUSTER_SNAPSHOT_LOCK:
+        CLUSTER_SNAPSHOT_CACHE["sampled_at"] = 0.0
+        CLUSTER_SNAPSHOT_CACHE["data"] = None
+        CLUSTER_SNAPSHOT_CACHE["generation"] = CLUSTER_SNAPSHOT_CACHE.get("generation", 0) + 1
+
+
+def collect_cluster_snapshot(force_refresh=False):
+    """Return a short-lived cluster cache so browser polls do not fan out per request."""
+    with CLUSTER_SNAPSHOT_LOCK:
+        now = time.monotonic()
+        cached = CLUSTER_SNAPSHOT_CACHE["data"]
+        cache_age = now - CLUSTER_SNAPSHOT_CACHE["sampled_at"]
+        generation = CLUSTER_SNAPSHOT_CACHE.get("generation", 0)
+        if cached is not None and cache_age < CLUSTER_CACHE_SECONDS:
+            return cached
+
+    acquired = CLUSTER_REFRESH_LOCK.acquire(blocking=False)
+    if not acquired:
+        if cached is not None and not force_refresh:
+            # Keep serving the most recent snapshot while another poll refreshes it.
+            return cached
+        with CLUSTER_REFRESH_LOCK:
+            with CLUSTER_SNAPSHOT_LOCK:
+                refreshed = CLUSTER_SNAPSHOT_CACHE["data"]
+        if refreshed is None:
+            return collect_cluster_snapshot(force_refresh=force_refresh)
+        return refreshed
+
+    try:
+        # Recheck after taking the refresh lock; another request may have filled the cache.
+        with CLUSTER_SNAPSHOT_LOCK:
+            now = time.monotonic()
+            cached = CLUSTER_SNAPSHOT_CACHE["data"]
+            generation = CLUSTER_SNAPSHOT_CACHE.get("generation", 0)
+            if cached is not None and now - CLUSTER_SNAPSHOT_CACHE["sampled_at"] < CLUSTER_CACHE_SECONDS:
+                return cached
+        nodes = {"local": {"id": "local", "name": socket.gethostname(), "online": True,
+                            "metrics": collect_snapshot()}}
+        with STORE.lock:
+            assets = list(STORE.data.get("assets", []))[:MAX_ASSETS]
+        if assets:
+            with ThreadPoolExecutor(max_workers=min(8, len(assets))) as pool:
+                futures = [pool.submit(_remote_snapshot, item) for item in assets]
+                for future in as_completed(futures):
+                    result = future.result()
+                    nodes[result["id"]] = result
+        active_ids = {item["id"] for item in assets}
+        with REMOTE_STATUS_LOCK:
+            for asset_id in list(REMOTE_LAST_SUCCESS):
+                if asset_id not in active_ids:
+                    del REMOTE_LAST_SUCCESS[asset_id]
+        result = {"nodes": nodes, "sampled_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+        with CLUSTER_SNAPSHOT_LOCK:
+            if CLUSTER_SNAPSHOT_CACHE.get("generation", 0) == generation:
+                CLUSTER_SNAPSHOT_CACHE["sampled_at"] = time.monotonic()
+                CLUSTER_SNAPSHOT_CACHE["data"] = result
+        return result
+    finally:
+        CLUSTER_REFRESH_LOCK.release()
 
 
 def _history_sampler(stop_event):
     """Collect cluster metrics in the background while the service is running."""
+    next_sample_at = time.monotonic()
     while not stop_event.is_set():
         try:
-            collect_cluster_snapshot()
+            snapshot = collect_cluster_snapshot(force_refresh=True)
+            _record_history(snapshot["nodes"])
         except Exception as exc:
             sys.stderr.write("TinyWatch history sampler: %s\n" % _safe_text(exc, 180))
-        if stop_event.wait(HISTORY_INTERVAL):
+        next_sample_at += HISTORY_INTERVAL
+        delay = next_sample_at - time.monotonic()
+        if delay <= 0:
+            next_sample_at = time.monotonic()
+            delay = 0
+        if stop_event.wait(delay):
             break
 
 
@@ -1515,7 +1668,15 @@ TRANSLATION_ROWS.push(
   ['历史图表：横轴为本地时间，纵轴为指标数值。可用左右方向键查看采样点。','History chart: local time on the horizontal axis and metric values on the vertical axis. Use the arrow keys to inspect samples.','履歴グラフ：横軸は現地時間、縦軸は指標値です。左右の矢印キーでサンプルを確認できます。','Graphique historique : heure locale en abscisse, valeur en ordonnée. Utilisez les flèches pour parcourir les mesures.','График истории: местное время по горизонтали, значение метрики по вертикали. Стрелками можно просматривать точки.','Verlauf: Ortszeit auf der waagerechten, Messwerte auf der senkrechten Achse. Mit den Pfeiltasten Messpunkte prüfen.'],
   ['HTTPS required','HTTPS required','HTTPS が必要','HTTPS requis','Требуется HTTPS','HTTPS erforderlich'],
   ['远程节点必须使用有效的 HTTPS 证书；HTTP 仅适用于本机 localhost 或回环地址。','Remote nodes require a valid HTTPS certificate. HTTP is limited to localhost or loopback addresses.','リモートノードには有効な HTTPS 証明書が必要です。HTTP は localhost またはループバックアドレスに限ります。','Les nœuds distants exigent un certificat HTTPS valide. HTTP est réservé à localhost ou aux adresses de bouclage.','Для удалённых узлов требуется действительный сертификат HTTPS. HTTP разрешён только для localhost или loopback.','Entfernte Knoten benötigen ein gültiges HTTPS-Zertifikat. HTTP ist auf localhost oder Loopback-Adressen beschränkt.'],
-  ['远程资产必须使用 HTTPS；HTTP 仅限 localhost / 回环地址','Remote assets must use HTTPS; HTTP is allowed only for localhost / loopback addresses','リモート資産は HTTPS が必要です。HTTP は localhost / ループバックに限ります','Les équipements distants doivent utiliser HTTPS ; HTTP est réservé à localhost / loopback','Удалённые ресурсы должны использовать HTTPS; HTTP разрешён только для localhost / loopback','Entfernte Assets müssen HTTPS verwenden; HTTP ist nur für localhost / Loopback zulässig']
+  ['远程资产必须使用 HTTPS；HTTP 仅限 localhost / 回环地址','Remote assets must use HTTPS; HTTP is allowed only for localhost / loopback addresses','リモート資産は HTTPS が必要です。HTTP は localhost / ループバックに限ります','Les équipements distants doivent utiliser HTTPS ; HTTP est réservé à localhost / loopback','Удалённые ресурсы должны использовать HTTPS; HTTP разрешён только для localhost / loopback','Entfernte Assets müssen HTTPS verwenden; HTTP ist nur für localhost / Loopback zulässig'],
+  ['首次设置代码','One-time setup code','初回セットアップコード','Code de configuration initiale','Одноразовый код первоначальной настройки','Einmaliger Einrichtungscode'],
+  ['请输入启动 TinyWatch 的终端中显示的一次性代码。','Enter the one-time code shown in the terminal running TinyWatch.','TinyWatch を起動したターミナルに表示されるワンタイムコードを入力してください。','Saisissez le code à usage unique affiché dans le terminal où TinyWatch est lancé.','Введите одноразовый код, показанный в терминале TinyWatch.','Geben Sie den Einmalcode aus dem Terminal ein, in dem TinyWatch läuft.'],
+  ['输入一次性设置代码','Enter one-time setup code','ワンタイム設定コードを入力','Saisissez le code de configuration','Введите одноразовый код настройки','Einmaligen Einrichtungscode eingeben'],
+  ['首次设置代码无效或已过期','The setup code is invalid or has expired.','セットアップコードが無効か、有効期限が切れています。','Le code de configuration est invalide ou expiré.','Код настройки недействителен или срок его действия истёк.','Der Einrichtungscode ist ungültig oder abgelaufen.'],
+  ['最后成功采样','Last successful sample','最後に成功したサンプル','Dernier échantillon réussi','Последний успешный сбор','Letzte erfolgreiche Messung'],
+  ['指标暂不可用','Metric unavailable','メトリックを利用できません','Mesure indisponible','Метрика недоступна','Messwert nicht verfügbar'],
+  ['离线','Offline','オフライン','Hors ligne','Не в сети','Offline'],
+  ['尚未采样','Not sampled yet','まだサンプリングされていません','Pas encore mesuré','Ещё не собирались данные','Noch nicht erfasst']
 );
 const LANGUAGE_LOOKUP = new Map();
 for (const row of TRANSLATION_ROWS) LANGUAGE_LOOKUP.set(row[0], row);
@@ -1554,8 +1715,10 @@ function bindLanguageSelector() {
   select.onchange = () => {
     const password = document.getElementById('password');
     const password2 = document.getElementById('password2');
+    const setupToken = document.getElementById('setup-token');
     const savedPassword = password ? password.value : '';
     const savedPassword2 = password2 ? password2.value : '';
+    const savedSetupToken = setupToken ? setupToken.value : '';
     state.language = LANGUAGE_NAMES[select.value] ? select.value : 'en';
     try { localStorage.setItem('tinywatch.language', state.language); } catch (error) { /* private mode */ }
     document.documentElement.lang = state.language;
@@ -1564,8 +1727,10 @@ function bindLanguageSelector() {
       authScreen(state.setup);
       const nextPassword = document.getElementById('password');
       const nextPassword2 = document.getElementById('password2');
+      const nextSetupToken = document.getElementById('setup-token');
       if (nextPassword) nextPassword.value = savedPassword;
       if (nextPassword2) nextPassword2.value = savedPassword2;
+      if (nextSetupToken) nextSetupToken.value = savedSetupToken;
     }
   };
 }
@@ -1581,11 +1746,11 @@ function toast(text){const el=document.getElementById('toast');el.textContent=tr
 function setTheme(theme){document.documentElement.dataset.theme=theme||'dark'}
 function authScreen(isSetup){
   state.setup=isSetup;
-  app.innerHTML='<div class="auth-wrap"><section class="auth-card"><div class="auth-tools">'+languageSelector()+'</div><div class="brand" style="padding:0"><div class="brand-mark">◈</div><div><strong>TinyWatch</strong><small>INFRASTRUCTURE CONSOLE</small></div></div><h1>'+(isSetup?'建立管理员密码':'欢迎回来')+'</h1><p>'+(isSetup?'首次使用，请设置用于此控制台的密码。':'登录后查看主机与网络资产指标。')+'</p><form id="auth-form"><div class="field"><label>管理员密码</label><input id="password" type="password" autocomplete="'+(isSetup?'new-password':'current-password')+'" required minlength="'+(isSetup?'10':'1')+'" autofocus placeholder="'+(isSetup?'至少 10 个字符':'输入密码')+'"></div>'+(isSetup?'<div class="field"><label>确认密码</label><input id="password2" type="password" autocomplete="new-password" required minlength="10" placeholder="再次输入密码"></div>':'')+'<div id="auth-error" class="error-message"></div><button class="button primary" type="submit">'+(isSetup?'设置密码并继续':'登录控制台')+'</button></form><div class="login-note">密码使用 PBKDF2-SHA256 加盐存储在本机 JSON 数据库中。</div></section></div>';
+  app.innerHTML='<div class="auth-wrap"><section class="auth-card"><div class="auth-tools">'+languageSelector()+'</div><div class="brand" style="padding:0"><div class="brand-mark">◈</div><div><strong>TinyWatch</strong><small>INFRASTRUCTURE CONSOLE</small></div></div><h1>'+(isSetup?'建立管理员密码':'欢迎回来')+'</h1><p>'+(isSetup?'首次使用，请设置用于此控制台的密码。':'登录后查看主机与网络资产指标。')+'</p><form id="auth-form">'+(isSetup?'<div class="field"><label>首次设置代码</label><input id="setup-token" type="password" autocomplete="off" required placeholder="输入一次性设置代码"><div class="helper">请使用启动 TinyWatch 的终端中显示的一次性代码。</div></div>':'')+'<div class="field"><label>管理员密码</label><input id="password" type="password" autocomplete="'+(isSetup?'new-password':'current-password')+'" required minlength="'+(isSetup?'10':'1')+'" autofocus placeholder="'+(isSetup?'至少 10 个字符':'输入密码')+'"></div>'+(isSetup?'<div class="field"><label>确认密码</label><input id="password2" type="password" autocomplete="new-password" required minlength="10" placeholder="再次输入密码"></div>':'')+'<div id="auth-error" class="error-message"></div><button class="button primary" type="submit">'+(isSetup?'设置密码并继续':'登录控制台')+'</button></form><div class="login-note">密码使用 PBKDF2-SHA256 加盐存储在本机 JSON 数据库中。</div></section></div>';
   document.documentElement.lang=state.language;
   localizeDOM(app);
   bindLanguageSelector();
-  document.getElementById('auth-form').onsubmit=async e=>{e.preventDefault();const p=document.getElementById('password').value;try{if(isSetup&&p!==document.getElementById('password2').value)throw new Error('两次输入的密码不一致');await api(isSetup?'/api/setup':'/api/login','POST',{password:p});await enterApp()}catch(err){document.getElementById('auth-error').textContent=tr(err.message)}};
+  document.getElementById('auth-form').onsubmit=async e=>{e.preventDefault();const p=document.getElementById('password').value;try{if(isSetup&&p!==document.getElementById('password2').value)throw new Error('两次输入的密码不一致');const payload={password:p};if(isSetup)payload.setup_token=document.getElementById('setup-token').value;await api(isSetup?'/api/setup':'/api/login','POST',payload);await enterApp()}catch(err){document.getElementById('auth-error').textContent=tr(err.message)}};
 }
 async function boot(){
   try{const status=await api('/api/status');if(status.authenticated)await enterApp();else authScreen(status.setup_required)}
@@ -1680,7 +1845,7 @@ function draw(){
   document.getElementById('panel-title').textContent=tr('自定义监控面板');
   document.getElementById('panel-description').textContent=tr('拖拽卡片调整布局 · 数据每 2.5 秒更新');
   document.getElementById('side-host')?.remove();
-  overview.innerHTML='<article class="stat"><div class="stat-label">CPU 使用率 <span class="tag good">'+metricsLocal.cpu.logical_cores+' 核</span></div><div class="stat-value">'+(metricsLocal.cpu.available?metricsLocal.cpu.percent:'—')+'<small>'+(metricsLocal.cpu.available?'%':'')+'</small></div><div class="stat-foot">'+(metricsLocal.cpu.cores.length?'每核心采样正常':(metricsLocal.cpu.available?'聚合采样':'当前系统未公开 CPU 计数'))+'</div></article><article class="stat"><div class="stat-label">内存使用 <span>RAM</span></div><div class="stat-value">'+fmtBytes(metricsLocal.memory.used)+'</div><div class="stat-foot">共 '+fmtBytes(metricsLocal.memory.total)+' · '+metricsLocal.memory.percent+'%</div></article><article class="stat"><div class="stat-label">网络资产 <span class="tag good">在线</span></div><div class="stat-value">'+alive+'<small> / '+total+'</small></div><div class="stat-foot">含本地节点与已配置资产</div></article><article class="stat"><div class="stat-label">系统运行时长 <span>UPTIME</span></div><div class="stat-value" style="font-size:22px">'+esc(metricsLocal.info.uptime)+'</div><div class="stat-foot">'+esc(metricsLocal.info.os)+' '+esc(metricsLocal.info.release)+'</div></article>';
+  overview.innerHTML='<article class="stat"><div class="stat-label">CPU 使用率 <span class="tag good">'+metricsLocal.cpu.logical_cores+' 核</span></div><div class="stat-value">'+(metricsLocal.cpu.available?metricsLocal.cpu.percent:'—')+'<small>'+(metricsLocal.cpu.available?'%':'')+'</small></div><div class="stat-foot">'+(metricsLocal.cpu.cores.length?'每核心采样正常':(metricsLocal.cpu.available?'聚合采样':'当前系统未公开 CPU 计数'))+'</div></article><article class="stat"><div class="stat-label">内存使用 <span>RAM</span></div><div class="stat-value">'+(metricsLocal.memory.supported===false?'—':fmtBytes(metricsLocal.memory.used))+'</div><div class="stat-foot">'+(metricsLocal.memory.supported===false?tr('指标暂不可用'):'共 '+fmtBytes(metricsLocal.memory.total)+' · '+metricsLocal.memory.percent+'%')+'</div></article><article class="stat"><div class="stat-label">网络资产 <span class="tag good">在线</span></div><div class="stat-value">'+alive+'<small> / '+total+'</small></div><div class="stat-foot">含本地节点与已配置资产</div></article><article class="stat"><div class="stat-label">系统运行时长 <span>UPTIME</span></div><div class="stat-value" style="font-size:22px">'+esc(metricsLocal.info.uptime)+'</div><div class="stat-foot">'+esc(metricsLocal.info.os)+' '+esc(metricsLocal.info.release)+'</div></article>';
   localizeDOM(overview);
   const assets=[{id:'local',name:metricsLocal.info.hostname}].concat(state.config.assets||[]);
   const widgets=(state.config.widgets||[]).filter(widget=>widget.metric!=='info');
@@ -1704,10 +1869,21 @@ function draw(){
 function widgetCard(widget,node,asset){
   const title=metrics[widget.metric]||['监控','◈'];let content='';
   if(!node)content='<div class="asset-error">节点暂不可用，检查资产地址、网络和代理令牌。</div>';
-  else if(!node.online)content='<div class="asset-error">离线 · '+esc(node.error||'无法连接')+'</div>';
+  else if(!node.online){
+    const lastSuccess=node.last_success_at?new Date(node.last_success_at):null;
+    const lastSuccessText=lastSuccess&&Number.isFinite(lastSuccess.getTime())?'<div class="metric-sub">'+tr('最后成功采样')+': '+esc(lastSuccess.toLocaleString(LANGUAGE_LOCALE[state.language]||'en-US'))+'</div>':'';
+    content='<div class="asset-error">离线 · '+esc(node.error||'无法连接')+lastSuccessText+'</div>';
+  }
   else{
     const metric=node.metrics;
-    switch(widget.metric){
+    const collectorError=metric.collector_errors&&metric.collector_errors[widget.metric];
+    const unsupported=(widget.metric==='memory'&&metric.memory.supported===false)||
+      (widget.metric==='disk'&&metric.disk.supported===false)||
+      (widget.metric==='network'&&metric.network.supported===false)||
+      (widget.metric==='load'&&(!metric.load||!metric.load.length));
+    if(collectorError)content='<div class="asset-error">'+tr('指标暂不可用')+': '+esc(collectorError)+'</div>';
+    else if(unsupported)content='<div class="empty">'+tr('指标暂不可用')+'</div>';
+    else switch(widget.metric){
       case'cpu':content=cpuCard(metric,widget.node);break;case'memory':content=memoryCard(metric.memory,widget.node);break;
       case'network':content=networkCard(metric,widget);break;case'disk':content=diskCard(metric,widget);break;
       case'load':content=loadCard(metric,widget.node);break;case'processes':content=processCard(metric);break;
@@ -1728,6 +1904,7 @@ function cpuCard(metric,node){
   return '<div class="big-value">'+(metric.cpu.available?metric.cpu.percent:'—')+'<small>'+(metric.cpu.available?'% utilization':'')+'</small></div><div class="metric-sub">'+(cores.length?'逻辑核心实时占用':(metric.cpu.available?'聚合 CPU 计数':'当前平台未提供兼容的 CPU 计数接口'))+'</div>'+sparkline(history,'cpu')+(bars?'<div class="core-grid">'+bars+'</div>':'');
 }
 function memoryCard(memory,node){
+  if(memory.supported===false)return '<div class="empty">'+tr('指标暂不可用')+'</div>';
   const history=historyChartData(node,'memory','');
   return '<div class="big-value">'+fmtBytes(memory.used)+'<small> / '+fmtBytes(memory.total)+'</small></div><div class="metric-sub">可用 '+fmtBytes(memory.available)+' · '+memory.percent+'%</div><div class="track" style="height:8px;margin-top:16px"><span style="width:'+pct(memory.percent)+'%"></span></div>'+sparkline(history,'memory');
 }
@@ -1822,7 +1999,7 @@ function showHistoryRange(node,metric,iface){
 function processCard(m){const rows=(m.processes||[]).slice(0,8);return rows.length?'<div style="overflow:auto"><table class="data-table"><thead><tr><th>进程</th><th>PID</th><th>CPU</th><th>内存</th><th>网络 ↓ / ↑</th></tr></thead><tbody>'+rows.map(p=>'<tr><td title="'+esc(p.name)+'">'+esc(p.name)+'</td><td>'+p.pid+'</td><td>'+p.cpu+'%</td><td>'+fmtBytes(p.memory)+'</td><td>'+(p.network_supported?fmtBytes(p.network_rx_rate||0)+'/s · '+fmtBytes(p.network_tx_rate||0)+'/s':(p.network_connections==null?'—':p.network_connections+' sockets'))+'</td></tr>').join('')+'</tbody></table></div><div class="notice">Linux 在存在 ss 命令且有权限时显示 TCP 收发速率；其他平台显示进程套接字数（若可读取）。标准库接口不提供跨平台的逐进程网络字节计数。</div>':'<div class="empty">未能读取进程信息，可能需要提升服务权限。</div>'}
 function loginCard(m){const rows=(m.logins||[]).slice(0,7);return rows.length?'<div>'+rows.map(x=>'<div class="disk-line"><span class="tag '+(/accepted|opened|success|4624/i.test(x.message)?'good':'bad')+'">'+esc(x.kind)+'</span><span style="flex:1;margin-left:9px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="'+esc(x.message)+'">'+esc(x.message)+'</span></div>').join('')+'</div><div class="notice">按系统日志权限读取 SSH、RDP（3389）和远程登录事件。</div>':'<div class="empty">当前没有可读取的 SSH / RDP 登录事件。日志可能需要更高权限或相应服务。</div>'}
 function dnsCard(m){const rows=(m.dns.entries||[]).slice(0,6);return '<div class="big-value">'+(m.dns.count||0)+'<small> 条目</small></div><div class="metric-sub">来源：'+esc(m.dns.source||'系统 DNS 缓存')+'</div>'+(rows.length?rows.map(x=>'<div class="disk-line"><span>'+esc(x.name)+'</span><span>'+esc(x.value||x.type||'')+'</span></div>').join(''):'<div class="empty">系统未公开 DNS 缓存详情。</div>')}
-function infoCard(m){const x=m.info;return '<div class="info-grid"><div class="info-item"><label>主机名</label><strong>'+esc(x.hostname)+'</strong></div><div class="info-item"><label>处理器</label><strong>'+esc(x.cpu)+' · '+x.logical_cores+' 核</strong></div><div class="info-item"><label>系统版本</label><strong>'+esc(x.system)+'</strong></div><div class="info-item"><label>内核版本</label><strong>'+esc(x.release)+' · '+esc(x.architecture)+'</strong></div><div class="info-item"><label>物理内存</label><strong>'+fmtBytes(x.memory_total)+'</strong></div><div class="info-item"><label>系统运行时长</label><strong>'+esc(x.uptime)+'</strong></div><div class="info-item" style="grid-column:1/-1"><label>当前会话</label><strong>'+esc((x.sessions||[]).join(' · ')||'无活动终端会话或当前账户无读取权限')+'</strong></div></div>'}
+function infoCard(m){const x=m.info;return '<div class="info-grid"><div class="info-item"><label>主机名</label><strong>'+esc(x.hostname)+'</strong></div><div class="info-item"><label>处理器</label><strong>'+esc(x.cpu)+' · '+x.logical_cores+' 核</strong></div><div class="info-item"><label>系统版本</label><strong>'+esc(x.system)+'</strong></div><div class="info-item"><label>内核版本</label><strong>'+esc(x.release)+' · '+esc(x.architecture)+'</strong></div><div class="info-item"><label>物理内存</label><strong>'+(x.memory_total?fmtBytes(x.memory_total):'—')+'</strong></div><div class="info-item"><label>系统运行时长</label><strong>'+esc(x.uptime)+'</strong></div><div class="info-item" style="grid-column:1/-1"><label>当前会话</label><strong>'+esc((x.sessions||[]).join(' · ')||'无活动终端会话或当前账户无读取权限')+'</strong></div></div>'}
 function chartAxisMaximum(value){
   const rawStep=Math.max(value,0.000001)/4;
   const magnitude=Math.pow(10,Math.floor(Math.log10(rawStep)));
@@ -2021,9 +2198,15 @@ function showSettings(){
 }
 function showAssets(){
   const assets=state.config.assets||[];
-  const rows=assets.map(asset=>'<div class="disk-line"><span><strong>'+esc(asset.name)+'</strong> '+
-    (asset.secure_transport?'':'<span class="tag bad">'+tr('HTTPS required')+'</span>')+
-    '<div class="metric-sub">'+esc(asset.url)+'</div></span><button class="button danger" data-remove="'+esc(asset.id)+'">移除</button></div>').join('');
+  const rows=assets.map(asset=>{
+    const node=nodeFor(asset.id),lastSuccess=node&&node.last_success_at?new Date(node.last_success_at):null;
+    const stateLabel=node?tr(node.online?'在线':'离线'):tr('尚未采样');
+    const status=node?'<span class="tag '+(node.online?'good':'bad')+'">'+stateLabel+'</span>':'<span class="tag">'+stateLabel+'</span>';
+    const sample=lastSuccess&&Number.isFinite(lastSuccess.getTime())?'<div class="metric-sub">'+tr('最后成功采样')+': '+esc(lastSuccess.toLocaleString(LANGUAGE_LOCALE[state.language]||'en-US'))+'</div>':'';
+    return '<div class="disk-line"><span><strong>'+esc(asset.name)+'</strong> '+status+
+      (asset.secure_transport?'':' <span class="tag bad">'+tr('HTTPS required')+'</span>')+
+      '<div class="metric-sub">'+esc(asset.url)+'</div>'+sample+'</span><button class="button danger" data-remove="'+esc(asset.id)+'">移除</button></div>';
+  }).join('');
   modal('<header class="modal-head"><div><h3>网络资产</h3><div class="helper">配置远程 TinyWatch 节点。每个节点需在“代理令牌”处填入目标主机生成的令牌。</div></div><button class="close" data-close>×</button></header><div>'+rows+'</div><form id="asset-form" style="margin-top:16px"><div class="form-grid"><div class="field"><label>资产名称</label><input id="asset-name" required maxlength="80" placeholder="例如：edge-node-01"></div><div class="field"><label>服务地址</label><input id="asset-url" required placeholder="https://node.example:8765"></div><div class="field full"><label>代理令牌</label><input id="asset-password" required autocomplete="off" placeholder="在目标节点设置页复制代理令牌"></div></div><div class="helper">'+tr('远程节点必须使用有效的 HTTPS 证书；HTTP 仅适用于本机 localhost 或回环地址。')+'</div><div class="error-message" id="asset-error"></div><div class="modal-actions"><button class="button primary">添加资产</button></div></form><div class="helper">本机代理令牌（复制到其他节点的资产配置中）：<br><code style="overflow-wrap:anywhere">'+esc(state.config.agent_token)+'</code></div>');
   document.getElementById('asset-form').onsubmit=async event=>{
     event.preventDefault();
@@ -2055,12 +2238,56 @@ def _session_from_request(handler):
         return False
     now = time.time()
     with STATE_LOCK:
+        _cleanup_auth_state(now)
         expiry = SESSIONS.get(token, 0)
         if expiry <= now:
             SESSIONS.pop(token, None)
             return False
         SESSIONS[token] = now + 12 * 60 * 60
     return True
+
+
+def _cleanup_auth_state(now=None):
+    """Bound in-memory authentication state and discard expired entries."""
+    global AUTH_STATE_LAST_CLEANUP
+    now = time.time() if now is None else now
+    if now - AUTH_STATE_LAST_CLEANUP < AUTH_STATE_CLEANUP_INTERVAL:
+        return
+    for token, expiry in list(SESSIONS.items()):
+        if expiry <= now:
+            SESSIONS.pop(token, None)
+    for address, failures in list(LOGIN_FAILURES.items()):
+        recent = [stamp for stamp in failures if now - stamp < 60]
+        if recent:
+            LOGIN_FAILURES[address] = recent
+        else:
+            LOGIN_FAILURES.pop(address, None)
+    if len(SESSIONS) > MAX_ACTIVE_SESSIONS:
+        oldest = sorted(SESSIONS.items(), key=lambda item: item[1])
+        for token, _ in oldest[:len(SESSIONS) - MAX_ACTIVE_SESSIONS]:
+            SESSIONS.pop(token, None)
+    if len(LOGIN_FAILURES) > MAX_LOGIN_FAILURE_ADDRESSES:
+        oldest = sorted(LOGIN_FAILURES, key=lambda address: max(LOGIN_FAILURES[address]))
+        for address in oldest[:len(LOGIN_FAILURES) - MAX_LOGIN_FAILURE_ADDRESSES]:
+            LOGIN_FAILURES.pop(address, None)
+    AUTH_STATE_LAST_CLEANUP = now
+
+
+def _remember_login_failure(address, now):
+    """Record a failure without allowing distinct source addresses to grow unbounded."""
+    if address not in LOGIN_FAILURES and len(LOGIN_FAILURES) >= MAX_LOGIN_FAILURE_ADDRESSES:
+        LOGIN_FAILURES.pop(next(iter(LOGIN_FAILURES)), None)
+    LOGIN_FAILURES.setdefault(address, []).append(now)
+
+
+def _setup_token_matches(supplied):
+    return bool(SETUP_TOKEN and isinstance(supplied, str)
+                and secrets.compare_digest(supplied, SETUP_TOKEN))
+
+
+def _session_cookie(token, max_age):
+    cookie = "tw_session=%s; Path=/; HttpOnly; SameSite=Strict; Max-Age=%d" % (token, max_age)
+    return cookie + ("; Secure" if SECURE_COOKIE else "")
 
 
 def _agent_authorized(handler):
@@ -2179,6 +2406,7 @@ class TinyWatchHandler(BaseHTTPRequestHandler):
         self._json(HTTPStatus.NOT_FOUND, {"error": "未找到"})
 
     def do_POST(self):
+        global SETUP_TOKEN
         path = urllib.parse.urlsplit(self.path).path
         try:
             value = self._read_json()
@@ -2191,8 +2419,8 @@ class TinyWatchHandler(BaseHTTPRequestHandler):
                 if STORE.data.get("password") is not None:
                     self._json(HTTPStatus.CONFLICT, {"error": "管理员密码已设置"})
                     return
-                if not self.client_address or self.client_address[0] not in ("127.0.0.1", "::1"):
-                    self._json(HTTPStatus.FORBIDDEN, {"error": "首次设置必须在运行 TinyWatch 的主机上通过 localhost 完成"})
+                if not _setup_token_matches(value.get("setup_token")):
+                    self._json(HTTPStatus.FORBIDDEN, {"error": "首次设置代码无效或已过期"})
                     return
                 password = value.get("password")
                 if not isinstance(password, str) or len(password) < 10:
@@ -2203,6 +2431,7 @@ class TinyWatchHandler(BaseHTTPRequestHandler):
                     return
                 STORE.data["password"] = _password_hash(password)
                 STORE.save()
+                SETUP_TOKEN = None
             self._create_session()
             return
 
@@ -2210,8 +2439,12 @@ class TinyWatchHandler(BaseHTTPRequestHandler):
             address = self.client_address[0] if self.client_address else "unknown"
             now = time.time()
             with STATE_LOCK:
+                _cleanup_auth_state(now)
                 recent = [stamp for stamp in LOGIN_FAILURES.get(address, []) if now - stamp < 60]
-                LOGIN_FAILURES[address] = recent
+                if recent:
+                    LOGIN_FAILURES[address] = recent
+                else:
+                    LOGIN_FAILURES.pop(address, None)
                 if len(recent) >= 8:
                     self._json(HTTPStatus.TOO_MANY_REQUESTS, {"error": "登录尝试过多，请一分钟后再试"})
                     return
@@ -2222,7 +2455,7 @@ class TinyWatchHandler(BaseHTTPRequestHandler):
                 return
             if not isinstance(password, str) or len(password) > 1024 or not _password_matches(password, record):
                 with STATE_LOCK:
-                    LOGIN_FAILURES.setdefault(address, []).append(now)
+                    _remember_login_failure(address, now)
                 self._json(HTTPStatus.UNAUTHORIZED, {"error": "密码不正确"})
                 return
             with STATE_LOCK:
@@ -2243,7 +2476,7 @@ class TinyWatchHandler(BaseHTTPRequestHandler):
                         SESSIONS.pop(morsel.value, None)
             except (ValueError, Exception):
                 pass
-            self._json(HTTPStatus.OK, {"ok": True}, {"Set-Cookie": "tw_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0"})
+            self._json(HTTPStatus.OK, {"ok": True}, {"Set-Cookie": _session_cookie("", 0)})
             return
         if path == "/api/config":
             try:
@@ -2258,8 +2491,12 @@ class TinyWatchHandler(BaseHTTPRequestHandler):
     def _create_session(self):
         token = secrets.token_urlsafe(32)
         with STATE_LOCK:
+            _cleanup_auth_state()
+            if len(SESSIONS) >= MAX_ACTIVE_SESSIONS:
+                oldest = min(SESSIONS, key=SESSIONS.get)
+                SESSIONS.pop(oldest, None)
             SESSIONS[token] = time.time() + 12 * 60 * 60
-        self._json(HTTPStatus.OK, {"ok": True}, {"Set-Cookie": "tw_session=" + token + "; Path=/; HttpOnly; SameSite=Strict; Max-Age=43200"})
+        self._json(HTTPStatus.OK, {"ok": True}, {"Set-Cookie": _session_cookie(token, 43200)})
 
     def _save_config(self, value):
         raw_assets = value.get("assets", [])
@@ -2327,6 +2564,7 @@ class TinyWatchHandler(BaseHTTPRequestHandler):
             pruned = _prune_history_database(STORE.data, retention_cutoff)
             backup_retention_days = retention_days if pruned or previous_retention_days != retention_days else None
             STORE.save(backup_retention_days=backup_retention_days)
+        _invalidate_cluster_snapshot()
 
 
 class TinyWatchServer(ThreadingHTTPServer):
@@ -2339,13 +2577,17 @@ def main(argv=None):
     parser.add_argument("--host", default="127.0.0.1", help="listen address; use 0.0.0.0 for LAN access")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="HTTP listening port (default: %(default)s)")
     parser.add_argument("--data", default=str(default_store_path()), help="JSON database path (default: ~/.tinywatch/data.json)")
+    parser.add_argument("--secure-cookie", action="store_true",
+                        help="mark session cookies Secure when HTTPS is terminated by a trusted proxy")
     parser.add_argument("--version", action="version", version=APP_NAME + " " + APP_VERSION)
     args = parser.parse_args(argv)
     if not 0 <= args.port <= 65535:
         parser.error("--port must be between 0 and 65535")
-    global STORE
+    global STORE, SETUP_TOKEN, SECURE_COOKIE
     try:
         STORE = JsonStore(args.data)
+        SETUP_TOKEN = secrets.token_urlsafe(24) if STORE.data.get("password") is None else None
+        SECURE_COOKIE = bool(args.secure_cookie)
         server = TinyWatchServer((args.host, args.port), TinyWatchHandler)
     except (OSError, ValueError) as exc:
         parser.error(str(exc))
@@ -2356,6 +2598,11 @@ def main(argv=None):
     display_host = "127.0.0.1" if args.host in ("0.0.0.0", "::") else args.host
     print("%s %s listening on http://%s:%d" % (APP_NAME, APP_VERSION, display_host, actual_port))
     print("JSON database: %s" % STORE.path)
+    if SETUP_TOKEN:
+        print("One-time first-run setup code: " + SETUP_TOKEN)
+        print("Enter this code in the setup page. It expires when TinyWatch stops.")
+    if SECURE_COOKIE:
+        print("Secure session cookies enabled; access this instance through HTTPS.")
     if args.host in ("0.0.0.0", "::"):
         print("LAN mode enabled; protect access with a firewall and use HTTPS via a trusted reverse proxy.")
     history_stop = threading.Event()

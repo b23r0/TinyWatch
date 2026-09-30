@@ -35,7 +35,7 @@ TinyWatch is a self-hosted monitoring console for small servers, home labs, and 
 | **Host profile** | Host name, processor, memory, OS and kernel versions, uptime, and current sessions |
 | **History** | Local one-minute samples, date/time range selection, peak-preserving charts, visible gaps, and keyboard/touch inspection |
 
-The dashboard refreshes live metrics every **2.5 seconds**. Historical samples are written every **60 seconds**. Charts preserve short peaks when reducing large histories, show gaps when collection pauses, and expose a crosshair with keyboard and touch inspection. Network tooltips show receive and transmit rates. The status indicator reports stale or failed refreshes.
+The dashboard refreshes live metrics every **2.5 seconds**. A server-side sampler writes historical samples every **60 seconds**, even while the dashboard is closed. Browser refreshes reuse a short-lived cluster snapshot, and each remote asset reports when its metrics were last collected successfully. Charts preserve short peaks when reducing large histories, show gaps when collection pauses, and expose a crosshair with keyboard and touch inspection.
 
 ## 🧭 A small architecture, by design
 
@@ -72,7 +72,7 @@ python3 tinywatch.py
 py -3 tinywatch.py
 ```
 
-Open **http://127.0.0.1:8765/** in a browser. On first launch, create an administrator password (at least 10 characters). No `pip install`, build step, or external frontend download is required.
+Open **http://127.0.0.1:8765/** in a browser. On first launch, TinyWatch prints a one-time setup code in the server terminal. Enter that code and create an administrator password (at least 10 characters). The code is discarded after setup or when the server stops. No `pip install`, build step, or external frontend download is required.
 
 ### 3. Make it yours
 
@@ -99,6 +99,7 @@ The central server requests `GET /api/agent/metrics` from each remote host and s
 | `--host` | `127.0.0.1` | Address to listen on. Use `0.0.0.0` only when remote access is intended and firewalled. |
 | `--port` | `8765` | HTTP listening port. |
 | `--data` | `~/.tinywatch/data.json` | Path to the local JSON database. |
+| `--secure-cookie` | Off | Add the `Secure` flag to session cookies when a trusted reverse proxy serves TinyWatch over HTTPS. |
 | `--version` | — | Print the TinyWatch version and exit. |
 
 Examples:
@@ -111,16 +112,16 @@ python3 tinywatch.py --port 9000 --data ./tinywatch-data.json
 python3 tinywatch.py --host 0.0.0.0 --port 8765
 ```
 
-The data path can also be set with the `TINYWATCH_DATA` environment variable. Command-line `--data` takes precedence.
+The data path can also be set with the `TINYWATCH_DATA` environment variable. Command-line `--data` takes precedence. When terminating TLS at a trusted reverse proxy, run TinyWatch with `--secure-cookie` and keep the backend bound to localhost.
 
 ## 🔐 Security & privacy
 
-- TinyWatch binds to **localhost by default**. First-time password setup is accepted only through localhost.
+- TinyWatch binds to **localhost by default**. First-time password setup requires a random one-time code printed to the server terminal; it is never returned by the API and is invalidated after setup or restart. This also protects setup when a same-host reverse proxy makes remote clients appear to originate from loopback.
 - Administrator passwords are stored as salted **PBKDF2-HMAC-SHA256** hashes, never as plaintext.
 - The JSON database contains dashboard configuration, agent tokens, and retained metric samples. Protect and back it up like other sensitive server configuration; file permissions are restricted where the operating system supports it.
 - TinyWatch atomically replaces the JSON database and keeps one previous known-good copy at `<data-file>.bak`. Startup and retention changes prune expired history from both copies. If the primary file is damaged, it preserves the damaged copy as `<data-file>.corrupt-*`, restores the backup, and displays a recovery notice. If neither file is valid, startup stops without replacing either file.
 - Remote agent tokens grant access to that node’s metrics. They are sent only over verified HTTPS, except to localhost/loopback; HTTP redirects are not followed. Keep tokens private and rotate them if a database backup is exposed.
-- The built-in server speaks HTTP. For access beyond a trusted local network, put it behind a trusted TLS reverse proxy and apply firewall rules. Do not expose the service directly to the public internet.
+- The built-in server speaks HTTP. For access beyond a trusted local network, put it behind a trusted TLS reverse proxy, use `--secure-cookie`, and apply firewall rules. Do not expose the service directly to the public internet. TinyWatch does not trust forwarded client-address headers; reverse proxies should enforce their own login rate limits because backend rate limiting sees the proxy address.
 - Run only one TinyWatch process against a given JSON database file. The file is protected against interrupted single-process writes; it is not a multi-process database.
 
 ## 🖥 Platform notes
@@ -139,7 +140,7 @@ The dashboard uses a small same-origin HTTP API:
 | Route | Purpose |
 | --- | --- |
 | `GET /api/status` | Check whether initial setup is required and whether the current session is authenticated |
-| `POST /api/setup` | Set the first administrator password; localhost only |
+| `POST /api/setup` | Set the first administrator password with the one-time setup code |
 | `POST /api/login` / `POST /api/logout` | Start or end an administrator session |
 | `GET /api/config` / `POST /api/config` | Read or update assets, dashboard widgets, theme, and history retention |
 | `GET /api/metrics` | Read current metrics for the local host and configured assets; requires a session |
@@ -156,7 +157,7 @@ Supported preset ranges are `1h`, `6h`, `24h`, `3d`, `7d`, `14d`, and `30d`, sub
 
 ## 🧰 Development
 
-TinyWatch has no runtime package dependencies. The cross-platform CI checks Python syntax, runs the standard-library regression suite, and parses the embedded UI JavaScript on Linux and Windows. Node.js is used only by this development check, never by the running application. See [CONTRIBUTING.md](CONTRIBUTING.md) for local commands and change guidelines, and [SECURITY.md](SECURITY.md) for private vulnerability reporting.
+TinyWatch has no runtime package dependencies. The cross-platform CI checks Python syntax, runs the standard-library regression suite, and parses the embedded UI JavaScript on Linux, Windows, and macOS. Node.js is used only by this development check, never by the running application. See [CONTRIBUTING.md](CONTRIBUTING.md) for local commands and change guidelines, and [SECURITY.md](SECURITY.md) for private vulnerability reporting.
 
 ## 📄 License
 
@@ -181,7 +182,7 @@ TinyWatch 是一款轻量、自托管的服务器监控面板：**单个 Python 
 - **实时主机监控**：CPU 总体及各核心占用、内存、磁盘和分区、网络上下行与网卡选择、系统负载。
 - **系统信息**：处理器、内存、操作系统和内核版本、开机时长、当前会话。
 - **进程与事件**：进程 CPU/内存占用；尽可能读取 SSH/RDP 登录事件和 DNS 缓存。
-- **历史曲线**：每分钟将指标保存到本地 JSON 数据库，可按预设范围或自定义日期时间查询；抽样时保留峰值，采集间断处显示断点，并支持触屏、鼠标和键盘查看。
+- **历史曲线**：服务端后台每分钟将指标保存到本地 JSON 数据库，关闭仪表盘后仍持续采样；图表可按预设范围或自定义日期时间查询，抽样时保留峰值，采集间断处显示断点，并支持触屏、鼠标和键盘查看。
 - **分布式资产**：通过主机地址、端口和代理令牌汇总多台 TinyWatch 节点，可为不同资产添加不同监控卡片。
 - **个性化界面**：拖拽排列面板、深浅主题、英语/简体中文/日语/法语/俄语/德语，以及适配移动端的布局。
 
@@ -203,7 +204,7 @@ Windows 可运行：
 py -3 tinywatch.py
 ```
 
-然后打开 [http://127.0.0.1:8765/](http://127.0.0.1:8765/)。首次启动时设置管理员密码（至少 10 个字符）。不需要安装依赖、构建前端或下载 CDN 资源。
+然后打开 [http://127.0.0.1:8765/](http://127.0.0.1:8765/)。首次启动时，TinyWatch 会在服务终端打印一次性设置代码；在页面输入代码并设置管理员密码（至少 10 个字符）。设置完成或服务重启后代码失效。不需要安装依赖、构建前端或下载 CDN 资源。
 
 ### 添加远程主机
 
@@ -221,19 +222,20 @@ py -3 tinywatch.py
 | `--host` | `127.0.0.1` | 监听地址；只有需要远程访问时才使用 `0.0.0.0`，并配置防火墙。 |
 | `--port` | `8765` | HTTP 服务端口。 |
 | `--data` | `~/.tinywatch/data.json` | 本地 JSON 数据库路径。 |
+| `--secure-cookie` | 关闭 | 通过可信反向代理使用 HTTPS 时，为会话 Cookie 添加 `Secure` 标志。 |
 | `--version` | — | 显示版本后退出。 |
 
-例如：`python3 tinywatch.py --port 9000 --data ./tinywatch-data.json`。也可以用 `TINYWATCH_DATA` 环境变量指定数据库路径；命令行 `--data` 优先级更高。
+例如：`python3 tinywatch.py --port 9000 --data ./tinywatch-data.json`。也可以用 `TINYWATCH_DATA` 环境变量指定数据库路径；命令行 `--data` 优先级更高。由可信反向代理终止 TLS 时，使用 `--secure-cookie` 并让 TinyWatch 只监听 localhost。
 
 ### 安全与平台说明
 
-- 服务默认只监听本机；首次设置密码也必须通过 localhost。
+- 服务默认只监听本机；首次设置需要服务终端打印的一次性代码。API 不会返回该代码，设置完成或重启后代码失效，因此同机反向代理不会因连接来源显示为回环地址而绕过首次设置保护。
 - 密码以加盐 PBKDF2-HMAC-SHA256 哈希保存。JSON 数据库包含代理令牌、面板设置和历史指标，请妥善保护和备份。
 - 数据库通过临时文件和原子替换保存，并保留一个 `.bak` 上一版本。启动和修改保留期限时会同时清理主文件及备份中过期的历史数据。损坏时 TinyWatch 会保留 `.corrupt-*` 文件并从有效备份恢复；主文件和备份都无效时会停止启动，原文件不会被空库覆盖。
 - 远程代理令牌只通过证书校验成功的 HTTPS 发送；HTTP 仅适用于本机 localhost / 回环地址，重定向不会被跟随。
-- 内置服务器使用 HTTP。需要在可信局域网外访问时，请通过可信的 TLS 反向代理并配置防火墙，不要将服务直接暴露到公网。
+- 内置服务器使用 HTTP。需要在可信局域网外访问时，请通过可信的 TLS 反向代理并配置防火墙，不要将服务直接暴露到公网。反代部署时建议启用 `--secure-cookie`；TinyWatch 不信任转发头中的客户端地址，登录限流会看到代理地址，反向代理应另外配置限流。
 - 同一个 JSON 数据库文件只应由一个 TinyWatch 进程使用；该格式提供单进程原子写入和恢复，不是多进程数据库。
 - Windows、Linux、macOS 和其他 Unix 系统使用各自可用的系统接口读取指标。进程网络速率依赖 Linux 上可用且有权限的 `ss`；登录日志和 DNS 缓存受系统权限及平台接口限制。Windows 不提供 Unix load average，面板会显示 CPU 参考值。
 - PowerShell、`ss`、`journalctl`、`who`、`netstat` 等系统命令仅在相关平台可用时尝试调用；它们不是 Python 第三方依赖。
 
-TinyWatch 使用 [MIT License](LICENSE)。CI 会在 Linux 与 Windows 上检查 Python 语法、运行标准库回归测试并解析内嵌 JavaScript；Node.js 仅用于开发验证，不是应用运行依赖。详情见 [CONTRIBUTING.md](CONTRIBUTING.md) 和 [SECURITY.md](SECURITY.md)。
+TinyWatch 使用 [MIT License](LICENSE)。CI 会在 Linux、Windows 与 macOS 上检查 Python 语法、运行标准库回归测试并解析内嵌 JavaScript；Node.js 仅用于开发验证，不是应用运行依赖。详情见 [CONTRIBUTING.md](CONTRIBUTING.md) 和 [SECURITY.md](SECURITY.md)。
