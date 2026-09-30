@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  standard-library-checks:
+    name: Python ${{ matrix.python-version }} · ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.10", "3.12"]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Set up Node for embedded UI syntax check
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Compile application
+        run: python -m py_compile tinywatch.py
+
+      - name: Run standard-library regression suite
+        run: python -m unittest discover -s tests -v
+
+      - name: Check embedded UI JavaScript syntax
+        run: python scripts/check_inline_js.py

@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
+import ipaddress
 import json
 import math
 import os
@@ -30,6 +31,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from datetime import datetime, timezone
+from http.client import HTTPException
 from http import HTTPStatus
 from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -887,41 +889,180 @@ def empty_database():
             "theme": "dark"}
 
 
+def _prune_history_database(database, cutoff):
+    history = database.get("history")
+    if not isinstance(history, dict):
+        return False
+    changed = False
+    for node_series in history.values():
+        if not isinstance(node_series, dict):
+            continue
+        for metric, points in list(node_series.items()):
+            if isinstance(points, list):
+                filtered = [point for point in points
+                            if isinstance(point, list) and point and _number(point[0]) >= cutoff]
+                if len(filtered) != len(points):
+                    changed = True
+                node_series[metric] = filtered
+    return changed
+
+
 class JsonStore:
-    """Small, atomic JSON database for credentials and dashboard configuration."""
+    """Atomic JSON store with one known-good backup and startup recovery."""
 
     def __init__(self, path):
         self.path = Path(path)
+        self.backup_path = self.path.with_name(self.path.name + ".bak")
         self.lock = threading.RLock()
+        self.recovered_from_backup = False
+        self.persisted_retention_days = None
+        self._known_main_signature = None
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.data = self._load()
+        self.persisted_retention_days = self._retention_days(self.data)
+        cutoff = time.time() - self.persisted_retention_days * 24 * 60 * 60
+        pruned = _prune_history_database(self.data, cutoff)
+        if not self.recovered_from_backup and self._valid_database_file(self.path):
+            self._known_main_signature = self._file_signature(self.path)
+        if self.recovered_from_backup or pruned:
+            self.save(backup_retention_days=self.persisted_retention_days)
 
-    def _load(self):
+    @staticmethod
+    def _retention_days(database):
+        days = database.get("history_retention_days", HISTORY_RETENTION_DEFAULT_DAYS)
+        if isinstance(days, bool) or days not in HISTORY_RETENTION_OPTIONS:
+            return HISTORY_RETENTION_DEFAULT_DAYS
+        return days
+
+    @staticmethod
+    def _file_signature(path):
+        stat = path.stat()
+        return stat.st_size, getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000))
+
+    @staticmethod
+    def _read_database(path):
         try:
-            with self.path.open("r", encoding="utf-8") as stream:
+            with path.open("r", encoding="utf-8") as stream:
                 value = json.load(stream)
-            if isinstance(value, dict) and value.get("schema") == 1:
-                default = empty_database()
-                default.update(value)
-                return default
-        except (OSError, ValueError, json.JSONDecodeError):
-            pass
-        return empty_database()
+        except FileNotFoundError:
+            return None, None
+        except (OSError, UnicodeError, ValueError) as exc:
+            return None, exc
+        if not isinstance(value, dict) or value.get("schema") != 1:
+            return None, ValueError("unsupported or invalid database schema")
+        default = empty_database()
+        default.update(value)
+        return default, None
 
-    def save(self):
-        with self.lock:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = self.path.with_suffix(self.path.suffix + ".tmp")
-            encoded = json.dumps(self.data, ensure_ascii=False, indent=2, sort_keys=True)
-            with temporary.open("w", encoding="utf-8") as stream:
-                stream.write(encoded)
-                stream.flush()
-                os.fsync(stream.fileno())
+    def _preserve_corrupt_file(self):
+        if not self.path.exists():
+            return
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        damaged = self.path.with_name(self.path.name + ".corrupt-" + stamp)
+        suffix = 1
+        while damaged.exists():
+            damaged = self.path.with_name(self.path.name + ".corrupt-" + stamp + "-" + str(suffix))
+            suffix += 1
+        try:
+            shutil.copy2(self.path, damaged)
             try:
-                os.chmod(temporary, 0o600)
+                os.chmod(damaged, 0o600)
             except OSError:
                 pass
+        except OSError as exc:
+            raise ValueError("database backup recovery failed; original file was left untouched: " + str(exc))
+
+    def _load(self):
+        primary, primary_error = self._read_database(self.path)
+        if primary is not None:
+            return primary
+        backup, backup_error = self._read_database(self.backup_path)
+        if backup is not None:
+            if primary_error is not None:
+                self._preserve_corrupt_file()
+            self.recovered_from_backup = True
+            return backup
+        if primary_error is None and backup_error is None:
+            return empty_database()
+        damaged_path = self.path if primary_error is not None else self.backup_path
+        raise ValueError("database is unreadable and no valid backup is available: " + str(damaged_path))
+
+    @staticmethod
+    def _write_synced(path, content):
+        with path.open("wb") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+
+    @staticmethod
+    def _valid_database_file(path):
+        try:
+            with path.open("r", encoding="utf-8") as stream:
+                value = json.load(stream)
+            return isinstance(value, dict) and value.get("schema") == 1
+        except (OSError, UnicodeError, ValueError):
+            return False
+
+    def _main_is_known_good(self):
+        try:
+            signature = self._file_signature(self.path)
+        except OSError:
+            return False
+        if signature == self._known_main_signature:
+            return True
+        if self._valid_database_file(self.path):
+            self._known_main_signature = signature
+            return True
+        return False
+
+    def _sync_parent_directory(self):
+        if os.name == "nt":
+            return
+        try:
+            descriptor = os.open(str(self.path.parent), os.O_RDONLY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        except OSError:
+            pass
+
+    def save(self, backup_retention_days=None):
+        with self.lock:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self.path.with_name(self.path.name + ".tmp")
+            backup_temporary = self.backup_path.with_name(self.backup_path.name + ".tmp")
+            encoded = json.dumps(self.data, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8")
+            self._write_synced(temporary, encoded)
+            if self._main_is_known_good():
+                if backup_retention_days is not None:
+                    with self.path.open("r", encoding="utf-8") as current:
+                        previous = json.load(current)
+                    previous["history_retention_days"] = backup_retention_days
+                    _prune_history_database(previous, time.time() - backup_retention_days * 24 * 60 * 60)
+                    backup_content = json.dumps(previous, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8")
+                    self._write_synced(backup_temporary, backup_content)
+                else:
+                    with self.path.open("rb") as current, backup_temporary.open("wb") as backup:
+                        shutil.copyfileobj(current, backup)
+                        backup.flush()
+                        os.fsync(backup.fileno())
+                    try:
+                        os.chmod(backup_temporary, 0o600)
+                    except OSError:
+                        pass
+                os.replace(backup_temporary, self.backup_path)
+            elif self.recovered_from_backup and backup_retention_days is not None:
+                self._write_synced(backup_temporary, encoded)
+                os.replace(backup_temporary, self.backup_path)
             os.replace(temporary, self.path)
+            self._known_main_signature = self._file_signature(self.path)
+            self.persisted_retention_days = self._retention_days(self.data)
+            self._sync_parent_directory()
 
 
 STORE = None
@@ -963,10 +1104,11 @@ def _validate_asset_url(value):
 
 def _config_for_browser():
     with STORE.lock:
-        return {"assets": [{"id": item["id"], "name": item["name"], "url": item["url"]} for item in STORE.data.get("assets", [])],
+        return {"assets": [_public_asset(item) for item in STORE.data.get("assets", [])],
                 "widgets": STORE.data.get("widgets", []), "theme": STORE.data.get("theme", "dark"),
                 "history_retention_days": _history_retention_days(),
-                "agent_token": STORE.data.get("agent_token", "")}
+                "agent_token": STORE.data.get("agent_token", ""),
+                "storage_recovered": STORE.recovered_from_backup}
 
 
 def _history_retention_days():
@@ -984,15 +1126,39 @@ def _history_retention_seconds():
 
 
 def _public_asset(asset):
-    return {"id": asset["id"], "name": asset["name"], "url": asset["url"]}
+    parsed = urllib.parse.urlsplit(asset["url"])
+    return {"id": asset["id"], "name": asset["name"], "url": asset["url"],
+            "secure_transport": parsed.scheme == "https" or _is_loopback_host(parsed.hostname)}
+
+
+def _is_loopback_host(hostname):
+    normalized = str(hostname or "").strip("[]").lower().rstrip(".")
+    if normalized == "localhost" or normalized.endswith(".localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(normalized.split("%", 1)[0]).is_loopback
+    except ValueError:
+        return False
+
+
+class _RejectRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Do not forward the agent token to a redirect target."""
+
+    def redirect_request(self, request, response, code, message, headers, new_url):
+        return None
 
 
 def _remote_snapshot(asset):
+    parsed = urllib.parse.urlsplit(asset["url"])
+    if parsed.scheme != "https" and not _is_loopback_host(parsed.hostname):
+        return {"id": asset["id"], "name": asset["name"], "online": False,
+                "error": "远程资产必须使用 HTTPS；HTTP 仅限 localhost / 回环地址", "metrics": None}
     endpoint = asset["url"].rstrip("/") + "/api/agent/metrics"
     request = urllib.request.Request(endpoint, headers={"X-TinyWatch-Token": asset["password"],
                                                         "Accept": "application/json", "User-Agent": "TinyWatch/" + APP_VERSION})
     try:
-        with urllib.request.urlopen(request, timeout=40) as response:
+        opener = urllib.request.build_opener(_RejectRedirectHandler())
+        with opener.open(request, timeout=10) as response:
             if response.status != 200:
                 raise OSError("HTTP " + str(response.status))
             payload = response.read(2_000_000)
@@ -1000,7 +1166,7 @@ def _remote_snapshot(asset):
             if not isinstance(data, dict) or "info" not in data or "cpu" not in data:
                 raise ValueError("invalid metric response")
             return {"id": asset["id"], "name": asset["name"], "online": True, "metrics": data}
-    except (OSError, urllib.error.URLError, ValueError, json.JSONDecodeError) as exc:
+    except (OSError, urllib.error.URLError, HTTPException, ValueError) as exc:
         reason = getattr(exc, "reason", exc)
         return {"id": asset["id"], "name": asset["name"], "online": False,
                 "error": _safe_text(reason, 140), "metrics": None}
@@ -1054,15 +1220,7 @@ def _record_history(nodes, now=None):
                 if not isinstance(points, list):
                     points = series[metric] = []
                 points.append([int(now)] + values)
-                series[metric] = [point for point in points
-                                  if isinstance(point, list) and point and _number(point[0]) >= cutoff]
-        for node_series in history.values():
-            if not isinstance(node_series, dict):
-                continue
-            for metric, points in list(node_series.items()):
-                if isinstance(points, list):
-                    node_series[metric] = [point for point in points
-                                           if isinstance(point, list) and point and _number(point[0]) >= cutoff]
+        _prune_history_database(STORE.data, cutoff)
         STORE.save()
         HISTORY_LAST_WRITE = now
 
@@ -1154,12 +1312,16 @@ HTML_PAGE = r'''<!doctype html>
 @media(max-width:680px){.sidebar{height:calc(57px + env(safe-area-inset-bottom));padding:5px 10px calc(5px + env(safe-area-inset-bottom))}.main{padding-bottom:calc(78px + env(safe-area-inset-bottom));align-self:start}.topbar{gap:8px}.top-actions{flex-wrap:wrap;justify-content:flex-end}.language-select{min-height:35px;padding:6px 5px;max-width:94px;font-size:10px}.host-panel{padding:13px}.host-info-card .info-grid{grid-template-columns:1fr 1fr;gap:10px}.section-head{align-items:flex-start}.section-head .panel-actions{flex-direction:column}.history-select{min-width:66px}}
 
 .mini-chart{cursor:crosshair;touch-action:pan-y}.mini-chart:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:4px}.chart-hover{fill:var(--text);stroke:var(--accent);stroke-width:2;pointer-events:none}.chart-tooltip{position:fixed;display:none;white-space:pre-line;pointer-events:none;z-index:60;max-width:min(340px,calc(100vw - 24px));padding:9px 11px;border:1px solid var(--line);border-radius:9px;background:var(--surface);color:var(--text);box-shadow:var(--shadow);font-size:11px;line-height:1.55}.chart-tooltip.visible{display:block}
+.mini-chart{height:148px}.mini-chart .chart-grid{stroke:var(--grid);stroke-width:.7}.mini-chart .chart-grid-vertical{stroke-dasharray:2 4}.mini-chart .chart-axis{stroke:var(--muted);stroke-width:1}.mini-chart .chart-label{fill:var(--muted);font:8px ui-sans-serif,system-ui,sans-serif}.mini-chart .chart-axis-caption{fill:var(--muted);font:7px ui-sans-serif,system-ui,sans-serif}.mini-chart .chart-gap-mark{stroke:var(--warn);stroke-width:1;stroke-dasharray:2 4;opacity:.8;pointer-events:none}.mini-chart .chart-crosshair{stroke:var(--accent2);stroke-width:1;stroke-dasharray:3 3;pointer-events:none;opacity:.85}
+@media(max-width:420px){.mini-chart .chart-label{font-size:7px}.mini-chart .chart-label-middle,.mini-chart .chart-grid-middle{display:none}}
+.chart-empty{height:148px}.status-pill.stale .dot{background:var(--warn);box-shadow:0 0 10px var(--warn)}
 </style></head><body><div id="app"></div><div id="toast" class="toast"></div><div id="chart-tooltip" class="chart-tooltip" role="tooltip"></div>
 <script>
 const app=document.getElementById('app');
 const LANGUAGE_NAMES = { en: 'English', zh: '中文', ja: '日本語', fr: 'Français', ru: 'Русский', de: 'Deutsch' };
 const LANGUAGE_INDEX = { en: 1, zh: 0, ja: 2, fr: 3, ru: 4, de: 5 };
 const LANGUAGE_LOCALE = { en: 'en-US', zh: 'zh-CN', ja: 'ja-JP', fr: 'fr-FR', ru: 'ru-RU', de: 'de-DE' };
+const CHART_GAP_SECONDS = 90; // Allow scheduling jitter around the one-minute history sample interval.
 const TRANSLATION_ROWS = [
   ['总览','Overview','概要','Vue générale','Обзор','Übersicht'],
   ['网络资产','Assets','ネットワーク資産','Équipements réseau','Сетевые узлы','Netzwerkgeräte'],
@@ -1340,7 +1502,20 @@ TRANSLATION_ROWS.push(
   ['14 天','14 days','14 日','14 jours','14 дней','14 Tage'],
   ['30 天','30 days','30 日','30 jours','30 дней','30 Tage'],
   ['历史数据保留最近','History retained for the last','履歴データの保存期間は直近','Historique conservé sur les','История хранится за последние','Verlauf wird für die letzten'],
-  ['所选时间超出当前数据保留期限','The selected range exceeds the current data retention period.','選択した期間は現在のデータ保持期間を超えています。','La période sélectionnée dépasse la durée de conservation actuelle.','Выбранный период выходит за текущий срок хранения данных.','Der ausgewählte Zeitraum überschreitet die aktuelle Aufbewahrungsdauer.']
+  ['所选时间超出当前数据保留期限','The selected range exceeds the current data retention period.','選択した期間は現在のデータ保持期間を超えています。','La période sélectionnée dépasse la durée de conservation actuelle.','Выбранный период выходит за текущий срок хранения данных.','Der ausgewählte Zeitraum überschreitet die aktuelle Aufbewahrungsdauer.'],
+  ['数据更新失败','Update failed','データ更新に失敗','Échec de la mise à jour','Не удалось обновить данные','Datenaktualisierung fehlgeschlagen'],
+  ['数据延迟','Data delayed','データ遅延','Données en retard','Задержка данных','Daten verzögert'],
+  ['刚刚','just now','たった今','à l’instant','только что','gerade eben'],
+  ['秒前','seconds ago','秒前','secondes','с назад','Sekunden zuvor'],
+  ['数据接收','Data received','データ受信','Données reçues','Данные получены','Daten empfangen'],
+  ['最近一次请求失败，TinyWatch 会继续重试','The latest request failed. TinyWatch will keep retrying.','直近のリクエストに失敗しました。TinyWatch は再試行を続けます。','La dernière requête a échoué. TinyWatch va réessayer.','Последний запрос завершился ошибкой. TinyWatch продолжит попытки.','Die letzte Anfrage ist fehlgeschlagen. TinyWatch versucht es weiter.'],
+  ['数据时间以浏览器本地时区显示','Data times use the browser local time zone.','データ時刻はブラウザーのローカルタイムゾーンで表示します。','Les heures utilisent le fuseau horaire local du navigateur.','Время отображается в часовом поясе браузера.','Zeitangaben verwenden die lokale Zeitzone des Browsers.'],
+  ['数据库已从备份恢复，请检查设置','Database restored from backup. Review your settings.','データベースをバックアップから復元しました。設定を確認してください。','Base restaurée depuis la sauvegarde. Vérifiez les paramètres.','База восстановлена из резервной копии. Проверьте настройки.','Datenbank aus Sicherung wiederhergestellt. Einstellungen prüfen.'],
+  ['本地时间','Local time','現地時間','Heure locale','Местное время','Ortszeit'],
+  ['历史图表：横轴为本地时间，纵轴为指标数值。可用左右方向键查看采样点。','History chart: local time on the horizontal axis and metric values on the vertical axis. Use the arrow keys to inspect samples.','履歴グラフ：横軸は現地時間、縦軸は指標値です。左右の矢印キーでサンプルを確認できます。','Graphique historique : heure locale en abscisse, valeur en ordonnée. Utilisez les flèches pour parcourir les mesures.','График истории: местное время по горизонтали, значение метрики по вертикали. Стрелками можно просматривать точки.','Verlauf: Ortszeit auf der waagerechten, Messwerte auf der senkrechten Achse. Mit den Pfeiltasten Messpunkte prüfen.'],
+  ['HTTPS required','HTTPS required','HTTPS が必要','HTTPS requis','Требуется HTTPS','HTTPS erforderlich'],
+  ['远程节点必须使用有效的 HTTPS 证书；HTTP 仅适用于本机 localhost 或回环地址。','Remote nodes require a valid HTTPS certificate. HTTP is limited to localhost or loopback addresses.','リモートノードには有効な HTTPS 証明書が必要です。HTTP は localhost またはループバックアドレスに限ります。','Les nœuds distants exigent un certificat HTTPS valide. HTTP est réservé à localhost ou aux adresses de bouclage.','Для удалённых узлов требуется действительный сертификат HTTPS. HTTP разрешён только для localhost или loopback.','Entfernte Knoten benötigen ein gültiges HTTPS-Zertifikat. HTTP ist auf localhost oder Loopback-Adressen beschränkt.'],
+  ['远程资产必须使用 HTTPS；HTTP 仅限 localhost / 回环地址','Remote assets must use HTTPS; HTTP is allowed only for localhost / loopback addresses','リモート資産は HTTPS が必要です。HTTP は localhost / ループバックに限ります','Les équipements distants doivent utiliser HTTPS ; HTTP est réservé à localhost / loopback','Удалённые ресурсы должны использовать HTTPS; HTTP разрешён только для localhost / loopback','Entfernte Assets müssen HTTPS verwenden; HTTP ist nur für localhost / Loopback zulässig']
 );
 const LANGUAGE_LOOKUP = new Map();
 for (const row of TRANSLATION_ROWS) LANGUAGE_LOOKUP.set(row[0], row);
@@ -1395,7 +1570,7 @@ function bindLanguageSelector() {
   };
 }
 
-const state={authenticated:false,setup:false,config:null,data:null,history:{},historical:{},historyPending:{},historyRanges:{},historyCustom:{},chartData:{},chartSequence:0,timer:null,dragged:null,modal:null,view:'overview',language:LANGUAGE_NAMES[readPreference('tinywatch.language','en')]?readPreference('tinywatch.language','en'):'en'};
+const state={authenticated:false,setup:false,config:null,data:null,history:{},historical:{},historyPending:{},historyRanges:{},historyCustom:{},chartData:{},chartSequence:0,timer:null,freshnessTimer:null,lastRefreshAt:0,refreshFailed:false,dragged:null,modal:null,view:'overview',language:LANGUAGE_NAMES[readPreference('tinywatch.language','en')]?readPreference('tinywatch.language','en'):'en'};
 document.documentElement.lang=state.language;
 const metrics={cpu:['处理器','◉'],memory:['内存','▤'],network:['网络流量','↕'],disk:['磁盘','▣'],load:['系统负载','⌁'],processes:['进程','▥'],logins:['登录事件','⌑'],dns:['DNS 缓存','⌘'],info:['主机信息','◈']};
 const fmtBytes=n=>{n=Number(n)||0;const u=['B','KB','MB','GB','TB'];let i=0;while(n>=1024&&i<u.length-1){n/=1024;i++}return new Intl.NumberFormat(LANGUAGE_LOCALE[state.language]||'en-US',{minimumFractionDigits:i?1:0,maximumFractionDigits:i?1:0}).format(i===0?Math.round(n):n)+' '+u[i]};
@@ -1418,18 +1593,36 @@ async function boot(){
 }
 async function enterApp(){
   state.authenticated=true;
-  try{state.config=await api('/api/config');setTheme(state.config.theme);render();await refresh();startPolling()}
+  try{state.config=await api('/api/config');setTheme(state.config.theme);render();if(state.config.storage_recovered)toast('数据库已从备份恢复，请检查设置');await refresh();startPolling()}
   catch(error){state.authenticated=false;authScreen(false)}
 }
 function startPolling(){
   clearTimeout(state.timer);
+  clearInterval(state.freshnessTimer);
+  state.freshnessTimer=setInterval(updateFreshnessIndicator,1000);
   const poll=async()=>{await refresh();if(state.authenticated)state.timer=setTimeout(poll,2500)};
   poll();
+}
+function updateFreshnessIndicator(){
+  const status=document.getElementById('live-status'),label=document.getElementById('live-status-label'),footer=document.getElementById('updated-at');
+  if(!status||!label)return;
+  const age=state.lastRefreshAt?Math.max(0,Math.floor((Date.now()-state.lastRefreshAt)/1000)):null;
+  const stale=state.refreshFailed||age===null||age>=10;
+  label.textContent=tr(state.refreshFailed?'数据更新失败':(stale?'数据延迟':'实时采集'));
+  status.classList.toggle('stale',stale);
+  status.title=tr(state.refreshFailed?'最近一次请求失败，TinyWatch 会继续重试':'数据时间以浏览器本地时区显示');
+  if(footer&&age!==null){
+    const ageText=age<3?tr('刚刚'):new Intl.NumberFormat(LANGUAGE_LOCALE[state.language]||'en-US').format(age)+' '+tr('秒前');
+    footer.dataset.freshness=tr('数据接收')+' · '+ageText;
+    const summary=footer.dataset.summary||footer.textContent;
+    footer.dataset.summary=summary;
+    footer.textContent=summary+' · '+footer.dataset.freshness;
+  }
 }
 async function refresh(){
   if(!state.authenticated)return;
   try{
-    const data=await api('/api/metrics');state.data=data;
+    const data=await api('/api/metrics');state.data=data;state.lastRefreshAt=Date.now();state.refreshFailed=false;
     for(const [id,node] of Object.entries(data.nodes||{})){
       if(!node.online||!node.metrics)continue;
       const metric=node.metrics;pushHistory(id+':cpu',metric.cpu.percent);
@@ -1440,13 +1633,16 @@ async function refresh(){
       for(const item of interfaces)pushHistory(id+':network:'+item.name,item.rx_rate+item.tx_rate);
     }
     draw();
-  }catch(error){if(error.status===401){state.authenticated=false;clearTimeout(state.timer);authScreen(false)}}
+  }catch(error){
+    if(error.status===401){state.authenticated=false;clearTimeout(state.timer);clearInterval(state.freshnessTimer);authScreen(false)}
+    else{state.refreshFailed=true;updateFreshnessIndicator()}
+  }
 }
 function pushHistory(key,value){const values=state.history[key]||(state.history[key]=[]);values.push([Date.now()/1000,Number(value)||0]);if(values.length>36)values.shift()}
 function nodeFor(id){return state.data&&state.data.nodes&&state.data.nodes[id]}
 function render(){
   if(!state.config)return;
-  app.innerHTML='<div class="shell"><aside class="sidebar"><div class="brand"><div class="brand-mark">◈</div><div><strong>TinyWatch</strong><small>INFRASTRUCTURE</small></div></div><nav class="nav" aria-label="Main navigation"><button class="active" data-view="overview"><span class="nav-icon">⌂</span><span>总览</span></button><button data-menu="assets"><span class="nav-icon">⌘</span><span>资产</span></button><button data-menu="settings"><span class="nav-icon">⚙</span><span>设置</span></button></nav></aside><main class="main"><header class="topbar"><div><div class="eyebrow">LIVE INFRASTRUCTURE</div><h1 class="page-title" id="page-title">系统总览</h1></div><div class="top-actions">'+languageSelector()+'<span class="status-pill"><i class="dot"></i>实时采集</span><button class="icon-button" id="theme-toggle" title="切换主题" aria-label="Switch theme">◐</button><button class="icon-button" id="logout-button" title="退出登录" aria-label="Sign out">↗</button></div></header><section class="host-panel"><div class="host-panel-head"><div><h2>主机信息</h2><p>本地节点 · HOST PROFILE</p></div></div><div id="host-summary"></div></section><section class="overview" id="overview"></section><div class="section-head"><div><h2 id="panel-title">自定义监控面板</h2><p id="panel-description">拖拽卡片调整布局 · 数据每 2.5 秒更新</p></div><div class="panel-actions" id="panel-actions"><button class="button subtle" id="assets-manage">管理资产</button><button class="button primary" id="add-widget">＋ 添加监控</button></div></div><section class="dashboard" id="dashboard" aria-live="polite"></section><div class="grid-footer" id="updated-at">正在连接监控节点…</div></main></div><div id="modal" class="modal-backdrop"></div>';
+  app.innerHTML='<div class="shell"><aside class="sidebar"><div class="brand"><div class="brand-mark">◈</div><div><strong>TinyWatch</strong><small>INFRASTRUCTURE</small></div></div><nav class="nav" aria-label="Main navigation"><button class="active" data-view="overview"><span class="nav-icon">⌂</span><span>总览</span></button><button data-menu="assets"><span class="nav-icon">⌘</span><span>资产</span></button><button data-menu="settings"><span class="nav-icon">⚙</span><span>设置</span></button></nav></aside><main class="main"><header class="topbar"><div><div class="eyebrow">LIVE INFRASTRUCTURE</div><h1 class="page-title" id="page-title">系统总览</h1></div><div class="top-actions">'+languageSelector()+'<span class="status-pill" id="live-status"><i class="dot"></i><span id="live-status-label">实时采集</span></span><button class="icon-button" id="theme-toggle" title="切换主题" aria-label="Switch theme">◐</button><button class="icon-button" id="logout-button" title="退出登录" aria-label="Sign out">↗</button></div></header><section class="host-panel"><div class="host-panel-head"><div><h2>主机信息</h2><p>本地节点 · HOST PROFILE</p></div></div><div id="host-summary"></div></section><section class="overview" id="overview"></section><div class="section-head"><div><h2 id="panel-title">自定义监控面板</h2><p id="panel-description">拖拽卡片调整布局 · 数据每 2.5 秒更新</p></div><div class="panel-actions" id="panel-actions"><button class="button subtle" id="assets-manage">管理资产</button><button class="button primary" id="add-widget">＋ 添加监控</button></div></div><section class="dashboard" id="dashboard" aria-live="polite"></section><div class="grid-footer" id="updated-at">正在连接监控节点…</div></main></div><div id="modal" class="modal-backdrop"></div>';
   document.documentElement.lang=state.language;localizeDOM(app);bindLanguageSelector();
   document.getElementById('theme-toggle').onclick=toggleTheme;
   document.getElementById('logout-button').onclick=logout;
@@ -1460,7 +1656,7 @@ function render(){
   draw();
 }
 async function toggleTheme(){state.config.theme=state.config.theme==='dark'?'light':'dark';setTheme(state.config.theme);try{await saveConfig()}catch(error){toast(error.message)}}
-async function logout(){clearTimeout(state.timer);try{await api('/api/logout','POST',{})}catch(error){}state.authenticated=false;authScreen(false)}
+async function logout(){clearTimeout(state.timer);clearInterval(state.freshnessTimer);try{await api('/api/logout','POST',{})}catch(error){}state.authenticated=false;authScreen(false)}
 function switchView(view){
   state.view='overview';
   document.querySelectorAll('.nav button').forEach(button=>button.classList.toggle('active',button.dataset.view===state.view));
@@ -1470,6 +1666,9 @@ function switchView(view){
 }
 function draw(){
   if(!state.data||!state.config)return;
+  const activeChart=document.activeElement&&document.activeElement.matches('.mini-chart')?document.activeElement:null;
+  const activeWidget=activeChart&&activeChart.closest('.widget');
+  const focusRestore=activeChart?{widget:activeWidget&&activeWidget.dataset.widget,index:activeChart.dataset.activeIndex||'0'}:null;
   state.chartData={};state.chartSequence=0;
   const local=nodeFor('local');if(!local||!local.metrics)return;
   const metricsLocal=local.metrics;const alive=Object.values(state.data.nodes).filter(node=>node.online).length;const total=Object.keys(state.data.nodes).length;
@@ -1491,10 +1690,16 @@ function draw(){
     const card=document.createElement('article');card.className='widget '+(['processes','logins','dns'].includes(widget.metric)?'wide':'');
     card.draggable=!widget.transient;card.dataset.widget=widget.id;card.innerHTML=widgetCard(widget,node,asset);dashboard.appendChild(card);localizeDOM(card);bindWidget(card,widget);
   }
+  if(focusRestore&&focusRestore.widget){
+    const card=Array.from(dashboard.children).find(item=>item.dataset.widget===focusRestore.widget);
+    const chart=card&&card.querySelector('.mini-chart');
+    if(chart){chart.dataset.activeIndex=focusRestore.index;chart.focus({preventScroll:true})}
+  }
   dashboard.ondragover=event=>{event.preventDefault();const target=event.target.closest('.widget');if(target&&state.dragged&&target!==state.dragged)target.classList.add('drag-over')};
   dashboard.ondragleave=event=>{const target=event.target.closest('.widget');if(target)target.classList.remove('drag-over')};
   dashboard.ondrop=event=>{event.preventDefault();const target=event.target.closest('.widget');if(!target||!state.dragged||target===state.dragged)return;target.classList.remove('drag-over');const cards=Array.from(dashboard.children);const from=cards.indexOf(state.dragged),to=cards.indexOf(target);if(from<to)target.after(state.dragged);else target.before(state.dragged);state.config.widgets=Array.from(dashboard.children).map(card=>state.config.widgets.find(widget=>widget.id===card.dataset.widget)).filter(Boolean);saveConfig().catch(error=>toast(error.message))};
-  document.getElementById('updated-at').textContent=tr('本机采样 · ')+new Date(metricsLocal.sampled_at).toLocaleString(LANGUAGE_LOCALE[state.language]||'en-US')+tr(' · 远程节点 ')+alive+'/'+total+tr(' 在线');
+  const footer=document.getElementById('updated-at');footer.dataset.summary=tr('本机采样 · ')+new Date(metricsLocal.sampled_at).toLocaleString(LANGUAGE_LOCALE[state.language]||'en-US')+tr(' · 远程节点 ')+alive+'/'+total+tr(' 在线');
+  footer.textContent=footer.dataset.summary;updateFreshnessIndicator();
 }
 function widgetCard(widget,node,asset){
   const title=metrics[widget.metric]||['监控','◈'];let content='';
@@ -1618,44 +1823,167 @@ function processCard(m){const rows=(m.processes||[]).slice(0,8);return rows.leng
 function loginCard(m){const rows=(m.logins||[]).slice(0,7);return rows.length?'<div>'+rows.map(x=>'<div class="disk-line"><span class="tag '+(/accepted|opened|success|4624/i.test(x.message)?'good':'bad')+'">'+esc(x.kind)+'</span><span style="flex:1;margin-left:9px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="'+esc(x.message)+'">'+esc(x.message)+'</span></div>').join('')+'</div><div class="notice">按系统日志权限读取 SSH、RDP（3389）和远程登录事件。</div>':'<div class="empty">当前没有可读取的 SSH / RDP 登录事件。日志可能需要更高权限或相应服务。</div>'}
 function dnsCard(m){const rows=(m.dns.entries||[]).slice(0,6);return '<div class="big-value">'+(m.dns.count||0)+'<small> 条目</small></div><div class="metric-sub">来源：'+esc(m.dns.source||'系统 DNS 缓存')+'</div>'+(rows.length?rows.map(x=>'<div class="disk-line"><span>'+esc(x.name)+'</span><span>'+esc(x.value||x.type||'')+'</span></div>').join(''):'<div class="empty">系统未公开 DNS 缓存详情。</div>')}
 function infoCard(m){const x=m.info;return '<div class="info-grid"><div class="info-item"><label>主机名</label><strong>'+esc(x.hostname)+'</strong></div><div class="info-item"><label>处理器</label><strong>'+esc(x.cpu)+' · '+x.logical_cores+' 核</strong></div><div class="info-item"><label>系统版本</label><strong>'+esc(x.system)+'</strong></div><div class="info-item"><label>内核版本</label><strong>'+esc(x.release)+' · '+esc(x.architecture)+'</strong></div><div class="info-item"><label>物理内存</label><strong>'+fmtBytes(x.memory_total)+'</strong></div><div class="info-item"><label>系统运行时长</label><strong>'+esc(x.uptime)+'</strong></div><div class="info-item" style="grid-column:1/-1"><label>当前会话</label><strong>'+esc((x.sessions||[]).join(' · ')||'无活动终端会话或当前账户无读取权限')+'</strong></div></div>'}
+function chartAxisMaximum(value){
+  const rawStep=Math.max(value,0.000001)/4;
+  const magnitude=Math.pow(10,Math.floor(Math.log10(rawStep)));
+  const fraction=rawStep/magnitude;
+  const niceFraction=fraction<=1?1:fraction<=2?2:fraction<=5?5:10;
+  return niceFraction*magnitude*4;
+}
+function downsampleHistory(samples,maximumPoints){
+  const ordered=samples.slice().filter(point=>Number.isFinite(Number(point.timestamp))&&Number.isFinite(Number(point.value)))
+    .sort((left,right)=>Number(left.timestamp)-Number(right.timestamp));
+  if(ordered.length<=maximumPoints)return ordered;
+  const gapPairs=[];
+  for(let index=1;index<ordered.length;index++){
+    if(Number(ordered[index].timestamp)-Number(ordered[index-1].timestamp)>CHART_GAP_SECONDS)gapPairs.push([index-1,index]);
+  }
+  const maxGapPairs=Math.floor((maximumPoints-2)/2);
+  const gapStride=Math.max(1,Math.ceil(gapPairs.length/maxGapPairs));
+  const selected=new Set([0,ordered.length-1]);
+  gapPairs.forEach((pair,index)=>{if(index%gapStride===0){selected.add(pair[0]);selected.add(pair[1])}});
+  const candidates=[];
+  for(let index=1;index<ordered.length-1;index++)if(!selected.has(index))candidates.push(index);
+  const remaining=maximumPoints-selected.size;
+  const bucketCount=Math.floor(remaining/2);
+  for(let bucket=0;bucket<bucketCount;bucket++){
+    const start=Math.floor(bucket*candidates.length/bucketCount);
+    const end=Math.max(start+1,Math.floor((bucket+1)*candidates.length/bucketCount));
+    if(start>=candidates.length)break;
+    let minimum=candidates[start],maximum=minimum;
+    for(let offset=start+1;offset<Math.min(end,candidates.length);offset++){
+      const candidate=candidates[offset];
+      if(Number(ordered[candidate].value)<Number(ordered[minimum].value))minimum=candidate;
+      if(Number(ordered[candidate].value)>Number(ordered[maximum].value))maximum=candidate;
+    }
+    selected.add(minimum);selected.add(maximum);
+  }
+  return [...selected].sort((left,right)=>left-right).map(index=>ordered[index]);
+}
+function chartTimeLabel(timestamp,span,includeYear){
+  const date=new Date(timestamp*1000);
+  if(!Number.isFinite(date.getTime()))return '—';
+  const locale=LANGUAGE_LOCALE[state.language]||'en-US';
+  return span<86400
+    ?date.toLocaleTimeString(locale,{hour:'2-digit',minute:'2-digit'})
+    :date.toLocaleDateString(locale,includeYear?{year:'2-digit',month:'2-digit',day:'2-digit'}:{month:'2-digit',day:'2-digit'});
+}
 function sparkline(samples,metric){
   if(!samples||!samples.length)return '<div class="chart-empty">'+tr('暂无历史样本')+'</div>';
-  const maximumPoints=240;const stride=Math.max(1,Math.ceil(samples.length/maximumPoints));
-  let points=samples.filter((sample,index)=>index%stride===0||index===samples.length-1).slice(-maximumPoints);
-  if(points.length===1)points=[{...points[0],x:110,y:26}];
-  else{
-    const width=220,height=52,values=points.map(point=>point.value),min=Math.min(...values),max=Math.max(...values),spread=Math.max(1,max-min);
-    points=points.map((point,index)=>({...point,x:index/(points.length-1)*width,y:height-4-((point.value-min)/spread)*(height-10)}));
+  const maximumPoints=240;let points=downsampleHistory(samples,maximumPoints);
+  if(!points.length)return '<div class="chart-empty">'+tr('暂无历史样本')+'</div>';
+  const width=320,height=148,plotLeft=74,plotRight=314,plotTop=9,plotBottom=101;
+  const plotWidth=plotRight-plotLeft,plotHeight=plotBottom-plotTop;
+  const values=points.map(point=>Math.max(0,Number(point.value)||0));
+  const percentageMetric=['cpu','memory','disk'].includes(metric);
+  const axisMaximum=percentageMetric?100:chartAxisMaximum(Math.max(metric==='network'?4:1,...values));
+  const timestamps=points.map(point=>Number(point.timestamp));
+  const hasTimeRange=timestamps.length>1&&timestamps.every(Number.isFinite)&&timestamps[timestamps.length-1]>timestamps[0];
+  const firstTime=hasTimeRange?timestamps[0]:0;
+  const timeSpan=hasTimeRange?timestamps[timestamps.length-1]-firstTime:0;
+  const firstDate=new Date(timestamps[0]*1000),lastDate=new Date(timestamps[timestamps.length-1]*1000);
+  const crossesYear=Number.isFinite(firstDate.getTime())&&Number.isFinite(lastDate.getTime())&&firstDate.getFullYear()!==lastDate.getFullYear();
+  const pointCount=points.length;
+  points=points.map((point,index)=>{
+    const value=Math.max(0,Number(point.value)||0);
+    const x=pointCount===1?plotLeft+plotWidth/2:plotLeft+(hasTimeRange?(timestamps[index]-firstTime)/timeSpan:index/(pointCount-1))*plotWidth;
+    const y=plotBottom-Math.min(1,value/axisMaximum)*plotHeight;
+    return {...point,x,y};
+  });
+  const ticks=Array.from({length:5},(_,index)=>axisMaximum*(4-index)/4);
+  const formatY=value=>percentageMetric
+    ?new Intl.NumberFormat(LANGUAGE_LOCALE[state.language]||'en-US',{maximumFractionDigits:0}).format(value)+'%'
+    :metric==='network'?fmtBytes(value)+'/s'
+    :new Intl.NumberFormat(LANGUAGE_LOCALE[state.language]||'en-US',{maximumFractionDigits:2}).format(value);
+  const grid=ticks.map(value=>{
+    const y=plotBottom-(value/axisMaximum)*plotHeight;
+    return '<line class="chart-grid" x1="'+plotLeft+'" y1="'+y.toFixed(1)+'" x2="'+plotRight+'" y2="'+y.toFixed(1)+'"></line><text class="chart-label" x="'+(plotLeft-7)+'" y="'+(y+3).toFixed(1)+'" text-anchor="end">'+formatY(value)+'</text>';
+  }).join('');
+  const xTicks=pointCount===1?[{x:points[0].x,timestamp:points[0].timestamp,anchor:'middle',position:'single'}]:[
+    {x:plotLeft,timestamp:points[0].timestamp,anchor:'start',position:'first'},
+    {x:(plotLeft+plotRight)/2,timestamp:hasTimeRange?(firstTime+timeSpan/2):points[Math.floor(pointCount/2)].timestamp,anchor:'middle',position:'middle'},
+    {x:plotRight,timestamp:points[pointCount-1].timestamp,anchor:'end',position:'last'}
+  ];
+  const xLabels=xTicks.map(tick=>'<line class="chart-grid chart-grid-vertical chart-grid-'+tick.position+'" x1="'+tick.x.toFixed(1)+'" y1="'+plotTop+'" x2="'+tick.x.toFixed(1)+'" y2="'+plotBottom+'"></line><text class="chart-label chart-label-x chart-label-'+tick.position+'" x="'+tick.x.toFixed(1)+'" y="125" text-anchor="'+tick.anchor+'">'+chartTimeLabel(Number(tick.timestamp),hasTimeRange?timeSpan:0,crossesYear)+'</text>').join('');
+  const segments=[];
+  points.forEach(point=>{
+    const current=segments[segments.length-1];
+    if(!current||Number(point.timestamp)-Number(current[current.length-1].timestamp)>CHART_GAP_SECONDS)segments.push([point]);
+    else current.push(point);
+  });
+  const gapMarkers=[];
+  for(let index=1;index<segments.length;index++){
+    const previous=segments[index-1][segments[index-1].length-1],next=segments[index][0];
+    gapMarkers.push('<line class="chart-gap-mark" x1="'+((previous.x+next.x)/2).toFixed(1)+'" y1="'+plotTop+'" x2="'+((previous.x+next.x)/2).toFixed(1)+'" y2="'+plotBottom+'"></line>');
   }
+  const drawing=segments.map(segment=>{
+    if(segment.length===1)return '<circle class="history-point" cx="'+segment[0].x.toFixed(1)+'" cy="'+segment[0].y.toFixed(1)+'" r="3"></circle>';
+    const coords=segment.map(point=>point.x.toFixed(1)+','+point.y.toFixed(1)).join(' ');
+    const first=segment[0],last=segment[segment.length-1];
+    return '<polygon class="area" points="'+first.x.toFixed(1)+','+first.y.toFixed(1)+' '+coords+' '+last.x.toFixed(1)+','+plotBottom+' '+first.x.toFixed(1)+','+plotBottom+'"></polygon><polyline class="line" points="'+coords+'"></polyline>';
+  }).join('');
+  const axes='<line class="chart-axis" x1="'+plotLeft+'" y1="'+plotTop+'" x2="'+plotLeft+'" y2="'+plotBottom+'"></line><line class="chart-axis" x1="'+plotLeft+'" y1="'+plotBottom+'" x2="'+plotRight+'" y2="'+plotBottom+'"></line>';
   const id='chart-'+(++state.chartSequence);state.chartData[id]={metric,points};
-  const coords=points.map(point=>point.x.toFixed(1)+','+point.y.toFixed(1)).join(' ');
-  const first=coords.split(' ')[0],last=coords.split(' ').slice(-1)[0];
-  const drawing=points.length===1?'<circle class="history-point" cx="'+points[0].x.toFixed(1)+'" cy="'+points[0].y.toFixed(1)+'" r="3"></circle>':'<polygon class="area" points="'+first+' '+coords+' '+last.split(',')[0]+',52 0,52"></polygon><polyline class="line" points="'+coords+'"></polyline>';
-  return '<svg class="mini-chart" data-chart-id="'+id+'" viewBox="0 0 220 52" preserveAspectRatio="none" role="img" tabindex="0" aria-label="Historical chart, move pointer to inspect date and value"><rect class="chart-hit" x="0" y="0" width="220" height="52" fill="transparent" pointer-events="all"></rect>'+drawing+'<circle class="chart-hover" cx="-10" cy="-10" r="4"></circle></svg>';
+  const caption='<text class="chart-axis-caption" x="'+((plotLeft+plotRight)/2)+'" y="143" text-anchor="middle">'+tr('本地时间')+'</text>';
+  return '<svg class="mini-chart" data-chart-id="'+id+'" viewBox="0 0 '+width+' '+height+'" preserveAspectRatio="none" role="img" tabindex="0" aria-label="'+esc(tr('历史图表：横轴为本地时间，纵轴为指标数值。可用左右方向键查看采样点。'))+'"><rect class="chart-hit" x="0" y="0" width="'+width+'" height="'+height+'" fill="transparent" pointer-events="all"></rect>'+grid+xLabels+gapMarkers.join('')+axes+drawing+caption+'<line class="chart-crosshair" x1="-10" y1="'+plotTop+'" x2="-10" y2="'+plotBottom+'"></line><circle class="chart-hover" cx="-10" cy="-10" r="4"></circle></svg>';
 }
 function bindChartTooltip(chart){
   const tooltip=document.getElementById('chart-tooltip');const data=state.chartData[chart.dataset.chartId];
   if(!tooltip||!data||!data.points.length)return;
-  const show=event=>{
+  let hideTimer=null;
+  const hide=()=>{
+    clearTimeout(hideTimer);tooltip.classList.remove('visible');
+    const marker=chart.querySelector('.chart-hover'),crosshair=chart.querySelector('.chart-crosshair');
+    if(marker){marker.setAttribute('cx','-10');marker.setAttribute('cy','-10')}
+    if(crosshair){crosshair.setAttribute('x1','-10');crosshair.setAttribute('x2','-10')}
+  };
+  const showPoint=(point,index,clientX,clientY)=>{
     const rect=chart.getBoundingClientRect();if(!rect.width)return;
-    const ratio=Math.max(0,Math.min(1,(event.clientX-rect.left)/rect.width));
-    const index=data.points.length===1?0:Math.round(ratio*(data.points.length-1));const point=data.points[index];
+    chart.dataset.activeIndex=String(index);
     const date=new Date(point.timestamp*1000);const dateText=Number.isFinite(date.getTime())?date.toLocaleString(LANGUAGE_LOCALE[state.language]||'en-US'):'—';
     let valueText;
     if(data.metric==='network')valueText=point.rx==null?fmtBytes(point.value)+'/s':fmtBytes(point.value)+'/s  (↓ '+fmtBytes(point.rx||0)+'/s · ↑ '+fmtBytes(point.tx||0)+'/s)';
     else if(data.metric==='load')valueText=Number(point.value).toFixed(2);
     else valueText=Number(point.value).toFixed(1)+'%';
     tooltip.textContent=dateText+'\n'+tr((metrics[data.metric]||['Metric'])[0])+': '+valueText;tooltip.classList.add('visible');
-    const bounds=tooltip.getBoundingClientRect();let left=event.clientX+14,top=event.clientY+14;
-    if(left+bounds.width>window.innerWidth-8)left=event.clientX-bounds.width-14;
-    if(top+bounds.height>window.innerHeight-8)top=event.clientY-bounds.height-14;
+    const bounds=tooltip.getBoundingClientRect();let left=clientX+14,top=clientY+14;
+    if(left+bounds.width>window.innerWidth-8)left=clientX-bounds.width-14;
+    if(top+bounds.height>window.innerHeight-8)top=clientY-bounds.height-14;
     tooltip.style.left=Math.max(8,left)+'px';tooltip.style.top=Math.max(8,top)+'px';
-    const marker=chart.querySelector('.chart-hover');if(marker){marker.setAttribute('cx',point.x);marker.setAttribute('cy',point.y)}
+    const marker=chart.querySelector('.chart-hover'),crosshair=chart.querySelector('.chart-crosshair');
+    if(marker){marker.setAttribute('cx',point.x);marker.setAttribute('cy',point.y)}
+    if(crosshair){crosshair.setAttribute('x1',point.x);crosshair.setAttribute('x2',point.x)}
   };
-  chart.addEventListener('pointermove',show);
-  chart.addEventListener('pointerleave',()=>{tooltip.classList.remove('visible');const marker=chart.querySelector('.chart-hover');if(marker){marker.setAttribute('cx','-10');marker.setAttribute('cy','-10')}});
-  chart.addEventListener('focus',()=>{const rect=chart.getBoundingClientRect();show({clientX:rect.left+rect.width/2,clientY:rect.top+rect.height/2})});
-  chart.addEventListener('blur',()=>tooltip.classList.remove('visible'));
+  const showPointer=event=>{
+    const rect=chart.getBoundingClientRect();if(!rect.width)return;
+    const chartX=Math.max(0,Math.min(320,(event.clientX-rect.left)/rect.width*320));
+    let index=0;
+    for(let candidate=1;candidate<data.points.length;candidate++){
+      if(Math.abs(data.points[candidate].x-chartX)<Math.abs(data.points[index].x-chartX))index=candidate;
+    }
+    showPoint(data.points[index],index,event.clientX,event.clientY);
+    if(event.pointerType==='touch'){clearTimeout(hideTimer);hideTimer=setTimeout(hide,2500)}
+  };
+  const showActive=()=>{
+    const index=Math.max(0,Math.min(data.points.length-1,Number(chart.dataset.activeIndex)||0));
+    const point=data.points[index],rect=chart.getBoundingClientRect();
+    showPoint(point,index,rect.left+point.x/320*rect.width,rect.top+point.y/148*rect.height);
+  };
+  chart.addEventListener('pointerdown',showPointer);
+  chart.addEventListener('pointermove',showPointer);
+  chart.addEventListener('pointerleave',event=>{if(event.pointerType!=='touch')hide()});
+  chart.addEventListener('pointercancel',hide);
+  chart.addEventListener('focus',showActive);
+  chart.addEventListener('keydown',event=>{
+    let index=Math.max(0,Math.min(data.points.length-1,Number(chart.dataset.activeIndex)||0));
+    if(event.key==='ArrowLeft')index=Math.max(0,index-1);
+    else if(event.key==='ArrowRight')index=Math.min(data.points.length-1,index+1);
+    else if(event.key==='Home')index=0;
+    else if(event.key==='End')index=data.points.length-1;
+    else return;
+    event.preventDefault();chart.dataset.activeIndex=String(index);showActive();
+  });
+  chart.addEventListener('blur',hide);
 }
 function bindWidget(el,w){
   el.querySelectorAll('.mini-chart[data-chart-id]').forEach(chart=>bindChartTooltip(chart));
@@ -1691,7 +2019,25 @@ function showSettings(){
     }catch(error){const target=document.getElementById('settings-error');if(target)target.textContent=tr(error.message)}
   };
 }
-function showAssets(){const assets=state.config.assets||[];modal('<header class="modal-head"><div><h3>网络资产</h3><div class="helper">配置远程 TinyWatch 节点。每个节点需在“代理令牌”处填入目标主机生成的令牌。</div></div><button class="close" data-close>×</button></header><div>'+assets.map(a=>'<div class="disk-line"><span><strong>'+esc(a.name)+'</strong><div class="metric-sub">'+esc(a.url)+'</div></span><button class="button danger" data-remove="'+esc(a.id)+'">移除</button></div>').join('')+'</div><form id="asset-form" style="margin-top:16px"><div class="form-grid"><div class="field"><label>资产名称</label><input id="asset-name" required maxlength="80" placeholder="例如：edge-node-01"></div><div class="field"><label>服务地址</label><input id="asset-url" required placeholder="http://10.0.0.12:8765"></div><div class="field full"><label>代理令牌</label><input id="asset-password" required autocomplete="off" placeholder="在目标节点设置页复制代理令牌"></div></div><div class="error-message" id="asset-error"></div><div class="modal-actions"><button class="button primary">添加资产</button></div></form><div class="helper">本机代理令牌（复制到其他节点的资产配置中）：<br><code style="overflow-wrap:anywhere">'+esc(state.config.agent_token)+'</code></div>');document.getElementById('asset-form').onsubmit=async e=>{e.preventDefault();const a={id:'a-'+(crypto.randomUUID?crypto.randomUUID():Date.now()),name:document.getElementById('asset-name').value,url:document.getElementById('asset-url').value,password:document.getElementById('asset-password').value};const list=state.config.assets.slice();list.push(a);try{await api('/api/config','POST',{assets:list,widgets:state.config.widgets,theme:state.config.theme});state.config=await api('/api/config');closeModal();draw();await refresh();toast('网络资产已添加')}catch(err){document.getElementById('asset-error').textContent=tr(err.message)}};document.querySelectorAll('[data-remove]').forEach(b=>b.onclick=async()=>{const list=state.config.assets.filter(a=>a.id!==b.dataset.remove);state.config.assets=list;state.config.widgets=state.config.widgets.filter(w=>w.node==='local'||list.some(a=>a.id===w.node));try{await saveConfig();showAssets();draw();toast('资产已移除')}catch(e){toast(e.message)}})}
+function showAssets(){
+  const assets=state.config.assets||[];
+  const rows=assets.map(asset=>'<div class="disk-line"><span><strong>'+esc(asset.name)+'</strong> '+
+    (asset.secure_transport?'':'<span class="tag bad">'+tr('HTTPS required')+'</span>')+
+    '<div class="metric-sub">'+esc(asset.url)+'</div></span><button class="button danger" data-remove="'+esc(asset.id)+'">移除</button></div>').join('');
+  modal('<header class="modal-head"><div><h3>网络资产</h3><div class="helper">配置远程 TinyWatch 节点。每个节点需在“代理令牌”处填入目标主机生成的令牌。</div></div><button class="close" data-close>×</button></header><div>'+rows+'</div><form id="asset-form" style="margin-top:16px"><div class="form-grid"><div class="field"><label>资产名称</label><input id="asset-name" required maxlength="80" placeholder="例如：edge-node-01"></div><div class="field"><label>服务地址</label><input id="asset-url" required placeholder="https://node.example:8765"></div><div class="field full"><label>代理令牌</label><input id="asset-password" required autocomplete="off" placeholder="在目标节点设置页复制代理令牌"></div></div><div class="helper">'+tr('远程节点必须使用有效的 HTTPS 证书；HTTP 仅适用于本机 localhost 或回环地址。')+'</div><div class="error-message" id="asset-error"></div><div class="modal-actions"><button class="button primary">添加资产</button></div></form><div class="helper">本机代理令牌（复制到其他节点的资产配置中）：<br><code style="overflow-wrap:anywhere">'+esc(state.config.agent_token)+'</code></div>');
+  document.getElementById('asset-form').onsubmit=async event=>{
+    event.preventDefault();
+    const asset={id:'a-'+(crypto.randomUUID?crypto.randomUUID():Date.now()),name:document.getElementById('asset-name').value,url:document.getElementById('asset-url').value,password:document.getElementById('asset-password').value};
+    const list=state.config.assets.slice();list.push(asset);
+    try{await api('/api/config','POST',{assets:list,widgets:state.config.widgets,theme:state.config.theme});state.config=await api('/api/config');closeModal();draw();await refresh();toast('网络资产已添加')}
+    catch(error){document.getElementById('asset-error').textContent=tr(error.message)}
+  };
+  document.querySelectorAll('[data-remove]').forEach(button=>button.onclick=async()=>{
+    const list=state.config.assets.filter(asset=>asset.id!==button.dataset.remove);
+    state.config.assets=list;state.config.widgets=state.config.widgets.filter(widget=>widget.node==='local'||list.some(asset=>asset.id===widget.node));
+    try{await saveConfig();showAssets();draw();toast('资产已移除')}catch(error){toast(error.message)}
+  });
+}
 boot();
 </script></body></html>'''
 
@@ -1926,6 +2272,7 @@ class TinyWatchHandler(BaseHTTPRequestHandler):
         if isinstance(retention_days, bool) or retention_days not in HISTORY_RETENTION_OPTIONS:
             raise ValueError("历史数据保留天数无效")
         with STORE.lock:
+            previous_retention_days = STORE.persisted_retention_days
             previous = {item["id"]: item for item in STORE.data.get("assets", [])}
             assets = []
             identifiers = set()
@@ -1942,6 +2289,11 @@ class TinyWatchHandler(BaseHTTPRequestHandler):
                 if not name:
                     raise ValueError("资产名称不能为空")
                 url = _validate_asset_url(item.get("url", ""))
+                parsed_url = urllib.parse.urlsplit(url)
+                old_asset = previous.get(asset_id, {})
+                if (parsed_url.scheme == "http" and not _is_loopback_host(parsed_url.hostname)
+                        and (not old_asset or old_asset.get("url") != url)):
+                    raise ValueError("远程资产必须使用 HTTPS；HTTP 仅限 localhost / 回环地址")
                 password = item.get("password")
                 if not isinstance(password, str) or not password:
                     password = previous.get(asset_id, {}).get("password", "")
@@ -1972,16 +2324,9 @@ class TinyWatchHandler(BaseHTTPRequestHandler):
             STORE.data["theme"] = theme
             STORE.data["history_retention_days"] = retention_days
             retention_cutoff = time.time() - retention_days * 24 * 60 * 60
-            history = STORE.data.get("history", {})
-            if isinstance(history, dict):
-                for node_series in history.values():
-                    if not isinstance(node_series, dict):
-                        continue
-                    for metric, points in list(node_series.items()):
-                        if isinstance(points, list):
-                            node_series[metric] = [point for point in points
-                                                   if isinstance(point, list) and point and _number(point[0]) >= retention_cutoff]
-            STORE.save()
+            pruned = _prune_history_database(STORE.data, retention_cutoff)
+            backup_retention_days = retention_days if pruned or previous_retention_days != retention_days else None
+            STORE.save(backup_retention_days=backup_retention_days)
 
 
 class TinyWatchServer(ThreadingHTTPServer):
@@ -2004,6 +2349,9 @@ def main(argv=None):
         server = TinyWatchServer((args.host, args.port), TinyWatchHandler)
     except (OSError, ValueError) as exc:
         parser.error(str(exc))
+    if STORE.recovered_from_backup:
+        print("Warning: TinyWatch restored its JSON database from the known-good .bak file.", file=sys.stderr)
+        print("Review the restored settings and preserve the .corrupt-* file for inspection.", file=sys.stderr)
     actual_port = server.server_address[1]
     display_host = "127.0.0.1" if args.host in ("0.0.0.0", "::") else args.host
     print("%s %s listening on http://%s:%d" % (APP_NAME, APP_VERSION, display_host, actual_port))
