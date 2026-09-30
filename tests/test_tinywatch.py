@@ -1,6 +1,7 @@
 """Standard-library regression tests for TinyWatch storage and asset safety."""
 
 import json
+import copy
 import sys
 import tempfile
 import threading
@@ -136,23 +137,29 @@ class JsonStoreTests(unittest.TestCase):
 
 
 class RemoteAssetSafetyTests(unittest.TestCase):
-    def test_https_is_required_for_non_loopback_assets(self):
+    def test_ip_and_port_normalizes_to_http_and_https_is_optional(self):
+        self.assertEqual(tinywatch._validate_asset_url("10.0.0.12:8765"), "http://10.0.0.12:8765")
+        self.assertEqual(tinywatch._validate_asset_url("[::1]:8765"), "http://[::1]:8765")
         self.assertEqual(tinywatch._validate_asset_url("https://node.example:8765"), "https://node.example:8765")
         self.assertTrue(tinywatch._is_loopback_host("127.0.0.8"))
         self.assertTrue(tinywatch._is_loopback_host("::1"))
         self.assertTrue(tinywatch._is_loopback_host("host.localhost"))
         self.assertFalse(tinywatch._is_loopback_host("node.example"))
 
-    def test_plain_http_remote_is_rejected_before_request(self):
+    def test_plain_http_remote_uses_the_same_simple_token_request(self):
         asset = {"id": "remote-1", "name": "Remote", "url": "http://10.0.0.12:8765", "password": "secret-token"}
         with patch.object(tinywatch.urllib.request, "build_opener") as build_opener:
+            build_opener.return_value.open.side_effect = urllib.error.URLError("fixture offline")
             result = tinywatch._remote_snapshot(asset)
 
         self.assertFalse(result["online"])
         self.assertIsNone(result["metrics"])
-        build_opener.assert_not_called()
+        request = build_opener.return_value.open.call_args.args[0]
+        self.assertEqual(request.full_url, "http://10.0.0.12:8765/api/agent/metrics")
+        self.assertEqual(request.get_header("X-tinywatch-token"), "secret-token")
+        self.assertIn("fixture offline", result["error"])
 
-    def test_new_plain_http_remote_is_rejected_from_configuration(self):
+    def test_plain_http_remote_can_be_saved_without_a_certificate(self):
         with tempfile.TemporaryDirectory(prefix="tinywatch-config-tests-") as directory:
             store = tinywatch.JsonStore(Path(directory) / "data.json")
             handler = object.__new__(tinywatch.TinyWatchHandler)
@@ -163,10 +170,9 @@ class RemoteAssetSafetyTests(unittest.TestCase):
                 "history_retention_days": 7,
             }
             with patch.object(tinywatch, "STORE", store):
-                with self.assertRaisesRegex(ValueError, "必须使用 HTTPS"):
-                    handler._save_config(value)
+                handler._save_config(value)
 
-            self.assertEqual(store.data["assets"], [])
+            self.assertEqual(store.data["assets"][0]["url"], "http://10.0.0.12:8765")
 
     def test_redirect_handler_never_returns_a_followup_request(self):
         handler = tinywatch._RejectRedirectHandler()
@@ -368,6 +374,337 @@ class AuthenticationHardeningTests(unittest.TestCase):
             self.assertNotIn("; Secure", tinywatch._session_cookie("token", 100))
         with patch.object(tinywatch, "SECURE_COOKIE", True):
             self.assertIn("; Secure", tinywatch._session_cookie("token", 100))
+
+
+class AlertLifecycleTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory(prefix="tinywatch-alerts-")
+        self.addCleanup(directory.cleanup)
+        self.store = tinywatch.JsonStore(Path(directory.name) / "data.json")
+        self.now = int(time.time())
+        self.rule = {"id": "cpu-rule", "name": "CPU high", "node": "local", "metric": "cpu",
+                     "mode": "threshold", "threshold": 90, "recovery": 85,
+                     "duration": 120, "cooldown": 300, "enabled": True}
+        self.store.data["alert_rules"] = [self.rule]
+        patcher = patch.object(tinywatch, "STORE", self.store)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def node(self, value, offset=0):
+        stamp = tinywatch.datetime.fromtimestamp(self.now + offset, tinywatch.timezone.utc).isoformat()
+        return {"name": "Local", "online": True, "metrics": {
+            "sampled_at": stamp, "cpu": {"percent": value, "available": True},
+            "processes": [{"pid": 123, "name": "fixture-worker", "cpu": value, "memory": 100}],
+            "logins": [{"kind": "SSH", "message": "fixture event"}],
+            "dns": {"count": 3, "source": "fixture"}}}
+
+    def evaluate(self, value, offset):
+        tinywatch._evaluate_alerts({"local": self.node(value, offset)}, self.now + offset)
+
+    def test_duration_deduplication_hysteresis_and_cooldown(self):
+        for offset in (0, 60, 120, 180):
+            self.evaluate(95, offset)
+        self.assertEqual(len(self.store.data["incidents"]), 1)
+        incident = self.store.data["incidents"][0]
+        self.assertEqual(incident["triggered_at"], self.now + 120)
+        self.assertEqual(incident["context"]["processes"][0]["name"], "fixture-worker")
+        self.evaluate(88, 240)
+        self.assertEqual(incident["status"], "active")
+        self.evaluate(84, 300)
+        self.assertEqual(incident["status"], "resolved")
+        for offset in (360, 420, 480, 540, 600, 660):
+            self.evaluate(95, offset)
+        self.assertEqual(len(self.store.data["incidents"]), 1)
+        self.evaluate(95, 720)
+        self.assertEqual(len(self.store.data["incidents"]), 2)
+
+    def test_unknown_metrics_reset_pending_and_never_resolve_an_incident(self):
+        self.evaluate(95, 0)
+        broken = self.node(0, 60)
+        broken["metrics"]["collector_errors"] = {"cpu": "fixture failure"}
+        tinywatch._evaluate_alerts({"local": broken}, self.now + 60)
+        self.evaluate(95, 120)
+        self.evaluate(95, 180)
+        self.assertEqual(self.store.data["incidents"], [])
+        self.evaluate(95, 240)
+        self.assertEqual(self.store.data["incidents"][0]["status"], "active")
+        broken["metrics"]["sampled_at"] = self.node(0, 300)["metrics"]["sampled_at"]
+        tinywatch._evaluate_alerts({"local": broken}, self.now + 300)
+        self.assertEqual(self.store.data["incidents"][0]["status"], "active")
+
+    def test_sampler_pause_does_not_count_as_continuous_breach(self):
+        self.evaluate(95, 0)
+        self.evaluate(95, 300)
+        self.evaluate(95, 360)
+        self.assertEqual(self.store.data["incidents"], [])
+        self.evaluate(95, 420)
+        self.assertEqual(len(self.store.data["incidents"]), 1)
+
+    def test_baseline_warmup_and_frozen_explainable_threshold(self):
+        self.rule.update(mode="baseline", threshold=10, recovery=0, duration=60)
+        self.evaluate(50, 0)
+        self.assertEqual(self.store.data["alert_states"]["cpu-rule:local"]["evaluation"], "warming_up")
+        self.store.data["history"] = {"local": {"cpu": [
+            [self.now - (index + 11) * 60, 15.25] for index in range(60)
+        ]}}
+        self.evaluate(50, 60)
+        self.evaluate(50, 120)
+        incident = self.store.data["incidents"][0]
+        self.assertEqual(incident["baseline"]["median"], 15.25)
+        self.assertEqual(incident["baseline"]["samples"], 60)
+        self.assertEqual(incident["threshold"], 25.25)
+        self.store.data["history"]["local"]["cpu"] = [[self.now - 1000, 99]] * 60
+        self.evaluate(50, 180)
+        self.assertEqual(incident["status"], "active")
+        self.evaluate(20, 240)
+        self.assertEqual(incident["status"], "resolved")
+
+    def test_acknowledgement_is_idempotent_and_does_not_end_monitoring(self):
+        self.rule["duration"] = 0
+        self.evaluate(95, 0)
+        incident = self.store.data["incidents"][0]
+        self.assertTrue(tinywatch._acknowledge_incident(incident["id"]))
+        acknowledged_at = incident["acknowledged_at"]
+        self.assertTrue(tinywatch._acknowledge_incident(incident["id"]))
+        self.assertEqual(incident["acknowledged_at"], acknowledged_at)
+        self.assertEqual(incident["status"], "active")
+        self.assertEqual(tinywatch._alert_counts()["unacknowledged_count"], 0)
+        self.evaluate(80, 60)
+        self.assertEqual(incident["status"], "resolved")
+
+    def test_open_incident_survives_restart_without_duplicate(self):
+        self.rule["duration"] = 0
+        self.evaluate(95, 0)
+        self.store.save()
+        reopened = tinywatch.JsonStore(self.store.path)
+        with patch.object(tinywatch, "STORE", reopened):
+            self.evaluate(95, 60)
+        self.assertEqual(len(reopened.data["incidents"]), 1)
+        self.assertEqual(reopened.data["incidents"][0]["status"], "active")
+
+    def test_rule_edit_resolves_old_incident_and_clears_pending_state(self):
+        self.rule["duration"] = 0
+        self.evaluate(95, 0)
+        changed = dict(self.rule, threshold=98)
+        tinywatch._save_alert_rules([changed])
+        self.assertEqual(self.store.data["incidents"][0]["resolution_reason"], "rule_changed")
+        self.assertEqual(self.store.data["alert_states"], {})
+        self.evaluate(95, 60)
+        self.assertEqual(len(self.store.data["incidents"]), 1)
+
+    def test_invalid_rule_config_is_rejected_without_mutation(self):
+        original = copy.deepcopy(self.store.data["alert_rules"])
+        for change in ({"threshold": float("nan")}, {"recovery": 95}, {"duration": -1},
+                       {"cooldown": float("inf")}, {"node": []}, {"node": "missing"},
+                       {"metric": "invalid"}, {"metric": "offline", "threshold": 1},
+                       {"mode": "baseline", "threshold": 0}):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                tinywatch._save_alert_rules([dict(self.rule, **change)])
+            self.assertEqual(self.store.data["alert_rules"], original)
+
+    def test_offline_rule_applies_to_each_asset_and_recovers(self):
+        self.rule.update(node="*", metric="offline", threshold=0, recovery=0, duration=60)
+        nodes = {"local": self.node(0), "remote-1": {"name": "Remote", "online": False, "error": "fixture"}}
+        tinywatch._evaluate_alerts(nodes, self.now)
+        tinywatch._evaluate_alerts(nodes, self.now + 60)
+        incident = self.store.data["incidents"][0]
+        self.assertEqual(incident["node"], "remote-1")
+        nodes["remote-1"]["online"] = True
+        tinywatch._evaluate_alerts(nodes, self.now + 120)
+        self.assertEqual(incident["status"], "resolved")
+
+    def test_removed_asset_closes_incident_and_removes_targeted_rules(self):
+        self.store.data["assets"] = [{"id": "remote-1", "name": "Remote", "url": "http://node:8765", "password": "token"}]
+        self.rule.update(node="remote-1", metric="offline", threshold=0, recovery=0, duration=0)
+        tinywatch._evaluate_alerts({"remote-1": {"online": False}}, self.now)
+        handler = object.__new__(tinywatch.TinyWatchHandler)
+        handler._save_config({"assets": [], "widgets": []})
+        self.assertEqual(self.store.data["incidents"][0]["resolution_reason"], "asset_removed")
+        self.assertEqual(self.store.data["alert_rules"], [])
+        self.assertEqual(self.store.data["alert_states"], {})
+
+    def test_retention_prunes_closed_incidents_but_keeps_open_ones(self):
+        cutoff = self.now - 86400
+        self.store.data["incidents"] = [
+            {"status": "active", "resolved_at": None, "triggered_at": cutoff - 100},
+            {"status": "resolved", "resolved_at": cutoff - 1},
+            {"status": "resolved", "resolved_at": self.now}]
+        tinywatch._prune_history_database(self.store.data, cutoff)
+        self.assertEqual(len(self.store.data["incidents"]), 2)
+        self.assertEqual(self.store.data["incidents"][0]["status"], "active")
+
+    def test_incident_capacity_evicts_closed_incidents_and_preserves_active(self):
+        self.rule["duration"] = 0
+        self.evaluate(95, 0)
+        active_id = self.store.data["incidents"][0]["id"]
+        self.store.data["incidents"].extend({"id": "closed-" + str(index), "status": "resolved",
+                                             "triggered_at": self.now + index}
+                                            for index in range(tinywatch.MAX_INCIDENTS + 10))
+        self.evaluate(95, 60)
+        self.assertEqual(len(self.store.data["incidents"]), tinywatch.MAX_INCIDENTS)
+        self.assertTrue(any(item["id"] == active_id for item in self.store.data["incidents"]))
+
+
+class HistoryCompactionTests(unittest.TestCase):
+    def test_compaction_preserves_peaks_real_gaps_and_is_idempotent(self):
+        now = int(time.time())
+        base = (now - 2 * 86400) // 300 * 300
+        points = [[base + index * 60, 99 if index == 5 else 12]
+                  for index in range(30) if not 8 <= index < 12]
+        data = {"history": {"local": {"cpu": points}}}
+        self.assertTrue(tinywatch._compact_history_database(data, now))
+        compacted = data["history"]["local"]["cpu"]
+        self.assertLess(len(compacted), len(points))
+        self.assertTrue(any(point[0] == base + 5 * 60 and point[1] == 99 for point in compacted))
+        gaps = [point[0] for point in compacted if tinywatch._point_metadata(point).get("gap_before")]
+        self.assertEqual(gaps, [base + 12 * 60])
+        self.assertFalse(tinywatch._compact_history_database(data, now))
+
+    def test_recent_samples_keep_fractional_precision_and_resolution(self):
+        now = int(time.time())
+        points = [[now - 120, 12.25], [now - 60, 13.75]]
+        data = {"history": {"local": {"cpu": copy.deepcopy(points)}}}
+        self.assertFalse(tinywatch._compact_history_database(data, now))
+        self.assertEqual(data["history"]["local"]["cpu"], points)
+
+    def test_hourly_network_compaction_preserves_each_interface_extreme(self):
+        now = int(time.time())
+        base = (now - 8 * 86400) // 3600 * 3600
+        points = [[base + index * 60, {"eth0": [99 if index == 10 else 1, 0],
+                                     "eth1": [1 if index == 10 else 99, 0]}] for index in range(60)]
+        data = {"history": {"local": {"network": points}}}
+        tinywatch._compact_history_database(data, now)
+        compacted = data["history"]["local"]["network"]
+        self.assertLessEqual(len(compacted), 6)
+        self.assertTrue(any(point[1]["eth0"][0] == 99 for point in compacted))
+        self.assertTrue(any(point[1]["eth1"][0] == 99 for point in compacted))
+        self.assertTrue(all(tinywatch._point_metadata(point)["resolution"] == 3600 for point in compacted))
+
+    def test_history_response_preserves_only_real_gap_markers(self):
+        with tempfile.TemporaryDirectory(prefix="tinywatch-history-response-") as directory:
+            store = tinywatch.JsonStore(Path(directory) / "data.json")
+            now = int(time.time())
+            base = (now - 2 * 86400) // 300 * 300
+            store.data["history"] = {"local": {"cpu": [[base + i * 60, i % 7]
+                                                       for i in range(100) if not 20 <= i < 30]}}
+            tinywatch._compact_history_database(store.data, now)
+            with patch.object(tinywatch, "STORE", store):
+                response = tinywatch._history_response("local", "cpu", "3d")
+            self.assertEqual(len(response["points"]), len(response["gaps"]))
+            self.assertEqual(sum(response["gaps"]), 1)
+            gap = response["gaps"].index(True)
+            self.assertEqual(response["points"][gap][0], base + 30 * 60)
+            self.assertTrue(all(len(point) == 2 for point in response["points"]))
+
+    def test_large_history_response_is_bounded_and_preserves_peak_and_gap(self):
+        rows = [[index * 60, 100 if index == 2345 else 12] for index in range(5000)]
+        gaps = [index == 3478 for index in range(5000)]
+        limited, flags = tinywatch._limit_history_points(rows, gaps, "cpu")
+        self.assertLessEqual(len(limited), 1200)
+        self.assertIn([2345 * 60, 100], limited)
+        self.assertEqual(sum(flags), 1)
+        self.assertEqual(limited[flags.index(True)][0], 3478 * 60)
+
+    def test_interface_absence_is_a_gap_instead_of_zero_bandwidth(self):
+        with tempfile.TemporaryDirectory(prefix="tinywatch-interface-gap-") as directory:
+            store = tinywatch.JsonStore(Path(directory) / "data.json")
+            now = int(time.time())
+            store.data["history"] = {"local": {"network": [
+                [now - 180, {"eth0": [10, 20]}], [now - 120, {"eth1": [30, 40]}],
+                [now - 60, {"eth0": [50, 60]}]]}}
+            with patch.object(tinywatch, "STORE", store):
+                response = tinywatch._history_response("local", "network", "1h", "eth0")
+            self.assertEqual(response["points"], [[now - 180, 10, 20], [now - 60, 50, 60]])
+            self.assertEqual(response["gaps"], [False, True])
+
+    def test_minute_sampling_keeps_fractional_load_and_cpu(self):
+        with tempfile.TemporaryDirectory(prefix="tinywatch-precision-") as directory:
+            store = tinywatch.JsonStore(Path(directory) / "data.json")
+            store.data["alert_rules"] = []
+            node = {"online": True, "metrics": {"cpu": {"percent": 12.75}, "load": [0.25, 1.5, 2.75]}}
+            with patch.object(tinywatch, "STORE", store), patch.object(tinywatch, "HISTORY_LAST_WRITE", 0):
+                tinywatch._record_history({"local": node}, now=int(time.time()))
+            self.assertEqual(store.data["history"]["local"]["cpu"][0][1], 12.75)
+            self.assertEqual(store.data["history"]["local"]["load"][0][1:], [0.25, 1.5, 2.75])
+
+
+class MonitoringApiTests(unittest.TestCase):
+    def test_rule_configuration_and_incident_acknowledgement_through_handler(self):
+        with tempfile.TemporaryDirectory(prefix="tinywatch-alert-api-") as directory:
+            store = tinywatch.JsonStore(Path(directory) / "data.json")
+            response = []
+            handler = object.__new__(tinywatch.TinyWatchHandler)
+            handler.path = "/api/alerts"
+            handler._json = lambda status, value, headers=None: response.append((status, value))
+            rule = {"id": "offline", "name": "Unavailable", "node": "local", "metric": "offline",
+                    "mode": "threshold", "threshold": 0, "recovery": 0, "duration": 0,
+                    "cooldown": 300, "enabled": True}
+            handler._read_json = lambda: {"action": "save_rules", "rules": [rule]}
+            with patch.object(tinywatch, "STORE", store), \
+                    patch.object(tinywatch, "_session_from_request", return_value=True):
+                handler.do_POST()
+                self.assertEqual(response[-1][0], tinywatch.HTTPStatus.OK)
+                self.assertEqual(response[-1][1]["rules"][0]["id"], "offline")
+                tinywatch._evaluate_alerts({"local": {"online": False}}, time.time())
+                handler.do_GET()
+                incident_id = response[-1][1]["incidents"][0]["id"]
+                self.assertEqual(response[-1][1]["active_count"], 1)
+                handler._read_json = lambda: {"action": "ack", "id": incident_id}
+                handler.do_POST()
+                self.assertEqual(response[-1][1]["unacknowledged_count"], 0)
+                handler._read_json = lambda: {"action": "save_rules", "rules": [dict(rule, threshold=-1)]}
+                handler.do_POST()
+                self.assertEqual(response[-1][0], tinywatch.HTTPStatus.BAD_REQUEST)
+                self.assertEqual(store.data["alert_rules"][0]["threshold"], 0)
+                handler._read_json = lambda: {"action": "ack", "id": "missing"}
+                handler.do_POST()
+                self.assertEqual(response[-1][0], tinywatch.HTTPStatus.NOT_FOUND)
+
+    def test_alert_response_is_a_snapshot_not_a_mutable_store_reference(self):
+        with tempfile.TemporaryDirectory(prefix="tinywatch-alert-response-") as directory:
+            store = tinywatch.JsonStore(Path(directory) / "data.json")
+            with patch.object(tinywatch, "STORE", store):
+                response = tinywatch._alerts_response()
+            response["rules"][0]["enabled"] = False
+            self.assertTrue(store.data["alert_rules"][0]["enabled"])
+
+    def test_diagnostics_distinguish_offline_stale_partial_and_healthy(self):
+        now = int(time.time())
+        metrics = {"sampled_at": tinywatch.datetime.fromtimestamp(now, tinywatch.timezone.utc).isoformat(),
+                   "cpu": {"available": True}, "memory": {"supported": True},
+                   "disk": {"supported": True}, "network": {"supported": True}, "load": [0.1]}
+        stale = dict(metrics, sampled_at=tinywatch.datetime.fromtimestamp(now - 121, tinywatch.timezone.utc).isoformat())
+        partial = dict(metrics, collector_errors={"memory": "fixture denied"})
+        report = tinywatch._diagnostics_response({"nodes": {
+            "ok": {"online": True, "metrics": metrics},
+            "old": {"online": True, "metrics": stale},
+            "partial": {"online": True, "metrics": partial},
+            "off": {"online": False, "error": "fixture offline"}}}, now=now)
+        self.assertEqual([node["status"] for node in report["nodes"]], ["healthy", "stale", "partial", "offline"])
+        self.assertEqual(report["nodes"][2]["issues"][0]["message"], "fixture denied")
+
+    def test_missing_timestamp_and_future_node_clock_are_reported(self):
+        now = int(time.time())
+        future = tinywatch.datetime.fromtimestamp(now + 300, tinywatch.timezone.utc).isoformat()
+        report = tinywatch._diagnostics_response({"nodes": {
+            "unknown": {"online": True, "metrics": {}},
+            "future": {"online": True, "metrics": {"sampled_at": future}}}}, now=now)
+        self.assertEqual(report["nodes"][0]["status"], "stale")
+        self.assertTrue(any(issue["kind"] == "clock_skew" for issue in report["nodes"][1]["issues"]))
+
+    def test_new_endpoints_require_login_without_opening_any_network_socket(self):
+        for path, method in (("/api/alerts", "GET"), ("/api/diagnostics", "GET"), ("/api/alerts", "POST")):
+            with self.subTest(path=path, method=method):
+                response = []
+                handler = object.__new__(tinywatch.TinyWatchHandler)
+                handler.path = path
+                handler._json = lambda status, value, headers=None: response.append((status, value))
+                handler._read_json = lambda: {"action": "ack", "id": "missing"}
+                with patch.object(tinywatch, "_session_from_request", return_value=False), \
+                        patch.object(tinywatch, "collect_cluster_snapshot") as collect:
+                    (handler.do_GET if method == "GET" else handler.do_POST)()
+                self.assertEqual(response[-1][0], tinywatch.HTTPStatus.UNAUTHORIZED)
+                collect.assert_not_called()
 
 
 if __name__ == "__main__":

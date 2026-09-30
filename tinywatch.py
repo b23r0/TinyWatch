@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import copy
 import hashlib
 import ipaddress
 import json
@@ -22,6 +23,7 @@ import re
 import secrets
 import shutil
 import socket
+import statistics
 import subprocess
 import sys
 import threading
@@ -44,6 +46,11 @@ MAX_BODY_BYTES = 1_000_000
 MAX_ASSETS = 16
 MAX_WIDGETS = 32
 HISTORY_INTERVAL = 60
+HISTORY_GAP_SECONDS = 90
+HISTORY_COMPACT_INTERVAL = 3600
+MAX_ALERT_RULES = 32
+MAX_INCIDENTS = 1024
+ALERT_METRICS = ("cpu", "memory", "disk", "network", "load", "offline", "stale")
 CLUSTER_CACHE_SECONDS = 5
 HISTORY_RETENTION_DEFAULT_DAYS = 7
 HISTORY_RETENTION_OPTIONS = (1, 3, 7, 14, 30)
@@ -922,6 +929,7 @@ def default_store_path():
 
 def empty_database():
     return {"schema": 1, "password": None, "agent_token": secrets.token_urlsafe(32),
+            "alert_rules": default_alert_rules(), "alert_states": {}, "incidents": [],
             "assets": [], "history": {}, "history_retention_days": HISTORY_RETENTION_DEFAULT_DAYS, "widgets": [{"id": "local-cpu", "node": "local", "metric": "cpu"},
                                        {"id": "local-memory", "node": "local", "metric": "memory"},
                                        {"id": "local-network", "node": "local", "metric": "network"},
@@ -949,6 +957,13 @@ def _prune_history_database(database, cutoff):
                 if len(filtered) != len(points):
                     changed = True
                 node_series[metric] = filtered
+    incidents = database.get("incidents", [])
+    if isinstance(incidents, list):
+        retained = [item for item in incidents if isinstance(item, dict) and
+                    (item.get("status") == "active" or _number(item.get("resolved_at")) >= cutoff)]
+        if retained != incidents:
+            database["incidents"] = retained
+            changed = True
     return changed
 
 
@@ -961,15 +976,18 @@ class JsonStore:
         self.lock = threading.RLock()
         self.recovered_from_backup = False
         self.persisted_retention_days = None
+        self.last_compact_at = 0
         self._known_main_signature = None
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.data = self._load()
         self.persisted_retention_days = self._retention_days(self.data)
         cutoff = time.time() - self.persisted_retention_days * 24 * 60 * 60
         pruned = _prune_history_database(self.data, cutoff)
+        compacted = _compact_history_database(self.data, time.time())
+        self.last_compact_at = time.time()
         if not self.recovered_from_backup and self._valid_database_file(self.path):
             self._known_main_signature = self._file_signature(self.path)
-        if self.recovered_from_backup or pruned:
+        if self.recovered_from_backup or pruned or compacted:
             self.save(backup_retention_days=self.persisted_retention_days)
 
     @staticmethod
@@ -1081,7 +1099,7 @@ class JsonStore:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             temporary = self.path.with_name(self.path.name + ".tmp")
             backup_temporary = self.backup_path.with_name(self.backup_path.name + ".tmp")
-            encoded = json.dumps(self.data, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8")
+            encoded = json.dumps(self.data, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
             self._write_synced(temporary, encoded)
             if self._main_is_known_good():
                 if backup_retention_days is not None:
@@ -1089,7 +1107,7 @@ class JsonStore:
                         previous = json.load(current)
                     previous["history_retention_days"] = backup_retention_days
                     _prune_history_database(previous, time.time() - backup_retention_days * 24 * 60 * 60)
-                    backup_content = json.dumps(previous, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8")
+                    backup_content = json.dumps(previous, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
                     self._write_synced(backup_temporary, backup_content)
                 else:
                     with self.path.open("rb") as current, backup_temporary.open("wb") as backup:
@@ -1133,6 +1151,8 @@ def _password_matches(password, record):
 
 def _validate_asset_url(value):
     value = str(value or "").strip()
+    if value and "://" not in value:
+        value = "http://" + value
     if len(value) > 300:
         raise ValueError("资产地址过长")
     parsed = urllib.parse.urlsplit(value)
@@ -1221,11 +1241,7 @@ def _remote_snapshot(asset):
             last_success_at = previous.get("sampled_at")
     if last_success_at is None:
         last_success_at = _historical_last_success(asset_id)
-    parsed = urllib.parse.urlsplit(asset["url"])
-    if parsed.scheme != "https" and not _is_loopback_host(parsed.hostname):
-        return {"id": asset_id, "name": asset["name"], "online": False,
-                "error": "远程资产必须使用 HTTPS；HTTP 仅限 localhost / 回环地址",
-                "metrics": None, "last_success_at": last_success_at}
+    request_started = time.monotonic()
     endpoint = asset["url"].rstrip("/") + "/api/agent/metrics"
     request = urllib.request.Request(endpoint, headers={"X-TinyWatch-Token": asset["password"],
                                                         "Accept": "application/json", "User-Agent": "TinyWatch/" + APP_VERSION})
@@ -1240,7 +1256,11 @@ def _remote_snapshot(asset):
             if (not isinstance(data, dict)
                     or any(not isinstance(data.get(key), dict) for key in required_objects)
                     or not isinstance(data.get("load", []), list)
-                    or not isinstance(data["network"].get("interfaces", []), list)):
+                    or not isinstance(data["network"].get("interfaces", []), list)
+                    or not isinstance(data.get("processes", []), list)
+                    or not isinstance(data.get("logins", []), list)
+                    or not isinstance(data.get("dns", {}), dict)
+                    or not isinstance(data.get("collector_errors", {}), dict)):
                 raise ValueError("invalid metric response")
             try:
                 sampled = datetime.fromisoformat(str(data.get("sampled_at", "")).replace("Z", "+00:00"))
@@ -1252,12 +1272,437 @@ def _remote_snapshot(asset):
             with REMOTE_STATUS_LOCK:
                 REMOTE_LAST_SUCCESS[asset_id] = {"url": asset["url"], "sampled_at": last_success_at}
             return {"id": asset_id, "name": asset["name"], "online": True,
-                    "metrics": data, "last_success_at": last_success_at}
+                    "metrics": data, "last_success_at": last_success_at,
+                    "latency_ms": round((time.monotonic() - request_started) * 1000, 1)}
     except Exception as exc:
         reason = getattr(exc, "reason", exc)
         return {"id": asset_id, "name": asset["name"], "online": False,
                 "error": _safe_text(reason, 140), "metrics": None,
-                "last_success_at": last_success_at}
+                "last_success_at": last_success_at,
+                "latency_ms": round((time.monotonic() - request_started) * 1000, 1)}
+
+
+def _point_metadata(point):
+    """Optional trailing metadata keeps existing schema-1 numeric rows readable."""
+    if len(point) > 2 and isinstance(point[-1], dict) and "resolution" in point[-1]:
+        return point[-1]
+    return {}
+
+
+def _point_values(metric, point):
+    if metric == "network":
+        interfaces = point[1] if len(point) > 1 and isinstance(point[1], dict) else {}
+        result = {"total": sum(sum(_number(value) for value in rates[:2])
+                               for rates in interfaces.values() if isinstance(rates, list))}
+        for name, rates in interfaces.items():
+            if isinstance(rates, list):
+                for index, value in enumerate(rates[:2]):
+                    result[(name, index)] = _number(value)
+        return result
+    length = len(point) - (1 if _point_metadata(point) else 0)
+    return {index: float(point[index]) for index in range(1, length)
+            if isinstance(point[index], (int, float)) and math.isfinite(point[index])}
+
+
+def _compact_history_database(database, now):
+    """Retain actual first/last/extreme samples, never average away short peaks.
+
+    Recent 24h stays at one minute; older data uses 5-minute buckets and data
+    older than 7 days uses hourly buckets. Explicit gap flags survive repeated
+    compaction, so sparse retention never creates or conceals collection gaps.
+    """
+    changed = False
+    history = database.get("history", {})
+    if not isinstance(history, dict):
+        return False
+    for series in history.values():
+        if not isinstance(series, dict):
+            continue
+        for metric, points in list(series.items()):
+            if not isinstance(points, list) or metric not in ALERT_METRICS[:5]:
+                continue
+            groups, current, key, previous = [], [], None, None
+            for point in points:
+                if not isinstance(point, list) or len(point) < 2:
+                    continue
+                stamp = _number(point[0])
+                resolution = 3600 if stamp < now - 7 * 86400 else (300 if stamp < now - 86400 else 60)
+                metadata = _point_metadata(point)
+                resolution = max(resolution, _number(metadata.get("resolution"), 60))
+                gap = bool(metadata["gap_before"]) if "gap_before" in metadata else (
+                    previous is not None and stamp - previous > HISTORY_GAP_SECONDS)
+                group_key = (resolution, stamp // resolution)
+                if current and (group_key != key or gap):
+                    groups.append(current)
+                    current = []
+                values = point[:-1] if metadata else point[:]
+                # Recent raw rows stay unchanged unless they mark a real gap.
+                if resolution > 60 or gap:
+                    values.append({"resolution": resolution, "gap_before": gap})
+                current.append(values)
+                key, previous = group_key, stamp
+            if current:
+                groups.append(current)
+            retained = []
+            for group in groups:
+                if _point_metadata(group[0]).get("resolution", 60) == 60:
+                    retained.extend(group)
+                    continue
+                selected = {0, len(group) - 1}
+                dimensions = {}
+                for index, point in enumerate(group):
+                    for dimension, value in _point_values(metric, point).items():
+                        dimensions.setdefault(dimension, []).append((value, index))
+                for values in dimensions.values():
+                    selected.add(min(values)[1])
+                    selected.add(max(values)[1])
+                retained.extend(group[index] for index in sorted(selected))
+            if retained != points:
+                series[metric] = retained
+                changed = True
+    return changed
+
+
+def default_alert_rules():
+    """Quiet starter rules; all timings are evaluated by the minute sampler."""
+    rules = []
+    for metric, duration in (("cpu", 180), ("memory", 180), ("disk", 300), ("offline", 120)):
+        rules.append({"id": "default-" + metric, "name": "", "node": "*", "metric": metric,
+                      "mode": "threshold", "threshold": 0 if metric == "offline" else 90,
+                      "recovery": 0 if metric == "offline" else 85, "duration": duration,
+                      "cooldown": 300, "enabled": True})
+    return rules
+
+
+def _finite_value(value):
+    if isinstance(value, bool):
+        return None
+    try:
+        value = float(value)
+        return value if math.isfinite(value) else None
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _sample_age(node, now):
+    stamp = (node.get("metrics") or {}).get("sampled_at") or node.get("last_success_at")
+    try:
+        sampled = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+        if sampled.tzinfo is None:
+            sampled = sampled.replace(tzinfo=timezone.utc)
+        return round(now - sampled.timestamp(), 1)
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+
+
+def _metric_value(node, metric, now):
+    """Missing/failed measurements are unknown, never a zero or a recovery."""
+    if metric == "offline":
+        return 0.0 if node.get("online") else 1.0
+    if not node.get("online"):
+        return None
+    if metric == "stale":
+        age = _sample_age(node, now)
+        return max(0, age) if age is not None else None
+    data = node.get("metrics") or {}
+    age = _sample_age(node, now)
+    if age is not None and (age > 120 or age < -120):
+        return None
+    if metric in data.get("collector_errors", {}):
+        return None
+    item = data.get(metric)
+    if metric == "load":
+        return _finite_value(item[0]) if isinstance(item, list) and item else None
+    if not isinstance(item, dict) or item.get("supported") is False or item.get("available") is False:
+        return None
+    if metric == "network":
+        rx, tx = _finite_value(item.get("rx_rate")), _finite_value(item.get("tx_rate"))
+        return _finite_value(rx + tx) if rx is not None and tx is not None else None
+    return _finite_value(item.get("percent"))
+
+
+def _historical_value(metric, point):
+    values = _point_values(metric, point)
+    if metric == "network":
+        return values.get("total")
+    return values.get(3 if metric in ("memory", "disk") else 1)
+
+
+def _baseline_for(node_id, metric, now, minimum_delta):
+    """Robust 24h baseline excluding the most recent 10 minutes of an incident."""
+    history = STORE.data.get("history", {}).get(node_id, {}).get(metric, [])
+    values = []
+    for point in history:
+        if not isinstance(point, list) or not point or not now - 86400 <= _number(point[0]) <= now - 600:
+            continue
+        value = _historical_value(metric, point)
+        if value is not None and math.isfinite(value):
+            values.append(value)
+    if len(values) < 30:
+        return None
+    median = statistics.median(values)
+    mad = statistics.median(abs(value - median) for value in values)
+    delta = max(minimum_delta, 3 * 1.4826 * mad)
+    if not all(math.isfinite(value) for value in (median, mad, delta, median + delta)):
+        return None
+    return {"median": round(median, 3), "mad": round(mad, 3), "samples": len(values),
+            "threshold": round(median + delta, 3), "recovery": round(median + delta * .7, 3),
+            "window_seconds": 86400, "excluded_seconds": 600}
+
+
+def _validate_alert_rules(value, valid_nodes):
+    if not isinstance(value, list) or len(value) > MAX_ALERT_RULES:
+        raise ValueError("Alert rules must be a list of at most 32 rules")
+    rules, identifiers = [], set()
+    for raw in value:
+        if not isinstance(raw, dict):
+            raise ValueError("Invalid alert rule")
+        rule_id = raw.get("id", "")
+        node_id, metric = raw.get("node"), raw.get("metric")
+        mode = raw.get("mode", "threshold")
+        if (not isinstance(rule_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", rule_id)
+                or rule_id in identifiers or not isinstance(node_id, str) or node_id not in valid_nodes | {"*"}
+                or not isinstance(metric, str) or metric not in ALERT_METRICS
+                or not isinstance(mode, str) or mode not in ("threshold", "baseline")):
+            raise ValueError("Invalid rule identity, node, metric or mode")
+        if metric in ("offline", "stale") and mode != "threshold":
+            raise ValueError("Availability rules require threshold mode")
+        threshold, recovery = _finite_value(raw.get("threshold")), _finite_value(raw.get("recovery"))
+        duration, cooldown = _finite_value(raw.get("duration")), _finite_value(raw.get("cooldown"))
+        if (threshold is None or recovery is None or threshold < 0 or recovery < 0
+                or duration is None or cooldown is None or not 0 <= duration <= 86400
+                or not 0 <= cooldown <= 7 * 86400 or duration != int(duration) or cooldown != int(cooldown)
+                or (mode == "threshold" and recovery > threshold)
+                or (mode == "baseline" and threshold <= 0)):
+            raise ValueError("Invalid thresholds, duration or cooldown")
+        if metric == "offline" and (threshold != 0 or recovery != 0):
+            raise ValueError("Offline rules use threshold and recovery 0")
+        if metric in ("cpu", "memory", "disk") and max(threshold, recovery) > 100:
+            raise ValueError("Percentage thresholds must not exceed 100")
+        name, enabled = raw.get("name", ""), raw.get("enabled", True)
+        if not isinstance(name, str) or len(name) > 80 or not isinstance(enabled, bool):
+            raise ValueError("Invalid rule name or enabled flag")
+        identifiers.add(rule_id)
+        rules.append({"id": rule_id, "name": name.strip(), "node": node_id, "metric": metric,
+                      "mode": mode, "threshold": threshold, "recovery": recovery,
+                      "duration": int(duration), "cooldown": int(cooldown), "enabled": enabled})
+    return rules
+
+
+def _incident_context(node):
+    """Bounded observations near the trigger; correlations are not diagnoses."""
+    metrics = node.get("metrics") or {}
+    processes = sorted([item for item in metrics.get("processes", []) if isinstance(item, dict)],
+                       key=lambda item: _finite_value(item.get("cpu")) or 0, reverse=True)[:3]
+    return {"processes": [{"pid": _number(item.get("pid")), "name": _safe_text(item.get("name"), 80),
+                           "cpu": _finite_value(item.get("cpu")), "memory": _number(item.get("memory"))}
+                          for item in processes],
+            "logins": [{"kind": _safe_text(item.get("kind"), 40),
+                        "message": _safe_text(item.get("message"), 180)}
+                       for item in metrics.get("logins", [])[:3] if isinstance(item, dict)],
+            "dns": {"count": _number((metrics.get("dns") or {}).get("count")),
+                    "source": _safe_text((metrics.get("dns") or {}).get("source"), 80)},
+            "collector_errors": {str(key)[:30]: _safe_text(value, 180)
+                                 for key, value in metrics.get("collector_errors", {}).items()},
+            "connection_error": _safe_text(node.get("error"), 180)}
+
+
+def _resolve_incident(incident, now, reason):
+    incident.update(status="resolved", resolved_at=int(now), resolution_reason=reason)
+
+
+def _evaluate_alerts(nodes, now):
+    """Persistent state machine: pending -> active -> resolved, with hysteresis.
+
+    A collection gap resets pending duration. Unknown metrics leave an active
+    incident open; acknowledgement never suppresses collection or recovery.
+    """
+    states = STORE.data.setdefault("alert_states", {})
+    incidents = STORE.data.setdefault("incidents", [])
+    active = {item["id"]: item for item in incidents if item.get("status") == "active"}
+    valid_keys = set()
+    for rule in STORE.data.get("alert_rules", []):
+        if not rule.get("enabled"):
+            continue
+        targets = nodes.items() if rule["node"] == "*" else [(rule["node"], nodes.get(rule["node"]))]
+        for node_id, node in targets:
+            if node is None:
+                continue
+            key = rule["id"] + ":" + node_id
+            valid_keys.add(key)
+            state = states.setdefault(key, {})
+            incident = active.get(state.get("active_id"))
+            value = _metric_value(node, rule["metric"], now)
+            baseline = None
+            if incident:
+                # Freeze the triggering baseline: a sustained incident must not
+                # become its own normal and silently recover as the baseline drifts.
+                baseline = incident.get("baseline")
+            elif rule["mode"] == "baseline":
+                baseline = _baseline_for(node_id, rule["metric"], now, rule["threshold"])
+            threshold = baseline["threshold"] if baseline else rule["threshold"]
+            recovery = baseline["recovery"] if baseline else rule["recovery"]
+            last_observation = state.get("observed_at", now)
+            state["observed_at"] = now
+            if value is None or (rule["mode"] == "baseline" and baseline is None):
+                state.pop("pending_since", None)
+                state["evaluation"] = "warming_up" if value is not None else "unavailable"
+                continue
+            state["evaluation"] = "ready"
+            if incident:
+                incident["last_value"] = value
+                incident["last_observed_at"] = int(now)
+                incident["peak"] = max(incident["peak"], value)
+                if value <= recovery:
+                    _resolve_incident(incident, now, "recovered")
+                    state.pop("active_id", None)
+                    state["recovered_at"] = now
+                continue
+            if value <= threshold:
+                state.pop("pending_since", None)
+                continue
+            if now - last_observation > HISTORY_GAP_SECONDS:
+                state.pop("pending_since", None)
+            if now - state.get("recovered_at", 0) < rule["cooldown"]:
+                state.pop("pending_since", None)
+                continue
+            pending = state.setdefault("pending_since", now)
+            if now - pending < rule["duration"]:
+                continue
+            incident = {"id": uuid.uuid4().hex, "rule_id": rule["id"], "rule_name": rule["name"],
+                        "node": node_id, "node_name": _safe_text(node.get("name") or node_id, 80),
+                        "metric": rule["metric"], "mode": rule["mode"], "status": "active",
+                        "started_at": int(pending), "triggered_at": int(now), "resolved_at": None,
+                        "acknowledged_at": None, "threshold": threshold, "recovery": recovery,
+                        "duration": rule["duration"], "value": value, "last_value": value,
+                        "peak": value, "last_observed_at": int(now), "baseline": baseline,
+                        "context": _incident_context(node)}
+            incidents.append(incident)
+            state["active_id"] = incident["id"]
+            state.pop("pending_since", None)
+    for key in list(states):
+        if key not in valid_keys:
+            incident = active.get(states[key].get("active_id"))
+            if incident:
+                _resolve_incident(incident, now, "rule_removed")
+            del states[key]
+    # Active incidents are bounded by rules x nodes and must never be evicted.
+    resolved = [item for item in incidents if item.get("status") != "active"]
+    active_items = [item for item in incidents if item.get("status") == "active"]
+    room = max(0, MAX_INCIDENTS - len(active_items))
+    STORE.data["incidents"] = sorted(active_items + (resolved[-room:] if room else []),
+                                     key=lambda item: item["triggered_at"])
+
+
+def _alerts_response():
+    with STORE.lock:
+        incidents = STORE.data.get("incidents", [])
+        return copy.deepcopy({"rules": STORE.data.get("alert_rules", []), "states": STORE.data.get("alert_states", {}),
+                "incidents": list(reversed(incidents)), "sample_interval": HISTORY_INTERVAL,
+                "active_count": sum(item.get("status") == "active" for item in incidents),
+                "unacknowledged_count": sum(item.get("status") == "active" and not item.get("acknowledged_at")
+                                            for item in incidents)})
+
+
+def _alert_counts():
+    with STORE.lock:
+        active = [item for item in STORE.data.get("incidents", []) if item.get("status") == "active"]
+        return {"active_count": len(active),
+                "unacknowledged_count": sum(not item.get("acknowledged_at") for item in active)}
+
+
+def _save_alert_rules(value):
+    with STORE.lock:
+        valid_nodes = {"local"} | {asset["id"] for asset in STORE.data.get("assets", [])}
+        rules = _validate_alert_rules(value, valid_nodes)
+        previous = {rule["id"]: rule for rule in STORE.data.get("alert_rules", [])}
+        current = {rule["id"]: rule for rule in rules}
+        changed = {key for key in previous if previous[key] != current.get(key)}
+        for incident in STORE.data.get("incidents", []):
+            if incident.get("status") == "active" and incident.get("rule_id") in changed:
+                _resolve_incident(incident, time.time(), "rule_changed")
+        states = STORE.data.get("alert_states", {})
+        STORE.data["alert_states"] = {key: item for key, item in states.items()
+                                      if key.split(":", 1)[0] not in changed}
+        STORE.data["alert_rules"] = rules
+        STORE.save()
+
+
+def _acknowledge_incident(incident_id):
+    with STORE.lock:
+        for incident in STORE.data.get("incidents", []):
+            if incident["id"] == incident_id:
+                if not incident.get("acknowledged_at"):
+                    incident["acknowledged_at"] = int(time.time())
+                    STORE.save()
+                return True
+    return False
+
+
+def _limit_history_points(rows, gaps, metric, maximum=1200):
+    """Bound JSON responses while retaining extrema and explicit outage breaks."""
+    if len(rows) <= maximum:
+        return rows, gaps
+    boundaries = [index for index, gap in enumerate(gaps) if gap and index > 0]
+    stride = max(1, math.ceil(len(boundaries) / (maximum // 4)))
+    selected = {0, len(rows) - 1}
+    for index in boundaries[::stride]:
+        selected.update((index - 1, index))
+    dimensions = 3 if metric == "network" else 1
+    bucket_count = max(1, (maximum - len(selected)) // (2 * dimensions))
+    for bucket in range(bucket_count):
+        start = bucket * len(rows) // bucket_count
+        end = (bucket + 1) * len(rows) // bucket_count
+        def values(index):
+            row = rows[index]
+            return ((row[1] + row[2], row[1], row[2]) if metric == "network" else
+                    (row[3] if metric in ("memory", "disk") else row[1],))
+        for dimension in range(dimensions):
+            selected.add(min(range(start, end), key=lambda index: values(index)[dimension]))
+            selected.add(max(range(start, end), key=lambda index: values(index)[dimension]))
+    indices = sorted(selected)
+    prefix = [0]
+    for gap in gaps:
+        prefix.append(prefix[-1] + bool(gap))
+    selected_gaps = [bool(gaps[indices[0]])]
+    selected_gaps.extend(prefix[right + 1] > prefix[left + 1] for left, right in zip(indices, indices[1:]))
+    return [rows[index] for index in indices], selected_gaps
+
+
+def _diagnostics_response(snapshot, now=None):
+    now = time.time() if now is None else now
+    reports = []
+    for node_id, node in snapshot.get("nodes", {}).items():
+        issues, metrics = [], node.get("metrics") or {}
+        age = _sample_age(node, now)
+        if not node.get("online"):
+            status = "offline"
+        elif age is None or age > 120:
+            status = "stale"
+        else:
+            status = "healthy"
+        if age is not None and age < -120:
+            issues.append({"metric": "info", "kind": "clock_skew", "message": ""})
+        errors = metrics.get("collector_errors", {})
+        for metric, error in errors.items():
+            issues.append({"metric": str(metric)[:30], "kind": "error", "message": _safe_text(error, 180)})
+        if node.get("online"):
+            for metric in ("cpu", "memory", "disk", "network", "load"):
+                item = metrics.get(metric)
+                supported = (bool(item) if metric == "load" else isinstance(item, dict)
+                             and item.get("supported", True) and item.get("available", True))
+                if not supported and metric not in errors:
+                    issues.append({"metric": metric, "kind": "unsupported", "message": ""})
+            if status == "healthy" and issues:
+                status = "partial"
+        reports.append({"id": node_id, "name": node.get("name") or node_id, "status": status,
+                        "age_seconds": age, "last_success_at": node.get("last_success_at") or metrics.get("sampled_at"),
+                        "latency_ms": node.get("latency_ms"), "issues": issues,
+                        "error": _safe_text(node.get("error"), 180),
+                        "platform": _safe_text((metrics.get("info") or {}).get("os"), 40)})
+    return {"nodes": reports, "sampled_at": snapshot.get("sampled_at"),
+            "history_interval": HISTORY_INTERVAL, "cache_seconds": CLUSTER_CACHE_SECONDS,
+            "asset_limit": MAX_ASSETS, "rule_limit": MAX_ALERT_RULES}
 
 
 def _record_history(nodes, now=None):
@@ -1269,6 +1714,7 @@ def _record_history(nodes, now=None):
     with STORE.lock:
         if now - HISTORY_LAST_WRITE < HISTORY_INTERVAL:
             return
+        _evaluate_alerts(nodes, now)
         history = STORE.data.setdefault("history", {})
         if not isinstance(history, dict):
             history = STORE.data["history"] = {}
@@ -1295,13 +1741,13 @@ def _record_history(nodes, now=None):
                 interfaces["total"] = [max(0, _number(network.get("rx_rate"))),
                                        max(0, _number(network.get("tx_rate")))]
             samples = {
-                "cpu": [round(_number(cpu.get("percent")), 2)],
+                "cpu": [round(_finite_value(cpu.get("percent")) or 0, 2)],
                 "memory": [round(_number(memory.get("used"))), round(_number(memory.get("total"))),
-                           round(_number(memory.get("percent")), 2)],
+                           round(_finite_value(memory.get("percent")) or 0, 2)],
                 "disk": [round(_number(disk.get("used"))), round(_number(disk.get("total"))),
-                         round(_number(disk.get("percent")), 2)],
+                         round(_finite_value(disk.get("percent")) or 0, 2)],
                 "network": [interfaces],
-                "load": [round(_number(value), 3) for value in load[:3]],
+                "load": [round(_finite_value(value) or 0, 3) for value in load[:3]],
             }
             collector_errors = metrics.get("collector_errors", {})
             if not isinstance(collector_errors, dict):
@@ -1312,13 +1758,17 @@ def _record_history(nodes, now=None):
                                 "network": network.get("supported", True),
                                 "load": bool(load)}
             for metric, values in samples.items():
-                if metric in collector_errors or not metric_available.get(metric, True):
+                if (metric in collector_errors or not metric_available.get(metric, True)
+                        or _metric_value(node, metric, now) is None):
                     continue
                 points = series.setdefault(metric, [])
                 if not isinstance(points, list):
                     points = series[metric] = []
                 points.append([int(now)] + values)
         _prune_history_database(STORE.data, cutoff)
+        if now - STORE.last_compact_at >= HISTORY_COMPACT_INTERVAL:
+            _compact_history_database(STORE.data, now)
+            STORE.last_compact_at = now
         STORE.save()
         HISTORY_LAST_WRITE = now
 
@@ -1343,17 +1793,27 @@ def _history_response(node_id, metric, range_name, interface="", start=None, end
             all_history = {}
         node_history = all_history.get(node_id, {})
         points = node_history.get(metric, []) if isinstance(node_history, dict) else []
-        result = []
+        result, gaps = [], []
+        previous_timestamp = None
+        missing_interface = False
         for point in points:
             if not isinstance(point, list) or not point:
                 continue
             timestamp = _number(point[0])
+            metadata = _point_metadata(point)
+            gap = bool(metadata["gap_before"]) if "gap_before" in metadata else (
+                previous_timestamp is not None and timestamp - previous_timestamp > HISTORY_GAP_SECONDS)
+            previous_timestamp = timestamp
             if timestamp < lower_bound or timestamp > upper_bound:
                 continue
+            before = len(result)
             if metric == "network":
                 interfaces = point[1] if len(point) > 1 and isinstance(point[1], dict) else {}
                 if interface:
-                    rates = interfaces.get(interface, [0, 0])
+                    if interface not in interfaces:
+                        missing_interface = True
+                        continue
+                    rates = interfaces[interface]
                 else:
                     rates = [sum(_number(rate[i]) for rate in interfaces.values()
                                  if isinstance(rate, list) and len(rate) > i) for i in range(2)]
@@ -1363,8 +1823,15 @@ def _history_response(node_id, metric, range_name, interface="", start=None, end
                     result.append([point[0], point[1]])
             elif metric in ("memory", "disk") and len(point) > 3:
                 result.append([point[0], point[1], point[2], point[3]])
+            if len(result) > before:
+                gaps.append(gap or missing_interface)
+                missing_interface = False
+        original_count = len(result)
+        result, gaps = _limit_history_points(result, gaps, metric)
     return {"node": node_id, "metric": metric, "range": range_name, "interface": interface,
-            "start": start, "end": end, "points": result}
+            "start": start, "end": end, "points": result, "gaps": gaps,
+            "source_count": original_count, "downsampled": original_count > len(result),
+            "retention_policy": {"raw_hours": 24, "five_minute_days": 7, "older_bucket_seconds": 3600}}
 
 
 def _invalidate_cluster_snapshot():
@@ -1404,8 +1871,11 @@ def collect_cluster_snapshot(force_refresh=False):
             generation = CLUSTER_SNAPSHOT_CACHE.get("generation", 0)
             if cached is not None and now - CLUSTER_SNAPSHOT_CACHE["sampled_at"] < CLUSTER_CACHE_SECONDS:
                 return cached
+        local_started = time.monotonic()
+        local_metrics = collect_snapshot()
         nodes = {"local": {"id": "local", "name": socket.gethostname(), "online": True,
-                            "metrics": collect_snapshot()}}
+                            "metrics": local_metrics,
+                            "latency_ms": round((time.monotonic() - local_started) * 1000, 1)}}
         with STORE.lock:
             assets = list(STORE.data.get("assets", []))[:MAX_ASSETS]
         if assets:
@@ -1468,6 +1938,20 @@ HTML_PAGE = r'''<!doctype html>
 .mini-chart{height:148px}.mini-chart .chart-grid{stroke:var(--grid);stroke-width:.7}.mini-chart .chart-grid-vertical{stroke-dasharray:2 4}.mini-chart .chart-axis{stroke:var(--muted);stroke-width:1}.mini-chart .chart-label{fill:var(--muted);font:8px ui-sans-serif,system-ui,sans-serif}.mini-chart .chart-axis-caption{fill:var(--muted);font:7px ui-sans-serif,system-ui,sans-serif}.mini-chart .chart-gap-mark{stroke:var(--warn);stroke-width:1;stroke-dasharray:2 4;opacity:.8;pointer-events:none}.mini-chart .chart-crosshair{stroke:var(--accent2);stroke-width:1;stroke-dasharray:3 3;pointer-events:none;opacity:.85}
 @media(max-width:420px){.mini-chart .chart-label{font-size:7px}.mini-chart .chart-label-middle,.mini-chart .chart-grid-middle{display:none}}
 .chart-empty{height:148px}.status-pill.stale .dot{background:var(--warn);box-shadow:0 0 10px var(--warn)}
+.fleet-health{margin:0 0 18px;padding:13px 15px;border:1px solid var(--line);border-radius:14px;background:var(--surface)}
+.fleet-label{font-size:11px;color:var(--muted);margin-bottom:9px}.fleet-nodes{display:flex;flex-wrap:wrap;gap:7px}
+.fleet-node{display:flex;align-items:center;gap:7px;max-width:100%;padding:7px 10px;border:1px solid var(--line);border-radius:9px;background:var(--surface2);color:var(--text);font-size:11px}
+.fleet-node span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.fleet-node small{color:var(--muted)}
+.health-dot{flex:none;width:6px;height:6px;border-radius:50%;background:var(--accent)}.partial .health-dot,.stale .health-dot{background:var(--warn)}.offline .health-dot{background:var(--bad)}
+.button.has-alerts{color:var(--bad);border-color:var(--bad)}.feature-tabs,.feature-toolbar,.rule-actions,.incident-actions{display:flex;align-items:center;flex-wrap:wrap;gap:8px;margin:12px 0}
+.feature-tabs{border-bottom:1px solid var(--line);padding-bottom:12px}.feature-toolbar select{min-height:35px;max-width:100%}.feature-tabs button{font-size:12px}
+.incident-list,.rule-list,.diagnostic-list{display:grid;gap:12px}.incident,.rule-card,.diagnostic-card{border:1px solid var(--line);border-radius:12px;padding:15px;background:var(--surface2);min-width:0}
+.incident.active{border-left:3px solid var(--bad)}.incident.resolved{border-left:3px solid var(--accent)}.feature-card-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.feature-card-head strong{overflow-wrap:anywhere}
+.health-status{display:inline-block;flex:none;border-radius:6px;padding:3px 7px;font-size:10px;background:var(--surface3);color:var(--muted)}.health-status.healthy{color:var(--accent)}.health-status.offline{color:var(--bad)}.health-status.stale,.health-status.partial{color:var(--warn)}
+.feature-facts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:11px 18px;margin:14px 0}.feature-facts div{min-width:0}.feature-facts dt{color:var(--muted);font-size:10px}.feature-facts dd{margin:3px 0 0;font-size:12px;overflow-wrap:anywhere}.feature-facts small{display:block;font-size:10px;color:var(--muted)}
+.incident details{border-top:1px solid var(--line);padding-top:10px}.incident summary{cursor:pointer;font-size:12px;color:var(--accent2)}.context-log,.diagnostic-issues{font-size:11px;overflow-wrap:anywhere}.diagnostic-issues{padding-left:18px}.diagnostic-issues li{margin:8px 0}.diagnostic-issues p{margin:3px 0;color:var(--muted)}.table-scroll{overflow:auto}.baseline-evidence{font-size:12px;color:var(--accent2)}
+.rule-editor{padding:15px;border:1px solid var(--accent2);border-radius:12px;margin-bottom:16px}.checkbox-label{display:flex!important;align-items:center;gap:8px}.checkbox-label input{width:auto!important}.rule-actions,.incident-actions{margin-bottom:0}.panel-actions{flex-wrap:wrap}.modal .helper{overflow-wrap:anywhere}
+@media(max-width:680px){.feature-facts{gap:10px}.feature-toolbar{align-items:stretch}.feature-toolbar select{flex:1;min-width:0}.fleet-node{flex-wrap:wrap}.fleet-node small{font-size:9px}.incident,.rule-card,.diagnostic-card{padding:12px}.feature-card-head{gap:8px}.health-status{max-width:45%;text-align:center}.feature-tabs button{flex:1;font-size:11px}.rule-editor .form-grid{grid-template-columns:1fr}.feature-card-head .metric-sub{overflow-wrap:anywhere}}
 </style></head><body><div id="app"></div><div id="toast" class="toast"></div><div id="chart-tooltip" class="chart-tooltip" role="tooltip"></div>
 <script>
 const app=document.getElementById('app');
@@ -1666,9 +2150,6 @@ TRANSLATION_ROWS.push(
   ['数据库已从备份恢复，请检查设置','Database restored from backup. Review your settings.','データベースをバックアップから復元しました。設定を確認してください。','Base restaurée depuis la sauvegarde. Vérifiez les paramètres.','База восстановлена из резервной копии. Проверьте настройки.','Datenbank aus Sicherung wiederhergestellt. Einstellungen prüfen.'],
   ['本地时间','Local time','現地時間','Heure locale','Местное время','Ortszeit'],
   ['历史图表：横轴为本地时间，纵轴为指标数值。可用左右方向键查看采样点。','History chart: local time on the horizontal axis and metric values on the vertical axis. Use the arrow keys to inspect samples.','履歴グラフ：横軸は現地時間、縦軸は指標値です。左右の矢印キーでサンプルを確認できます。','Graphique historique : heure locale en abscisse, valeur en ordonnée. Utilisez les flèches pour parcourir les mesures.','График истории: местное время по горизонтали, значение метрики по вертикали. Стрелками можно просматривать точки.','Verlauf: Ortszeit auf der waagerechten, Messwerte auf der senkrechten Achse. Mit den Pfeiltasten Messpunkte prüfen.'],
-  ['HTTPS required','HTTPS required','HTTPS が必要','HTTPS requis','Требуется HTTPS','HTTPS erforderlich'],
-  ['远程节点必须使用有效的 HTTPS 证书；HTTP 仅适用于本机 localhost 或回环地址。','Remote nodes require a valid HTTPS certificate. HTTP is limited to localhost or loopback addresses.','リモートノードには有効な HTTPS 証明書が必要です。HTTP は localhost またはループバックアドレスに限ります。','Les nœuds distants exigent un certificat HTTPS valide. HTTP est réservé à localhost ou aux adresses de bouclage.','Для удалённых узлов требуется действительный сертификат HTTPS. HTTP разрешён только для localhost или loopback.','Entfernte Knoten benötigen ein gültiges HTTPS-Zertifikat. HTTP ist auf localhost oder Loopback-Adressen beschränkt.'],
-  ['远程资产必须使用 HTTPS；HTTP 仅限 localhost / 回环地址','Remote assets must use HTTPS; HTTP is allowed only for localhost / loopback addresses','リモート資産は HTTPS が必要です。HTTP は localhost / ループバックに限ります','Les équipements distants doivent utiliser HTTPS ; HTTP est réservé à localhost / loopback','Удалённые ресурсы должны использовать HTTPS; HTTP разрешён только для localhost / loopback','Entfernte Assets müssen HTTPS verwenden; HTTP ist nur für localhost / Loopback zulässig'],
   ['首次设置代码','One-time setup code','初回セットアップコード','Code de configuration initiale','Одноразовый код первоначальной настройки','Einmaliger Einrichtungscode'],
   ['请输入启动 TinyWatch 的终端中显示的一次性代码。','Enter the one-time code shown in the terminal running TinyWatch.','TinyWatch を起動したターミナルに表示されるワンタイムコードを入力してください。','Saisissez le code à usage unique affiché dans le terminal où TinyWatch est lancé.','Введите одноразовый код, показанный в терминале TinyWatch.','Geben Sie den Einmalcode aus dem Terminal ein, in dem TinyWatch läuft.'],
   ['输入一次性设置代码','Enter one-time setup code','ワンタイム設定コードを入力','Saisissez le code de configuration','Введите одноразовый код настройки','Einmaligen Einrichtungscode eingeben'],
@@ -1735,7 +2216,7 @@ function bindLanguageSelector() {
   };
 }
 
-const state={authenticated:false,setup:false,config:null,data:null,history:{},historical:{},historyPending:{},historyRanges:{},historyCustom:{},chartData:{},chartSequence:0,timer:null,freshnessTimer:null,lastRefreshAt:0,refreshFailed:false,dragged:null,modal:null,view:'overview',language:LANGUAGE_NAMES[readPreference('tinywatch.language','en')]?readPreference('tinywatch.language','en'):'en'};
+const state={authenticated:false,setup:false,config:null,data:null,history:{},historical:{},historyPending:{},historyRanges:{},historyCustom:{},chartData:{},chartSequence:0,timer:null,freshnessTimer:null,lastRefreshAt:0,refreshFailed:false,dragged:null,modal:null,modalKind:'',alertData:null,alertTab:'incidents',alertStatus:'all',alertNode:'*',alertRequest:0,alertFetchedAt:0,alertLoading:false,view:'overview',language:LANGUAGE_NAMES[readPreference('tinywatch.language','en')]?readPreference('tinywatch.language','en'):'en'};
 document.documentElement.lang=state.language;
 const metrics={cpu:['处理器','◉'],memory:['内存','▤'],network:['网络流量','↕'],disk:['磁盘','▣'],load:['系统负载','⌁'],processes:['进程','▥'],logins:['登录事件','⌑'],dns:['DNS 缓存','⌘'],info:['主机信息','◈']};
 const fmtBytes=n=>{n=Number(n)||0;const u=['B','KB','MB','GB','TB'];let i=0;while(n>=1024&&i<u.length-1){n/=1024;i++}return new Intl.NumberFormat(LANGUAGE_LOCALE[state.language]||'en-US',{minimumFractionDigits:i?1:0,maximumFractionDigits:i?1:0}).format(i===0?Math.round(n):n)+' '+u[i]};
@@ -1807,11 +2288,13 @@ function pushHistory(key,value){const values=state.history[key]||(state.history[
 function nodeFor(id){return state.data&&state.data.nodes&&state.data.nodes[id]}
 function render(){
   if(!state.config)return;
-  app.innerHTML='<div class="shell"><aside class="sidebar"><div class="brand"><div class="brand-mark">◈</div><div><strong>TinyWatch</strong><small>INFRASTRUCTURE</small></div></div><nav class="nav" aria-label="Main navigation"><button class="active" data-view="overview"><span class="nav-icon">⌂</span><span>总览</span></button><button data-menu="assets"><span class="nav-icon">⌘</span><span>资产</span></button><button data-menu="settings"><span class="nav-icon">⚙</span><span>设置</span></button></nav></aside><main class="main"><header class="topbar"><div><div class="eyebrow">LIVE INFRASTRUCTURE</div><h1 class="page-title" id="page-title">系统总览</h1></div><div class="top-actions">'+languageSelector()+'<span class="status-pill" id="live-status"><i class="dot"></i><span id="live-status-label">实时采集</span></span><button class="icon-button" id="theme-toggle" title="切换主题" aria-label="Switch theme">◐</button><button class="icon-button" id="logout-button" title="退出登录" aria-label="Sign out">↗</button></div></header><section class="host-panel"><div class="host-panel-head"><div><h2>主机信息</h2><p>本地节点 · HOST PROFILE</p></div></div><div id="host-summary"></div></section><section class="overview" id="overview"></section><div class="section-head"><div><h2 id="panel-title">自定义监控面板</h2><p id="panel-description">拖拽卡片调整布局 · 数据每 2.5 秒更新</p></div><div class="panel-actions" id="panel-actions"><button class="button subtle" id="assets-manage">管理资产</button><button class="button primary" id="add-widget">＋ 添加监控</button></div></div><section class="dashboard" id="dashboard" aria-live="polite"></section><div class="grid-footer" id="updated-at">正在连接监控节点…</div></main></div><div id="modal" class="modal-backdrop"></div>';
+  state.modalKind='';state.modal=null;state.alertRequest++;state.alertLoading=false;
+  app.innerHTML='<div class="shell"><aside class="sidebar"><div class="brand"><div class="brand-mark">◈</div><div><strong>TinyWatch</strong><small>INFRASTRUCTURE</small></div></div><nav class="nav" aria-label="Main navigation"><button class="active" data-view="overview"><span class="nav-icon">⌂</span><span>总览</span></button><button data-menu="assets"><span class="nav-icon">⌘</span><span>资产</span></button><button data-menu="settings"><span class="nav-icon">⚙</span><span>设置</span></button></nav></aside><main class="main"><header class="topbar"><div><div class="eyebrow">LIVE INFRASTRUCTURE</div><h1 class="page-title" id="page-title">系统总览</h1></div><div class="top-actions">'+languageSelector()+'<span class="status-pill" id="live-status"><i class="dot"></i><span id="live-status-label">实时采集</span></span><button class="icon-button" id="theme-toggle" title="切换主题" aria-label="Switch theme">◐</button><button class="icon-button" id="logout-button" title="退出登录" aria-label="Sign out">↗</button></div></header><section class="host-panel"><div class="host-panel-head"><div><h2>主机信息</h2><p>本地节点 · HOST PROFILE</p></div></div><div id="host-summary"></div></section><section class="overview" id="overview"></section><section id="fleet-health" class="fleet-health" aria-label="Asset health"></section><div class="section-head"><div><h2 id="panel-title">自定义监控面板</h2><p id="panel-description">拖拽卡片调整布局 · 数据每 2.5 秒更新</p></div><div class="panel-actions" id="panel-actions"><button type="button" class="button subtle" id="alerts-open">Alerts · 0</button><button class="button subtle" id="assets-manage">管理资产</button><button class="button primary" id="add-widget">＋ 添加监控</button></div></div><section class="dashboard" id="dashboard" aria-live="polite"></section><div class="grid-footer" id="updated-at">正在连接监控节点…</div></main></div><div id="modal" class="modal-backdrop"></div>';
   document.documentElement.lang=state.language;localizeDOM(app);bindLanguageSelector();
   document.getElementById('theme-toggle').onclick=toggleTheme;
   document.getElementById('logout-button').onclick=logout;
   document.getElementById('assets-manage').onclick=showAssets;
+  document.getElementById('alerts-open').onclick=()=>showAlerts();
   document.getElementById('add-widget').onclick=showAddWidget;
   document.querySelectorAll('.nav button').forEach(button=>{
     if(button.dataset.view){button.onclick=()=>switchView(button.dataset.view);button.classList.toggle('active',button.dataset.view===state.view)}
@@ -1847,6 +2330,7 @@ function draw(){
   document.getElementById('side-host')?.remove();
   overview.innerHTML='<article class="stat"><div class="stat-label">CPU 使用率 <span class="tag good">'+metricsLocal.cpu.logical_cores+' 核</span></div><div class="stat-value">'+(metricsLocal.cpu.available?metricsLocal.cpu.percent:'—')+'<small>'+(metricsLocal.cpu.available?'%':'')+'</small></div><div class="stat-foot">'+(metricsLocal.cpu.cores.length?'每核心采样正常':(metricsLocal.cpu.available?'聚合采样':'当前系统未公开 CPU 计数'))+'</div></article><article class="stat"><div class="stat-label">内存使用 <span>RAM</span></div><div class="stat-value">'+(metricsLocal.memory.supported===false?'—':fmtBytes(metricsLocal.memory.used))+'</div><div class="stat-foot">'+(metricsLocal.memory.supported===false?tr('指标暂不可用'):'共 '+fmtBytes(metricsLocal.memory.total)+' · '+metricsLocal.memory.percent+'%')+'</div></article><article class="stat"><div class="stat-label">网络资产 <span class="tag good">在线</span></div><div class="stat-value">'+alive+'<small> / '+total+'</small></div><div class="stat-foot">含本地节点与已配置资产</div></article><article class="stat"><div class="stat-label">系统运行时长 <span>UPTIME</span></div><div class="stat-value" style="font-size:22px">'+esc(metricsLocal.info.uptime)+'</div><div class="stat-foot">'+esc(metricsLocal.info.os)+' '+esc(metricsLocal.info.release)+'</div></article>';
   localizeDOM(overview);
+  drawFleetHealth();
   const assets=[{id:'local',name:metricsLocal.info.hostname}].concat(state.config.assets||[]);
   const widgets=(state.config.widgets||[]).filter(widget=>widget.metric!=='info');
   dashboard.innerHTML='';
@@ -1953,7 +2437,7 @@ function requestHistory(node,metric,range,iface,custom){
   state.historyPending[key]=true;
   const query=new URLSearchParams({node,metric,range});if(iface)query.set('iface',iface);
   if(range==='custom'){query.set('start',String(custom.start));query.set('end',String(custom.end))}
-  api('/api/history?'+query.toString()).then(result=>{state.historical[key]={points:result.points||[],fetchedAt:Date.now()};draw()})
+  api('/api/history?'+query.toString()).then(result=>{state.historical[key]={points:result.points||[],gaps:result.gaps||[],fetchedAt:Date.now()};draw()})
     .catch(error=>{if(error.status===401){state.authenticated=false;authScreen(false)}else toast(error.message)})
     .finally(()=>{delete state.historyPending[key]});
 }
@@ -1962,7 +2446,7 @@ function historyChartData(node,metric,iface){
   const cached=state.historical[historyCacheKey(node,metric,range,iface,state.historyCustom[selection])];
   if(cached){
     const index={cpu:1,memory:3,disk:3,load:1};
-    return cached.points.map(point=>({timestamp:Number(point[0]),value:metric==='network'?Number(point[1]||0)+Number(point[2]||0):Number(point[index[metric]]||0),rx:Number(point[1]||0),tx:Number(point[2]||0)})).filter(point=>Number.isFinite(point.timestamp)&&Number.isFinite(point.value));
+    return cached.points.map((point,position)=>({timestamp:Number(point[0]),value:metric==='network'?Number(point[1]||0)+Number(point[2]||0):Number(point[index[metric]]||0),rx:Number(point[1]||0),tx:Number(point[2]||0),gapBefore:position<(cached.gaps||[]).length?Boolean(cached.gaps[position]):undefined})).filter(point=>Number.isFinite(point.timestamp)&&Number.isFinite(point.value));
   }
   const key=metric==='network'?node+':network:'+(iface||'total'):node+':'+metric;
   return (state.history[key]||[]).map(point=>({timestamp:Number(point[0]),value:Number(point[1])})).filter(point=>Number.isFinite(point.timestamp)&&Number.isFinite(point.value));
@@ -2007,15 +2491,19 @@ function chartAxisMaximum(value){
   const niceFraction=fraction<=1?1:fraction<=2?2:fraction<=5?5:10;
   return niceFraction*magnitude*4;
 }
+function chartHasGap(previous,next){
+  return typeof next.gapBefore==='boolean'?next.gapBefore:Number(next.timestamp)-Number(previous.timestamp)>CHART_GAP_SECONDS;
+}
 function downsampleHistory(samples,maximumPoints){
   const ordered=samples.slice().filter(point=>Number.isFinite(Number(point.timestamp))&&Number.isFinite(Number(point.value)))
     .sort((left,right)=>Number(left.timestamp)-Number(right.timestamp));
   if(ordered.length<=maximumPoints)return ordered;
   const gapPairs=[];
   for(let index=1;index<ordered.length;index++){
-    if(Number(ordered[index].timestamp)-Number(ordered[index-1].timestamp)>CHART_GAP_SECONDS)gapPairs.push([index-1,index]);
+    if(chartHasGap(ordered[index-1],ordered[index]))gapPairs.push([index-1,index]);
   }
-  const maxGapPairs=Math.floor((maximumPoints-2)/2);
+  // Reserve half the display budget for extrema, even with many outages.
+  const maxGapPairs=Math.max(1,Math.floor((maximumPoints-2)/4));
   const gapStride=Math.max(1,Math.ceil(gapPairs.length/maxGapPairs));
   const selected=new Set([0,ordered.length-1]);
   gapPairs.forEach((pair,index)=>{if(index%gapStride===0){selected.add(pair[0]);selected.add(pair[1])}});
@@ -2035,7 +2523,13 @@ function downsampleHistory(samples,maximumPoints){
     }
     selected.add(minimum);selected.add(maximum);
   }
-  return [...selected].sort((left,right)=>left-right).map(index=>ordered[index]);
+  const indices=[...selected].sort((left,right)=>left-right);
+  return indices.map((index,position)=>{
+    if(!position)return ordered[index];
+    let gapBefore=false;
+    for(let current=indices[position-1]+1;current<=index;current++)if(chartHasGap(ordered[current-1],ordered[current])){gapBefore=true;break}
+    return {...ordered[index],gapBefore};
+  });
 }
 function chartTimeLabel(timestamp,span,includeYear){
   const date=new Date(timestamp*1000);
@@ -2085,7 +2579,7 @@ function sparkline(samples,metric){
   const segments=[];
   points.forEach(point=>{
     const current=segments[segments.length-1];
-    if(!current||Number(point.timestamp)-Number(current[current.length-1].timestamp)>CHART_GAP_SECONDS)segments.push([point]);
+    if(!current||chartHasGap(current[current.length-1],point))segments.push([point]);
     else current.push(point);
   });
   const gapMarkers=[];
@@ -2172,8 +2666,8 @@ function bindWidget(el,w){
   const disk=el.querySelector('[data-disk]');if(disk)disk.onclick=()=>showDisks(w.node)
 }
 async function saveConfig(){await api('/api/config','POST',{assets:state.config.assets,widgets:state.config.widgets,theme:state.config.theme,history_retention_days:state.config.history_retention_days});state.config=await api('/api/config')}
-function modal(content,wide){const box=document.getElementById('modal');box.className='modal-backdrop open';box.innerHTML='<section class="modal '+(wide?'wide-modal':'')+'">'+content+'</section>';localizeDOM(box);box.onclick=e=>{if(e.target===box)closeModal()};const close=box.querySelectorAll('[data-close]');close.forEach(x=>x.onclick=closeModal);state.modal=box}
-function closeModal(){const box=document.getElementById('modal');if(box){box.className='modal-backdrop';box.innerHTML=''}state.modal=null}
+function modal(content,wide){state.modalKind='';state.alertRequest++;state.alertLoading=false;const box=document.getElementById('modal');box.className='modal-backdrop open';box.innerHTML='<section class="modal '+(wide?'wide-modal':'')+'">'+content+'</section>';localizeDOM(box);box.onclick=e=>{if(e.target===box)closeModal()};const close=box.querySelectorAll('[data-close]');close.forEach(x=>x.onclick=closeModal);state.modal=box}
+function closeModal(){state.modalKind='';state.alertRequest++;state.alertLoading=false;const box=document.getElementById('modal');if(box){box.className='modal-backdrop';box.innerHTML=''}state.modal=null}
 function showDisks(id){const node=nodeFor(id);if(!node||!node.metrics)return;const rows=node.metrics.disk.partitions||[];modal('<header class="modal-head"><h3>磁盘与分区 · '+esc(node.name)+'</h3><button class="close" data-close>×</button></header><div style="overflow:auto"><table class="data-table"><thead><tr><th>挂载点</th><th>设备</th><th>文件系统</th><th>已用 / 总量</th><th>使用率</th></tr></thead><tbody>'+rows.map(x=>'<tr><td>'+esc(x.mount)+'</td><td>'+esc(x.device)+'</td><td>'+esc(x.filesystem)+'</td><td>'+fmtBytes(x.used)+' / '+fmtBytes(x.total)+'</td><td>'+x.percent+'%</td></tr>').join('')+'</tbody></table></div>',true)}
 function showAddWidget(){const assets=[{id:'local',name:nodeFor('local')?.name||'本机'}].concat(state.config.assets||[]);modal('<header class="modal-head"><h3>添加监控卡片</h3><button class="close" data-close>×</button></header><form id="widget-form"><div class="form-grid"><div class="field full"><label>网络资产</label><select id="widget-node">'+assets.map(a=>'<option value="'+esc(a.id)+'">'+esc(a.name)+'</option>').join('')+'</select></div><div class="field full"><label>监控项目</label><select id="widget-metric">'+Object.entries(metrics).filter(([key])=>key!=='info').map(([k,v])=>'<option value="'+k+'">'+v[0]+'</option>').join('')+'</select></div></div><div class="error-message" id="widget-error"></div><div class="modal-actions"><button type="button" class="button subtle" data-close>取消</button><button class="button primary">添加卡片</button></div></form>');document.getElementById('widget-form').onsubmit=async e=>{e.preventDefault();if(state.config.widgets.length>=32){document.getElementById('widget-error').textContent=tr('最多添加 32 张卡片');return}const node=document.getElementById('widget-node').value,metric=document.getElementById('widget-metric').value;state.config.widgets.push({id:crypto.randomUUID?crypto.randomUUID():('w-'+Date.now()),node:node,metric:metric});closeModal();draw();try{await saveConfig()}catch(err){toast(err.message)}}}
 function showHistorySettings(){showSettings()}
@@ -2182,7 +2676,7 @@ function showSettings(){
   const retention=[1,3,7,14,30].map(value=>'<option value="'+value+'" '+(value===current?'selected':'')+'>'+tr(value+' 天')+'</option>').join('');
   const themes=[['dark','深色'],['light','浅色']].map(([value,label])=>'<option value="'+value+'" '+(state.config.theme===value?'selected':'')+'>'+tr(label)+'</option>').join('');
   const languages=Object.entries(LANGUAGE_NAMES).map(([code,name])=>'<option value="'+code+'" '+(state.language===code?'selected':'')+'>'+name+'</option>').join('');
-  modal('<header class="modal-head"><div><h3>设置</h3><div class="helper">配置语言、外观和历史数据保留期限。</div></div><button class="close" data-close aria-label="Close">×</button></header><form id="settings-form"><div class="form-grid"><div class="field"><label for="settings-language">Language</label><select id="settings-language">'+languages+'</select></div><div class="field"><label for="settings-theme">主题</label><select id="settings-theme">'+themes+'</select></div><div class="field full"><label for="retention-days">数据保留期限 · 保留时间</label><select id="retention-days">'+retention+'</select></div></div><div class="helper">历史样本每分钟保存到本地 JSON 数据库。</div><div class="helper">缩短保留期限会立即删除超出期限的旧数据。</div><div class="error-message" id="settings-error"></div><div class="modal-actions"><button type="button" class="button subtle" data-close>取消</button><button type="submit" class="button primary">保存设置</button></div></form>');
+  modal('<header class="modal-head"><div><h3>设置</h3><div class="helper">配置语言、外观和历史数据保留期限。</div></div><button class="close" data-close aria-label="Close">×</button></header><form id="settings-form"><div class="form-grid"><div class="field"><label for="settings-language">Language</label><select id="settings-language">'+languages+'</select></div><div class="field"><label for="settings-theme">主题</label><select id="settings-theme">'+themes+'</select></div><div class="field full"><label for="retention-days">数据保留期限 · 保留时间</label><select id="retention-days">'+retention+'</select></div></div><div class="helper">历史样本每分钟保存到本地 JSON 数据库。</div><div class="helper">'+esc(ft('history_policy'))+'</div><div class="helper">缩短保留期限会立即删除超出期限的旧数据。</div><div class="error-message" id="settings-error"></div><div class="modal-actions"><button type="button" class="button subtle" data-close>取消</button><button type="submit" class="button primary">保存设置</button></div></form>');
   document.getElementById('settings-form').onsubmit=async event=>{
     event.preventDefault();const nextLanguage=document.getElementById('settings-language').value;
     const nextTheme=document.getElementById('settings-theme').value;const nextDays=Number(document.getElementById('retention-days').value);
@@ -2204,10 +2698,11 @@ function showAssets(){
     const status=node?'<span class="tag '+(node.online?'good':'bad')+'">'+stateLabel+'</span>':'<span class="tag">'+stateLabel+'</span>';
     const sample=lastSuccess&&Number.isFinite(lastSuccess.getTime())?'<div class="metric-sub">'+tr('最后成功采样')+': '+esc(lastSuccess.toLocaleString(LANGUAGE_LOCALE[state.language]||'en-US'))+'</div>':'';
     return '<div class="disk-line"><span><strong>'+esc(asset.name)+'</strong> '+status+
-      (asset.secure_transport?'':' <span class="tag bad">'+tr('HTTPS required')+'</span>')+
+      (asset.secure_transport?'':' <span class="tag">HTTP</span>')+
       '<div class="metric-sub">'+esc(asset.url)+'</div>'+sample+'</span><button class="button danger" data-remove="'+esc(asset.id)+'">移除</button></div>';
   }).join('');
-  modal('<header class="modal-head"><div><h3>网络资产</h3><div class="helper">配置远程 TinyWatch 节点。每个节点需在“代理令牌”处填入目标主机生成的令牌。</div></div><button class="close" data-close>×</button></header><div>'+rows+'</div><form id="asset-form" style="margin-top:16px"><div class="form-grid"><div class="field"><label>资产名称</label><input id="asset-name" required maxlength="80" placeholder="例如：edge-node-01"></div><div class="field"><label>服务地址</label><input id="asset-url" required placeholder="https://node.example:8765"></div><div class="field full"><label>代理令牌</label><input id="asset-password" required autocomplete="off" placeholder="在目标节点设置页复制代理令牌"></div></div><div class="helper">'+tr('远程节点必须使用有效的 HTTPS 证书；HTTP 仅适用于本机 localhost 或回环地址。')+'</div><div class="error-message" id="asset-error"></div><div class="modal-actions"><button class="button primary">添加资产</button></div></form><div class="helper">本机代理令牌（复制到其他节点的资产配置中）：<br><code style="overflow-wrap:anywhere">'+esc(state.config.agent_token)+'</code></div>');
+  modal('<header class="modal-head"><div><h3>网络资产</h3><div class="helper">配置远程 TinyWatch 节点。每个节点需在“代理令牌”处填入目标主机生成的令牌。</div></div><button class="close" data-close>×</button></header><div class="feature-toolbar"><button type="button" class="button subtle" id="assets-diagnostics">'+esc(ft('diagnostics'))+'</button></div><div>'+rows+'</div><form id="asset-form" style="margin-top:16px"><div class="form-grid"><div class="field"><label>资产名称</label><input id="asset-name" required maxlength="80" placeholder="例如：edge-node-01"></div><div class="field"><label>服务地址</label><input id="asset-url" required placeholder="192.168.1.10:8765"></div><div class="field full"><label>代理令牌</label><input id="asset-password" required autocomplete="off" placeholder="在目标节点设置页复制代理令牌"></div></div><div class="helper">'+esc(ft('http_help'))+'</div><div class="error-message" id="asset-error"></div><div class="modal-actions"><button class="button primary">添加资产</button></div></form><div class="helper">本机代理令牌（复制到其他节点的资产配置中）：<br><code style="overflow-wrap:anywhere">'+esc(state.config.agent_token)+'</code></div>');
+  document.getElementById('assets-diagnostics').onclick=()=>showDiagnostics();
   document.getElementById('asset-form').onsubmit=async event=>{
     event.preventDefault();
     const asset={id:'a-'+(crypto.randomUUID?crypto.randomUUID():Date.now()),name:document.getElementById('asset-name').value,url:document.getElementById('asset-url').value,password:document.getElementById('asset-password').value};
@@ -2220,6 +2715,254 @@ function showAssets(){
     state.config.assets=list;state.config.widgets=state.config.widgets.filter(widget=>widget.node==='local'||list.some(asset=>asset.id===widget.node));
     try{await saveConfig();showAssets();draw();toast('资产已移除')}catch(error){toast(error.message)}
   });
+}
+// New monitoring controls use explicit translation keys, keeping data and labels separate.
+const FEATURE_MESSAGES = {
+  alerts: ['Alerts', '告警', 'アラート', 'Alertes', 'Оповещения', 'Alarme'],
+  timeline: ['Incident timeline', '事件时间线', 'インシデント履歴', 'Chronologie des incidents', 'История инцидентов', 'Vorfallverlauf'],
+  rules: ['Alert rules', '告警规则', 'アラートルール', 'Règles d’alerte', 'Правила оповещений', 'Alarmregeln'],
+  diagnostics: ['Collection diagnostics', '采集诊断', '収集診断', 'Diagnostic de collecte', 'Диагностика сбора', 'Erfassungsdiagnose'],
+  fleet: ['Asset health', '资产健康', '資産の状態', 'État des actifs', 'Состояние узлов', 'Zustand der Systeme'],
+  healthy: ['Healthy', '正常', '正常', 'Normal', 'В норме', 'Normal'],
+  online: ['Online', '在线', 'オンライン', 'En ligne', 'Доступен', 'Online'],
+  condition: ['Condition', '触发条件', '条件', 'Condition', 'Условие', 'Bedingung'],
+  partial: ['Partial', '部分指标不可用', '一部利用不可', 'Partiel', 'Частичные данные', 'Teilweise verfügbar'],
+  stale: ['Stale data', '数据过期', '古いデータ', 'Données anciennes', 'Устаревшие данные', 'Veraltete Daten'],
+  offline: ['Offline', '离线', 'オフライン', 'Hors ligne', 'Недоступен', 'Offline'],
+  error: ['Collection error', '采集错误', '収集エラー', 'Erreur de collecte', 'Ошибка сбора', 'Erfassungsfehler'],
+  unsupported: ['Not exposed by this system', '系统未公开此指标', 'システム非対応', 'Non exposé par le système', 'Система не предоставляет метрику', 'Vom System nicht bereitgestellt'],
+  clock_skew: ['Check the node clock', '请检查节点时间', 'ノードの時刻を確認', 'Vérifiez l’horloge du nœud', 'Проверьте часы узла', 'Systemzeit prüfen'],
+  active: ['Active', '正在告警', '発生中', 'Actif', 'Активен', 'Aktiv'],
+  resolved: ['Resolved', '已恢复', '解決済み', 'Résolu', 'Завершён', 'Beendet'],
+  all: ['All', '全部', 'すべて', 'Tous', 'Все', 'Alle'],
+  acknowledged: ['Acknowledged', '已确认', '確認済み', 'Acquitté', 'Подтверждён', 'Bestätigt'],
+  acknowledge: ['Acknowledge', '确认告警', '確認する', 'Acquitter', 'Подтвердить', 'Bestätigen'],
+  no_incidents: ['No incidents in this view.', '当前筛选下没有事件。', '該当するインシデントはありません。', 'Aucun incident pour ce filtre.', 'Нет инцидентов для этого фильтра.', 'Keine Vorfälle für diesen Filter.'],
+  no_rules: ['No rules configured.', '尚未配置规则。', 'ルールがありません。', 'Aucune règle configurée.', 'Правила не настроены.', 'Keine Regeln eingerichtet.'],
+  add_rule: ['Add rule', '添加规则', 'ルール追加', 'Ajouter une règle', 'Добавить правило', 'Regel hinzufügen'],
+  edit: ['Edit', '编辑', '編集', 'Modifier', 'Изменить', 'Bearbeiten'],
+  remove: ['Remove', '删除', '削除', 'Supprimer', 'Удалить', 'Entfernen'],
+  save: ['Save', '保存', '保存', 'Enregistrer', 'Сохранить', 'Speichern'],
+  cancel: ['Cancel', '取消', 'キャンセル', 'Annuler', 'Отмена', 'Abbrechen'],
+  close: ['Close', '关闭', '閉じる', 'Fermer', 'Закрыть', 'Schließen'],
+  loading: ['Loading…', '正在加载…', '読み込み中…', 'Chargement…', 'Загрузка…', 'Wird geladen…'],
+  retry: ['Retry', '重试', '再試行', 'Réessayer', 'Повторить', 'Erneut versuchen'],
+  failed: ['Could not save. Check the values and try again.', '保存失败，请检查输入后重试。', '保存できません。入力を確認してください。', 'Échec. Vérifiez les valeurs et réessayez.', 'Не удалось сохранить. Проверьте значения.', 'Speichern fehlgeschlagen. Eingaben prüfen.'],
+  saved: ['Saved', '已保存', '保存しました', 'Enregistré', 'Сохранено', 'Gespeichert'],
+  name: ['Rule name (optional)', '规则名称（可选）', 'ルール名（任意）', 'Nom de règle (facultatif)', 'Название (необязательно)', 'Regelname (optional)'],
+  node: ['Asset', '资产', '資産', 'Actif', 'Узел', 'System'],
+  all_nodes: ['All assets, including local', '所有资产（含本机）', 'ローカルを含む全資産', 'Tous les actifs, y compris local', 'Все узлы, включая локальный', 'Alle Systeme, einschließlich lokal'],
+  metric: ['Metric', '监控项目', 'メトリック', 'Métrique', 'Метрика', 'Messwert'],
+  mode: ['Detection mode', '检测方式', '検出方式', 'Mode de détection', 'Режим обнаружения', 'Erkennungsmodus'],
+  threshold: ['Fixed threshold', '固定阈值', '固定しきい値', 'Seuil fixe', 'Фиксированный порог', 'Fester Schwellenwert'],
+  baseline: ['Historical baseline', '历史基线', '履歴ベースライン', 'Référence historique', 'Историческая база', 'Historischer Vergleich'],
+  trigger: ['Trigger above', '超过此值触发', '超過で発生', 'Déclencher au-dessus de', 'Срабатывание выше', 'Auslösen oberhalb von'],
+  recovery: ['Recover at or below', '低于或等于此值恢复', '以下で復旧', 'Rétablir à ou sous', 'Восстановление при или ниже', 'Beenden bei oder unter'],
+  minimum_delta: ['Minimum increase above baseline', '相对基线的最小增量', 'ベースラインからの最小増加', 'Hausse minimale sur la référence', 'Минимальный рост над базой', 'Mindestanstieg über Vergleichswert'],
+  duration: ['Sustained for (minutes)', '持续时间（分钟）', '継続時間（分）', 'Durée continue (minutes)', 'Длительность (минуты)', 'Dauer (Minuten)'],
+  cooldown: ['Cooldown after recovery (minutes)', '恢复后冷却时间（分钟）', '復旧後の待機時間（分）', 'Pause après rétablissement (minutes)', 'Пауза после восстановления (минуты)', 'Pause nach Ende (Minuten)'],
+  enabled: ['Enabled', '启用', '有効', 'Activée', 'Включено', 'Aktiviert'],
+  disabled: ['Disabled', '停用', '無効', 'Désactivée', 'Выключено', 'Deaktiviert'],
+  warming_up: ['Waiting for baseline history', '等待基线历史积累', '履歴データを蓄積中', 'En attente d’historique', 'Ожидание истории', 'Warten auf Verlaufsdaten'],
+  unavailable: ['Waiting for valid measurements', '等待有效采样', '有効な測定を待機', 'En attente de mesures valides', 'Ожидание корректных измерений', 'Warten auf gültige Messungen'],
+  rule_limit: ['Up to 32 rules.', '最多 32 条规则。', '最大32ルール。', '32 règles maximum.', 'Не более 32 правил.', 'Bis zu 32 Regeln.'],
+  sampler_help: ['Evaluated every minute, even with the dashboard closed. Acknowledgement keeps monitoring active.', '每分钟评估一次，关闭网页也会继续。确认告警不会停止监控。', '画面を閉じても毎分評価します。確認後も監視を続けます。', 'Évaluation chaque minute, même sans navigateur. L’acquittement maintient la surveillance.', 'Проверка каждую минуту, даже без браузера. Подтверждение не останавливает мониторинг.', 'Prüfung jede Minute, auch ohne Browser. Bestätigung beendet die Überwachung nicht.'],
+  baseline_help: ['Uses the last 24h median and MAD, excluding the latest 10 minutes. Needs 30 samples. Trigger = median + max(minimum increase, 3 × 1.4826 × MAD).', '使用过去 24 小时中位数和 MAD，排除最近 10 分钟，至少需要 30 个样本。触发值 = 中位数 + max(最小增量, 3 × 1.4826 × MAD)。', '直近10分を除く24時間の中央値とMADを使用。30サンプル必要。しきい値 = 中央値 + max(最小増加, 3 × 1.4826 × MAD)。', 'Médiane et MAD sur 24 h, hors les 10 dernières minutes. 30 mesures requises. Seuil = médiane + max(hausse minimale, 3 × 1,4826 × MAD).', 'Медиана и MAD за 24 ч без последних 10 минут. Нужно 30 отсчётов. Порог = медиана + max(минимальный рост, 3 × 1,4826 × MAD).', 'Median und MAD der letzten 24 h ohne letzte 10 Minuten. 30 Werte nötig. Schwelle = Median + max(Mindestanstieg, 3 × 1,4826 × MAD).'],
+  baseline_frozen: ['The baseline is frozen during an active incident; it does not adapt to the anomaly.', '告警期间冻结基线，避免持续异常被当作正常。', '発生中は異常に追従しないよう基準を固定します。', 'La référence reste fixe pendant l’incident.', 'База фиксируется на время активного инцидента.', 'Während eines Vorfalls bleibt der Vergleichswert fest.'],
+  context: ['Observations at trigger time', '触发时的观测信息', '発生時の観測情報', 'Observations au déclenchement', 'Наблюдения при срабатывании', 'Beobachtungen bei Auslösung'],
+  context_help: ['These observations provide context; they do not prove a cause.', '这些信息仅提供上下文，不能证明故障原因。', 'これらは参考情報であり、原因を証明しません。', 'Ces observations donnent du contexte sans prouver une cause.', 'Эти данные дают контекст, но не доказывают причину.', 'Diese Beobachtungen geben Kontext, beweisen aber keine Ursache.'],
+  began: ['Started', '开始时间', '開始', 'Début', 'Начало', 'Beginn'],
+  triggered: ['Triggered', '触发时间', '発生', 'Déclenchement', 'Срабатывание', 'Ausgelöst'],
+  ended: ['Ended', '结束时间', '終了', 'Fin', 'Завершение', 'Ende'],
+  current: ['Last observed', '最近观测值', '最新観測値', 'Dernière valeur', 'Последнее значение', 'Letzter Messwert'],
+  peak: ['Peak', '峰值', 'ピーク', 'Pic', 'Пик', 'Spitzenwert'],
+  median: ['Median', '中位数', '中央値', 'Médiane', 'Медиана', 'Median'],
+  samples: ['samples', '样本', 'サンプル', 'mesures', 'отсчётов', 'Messwerte'],
+  seconds: ['seconds', '秒', '秒', 'secondes', 'секунд', 'Sekunden'],
+  sample_age: ['Sample age', '样本年龄', 'サンプル経過時間', 'Âge de la mesure', 'Возраст измерения', 'Alter des Messwerts'],
+  latency: ['Collection latency', '采集耗时', '収集時間', 'Durée de collecte', 'Время сбора', 'Erfassungsdauer'],
+  last_success: ['Last successful sample', '最后成功采样', '最終成功サンプル', 'Dernière mesure réussie', 'Последний успешный сбор', 'Letzte erfolgreiche Messung'],
+  unavailable_time: ['Unknown', '未知', '不明', 'Inconnu', 'Неизвестно', 'Unbekannt'],
+  no_issues: ['No collection issues detected.', '未发现采集问题。', '収集の問題はありません。', 'Aucun problème de collecte détecté.', 'Проблем сбора не обнаружено.', 'Keine Erfassungsprobleme erkannt.'],
+  diagnostics_help: ['Healthy: current measurements. Stale: missing timestamp or over 120 seconds old. Partial: unavailable collectors. Node clock differences also affect freshness.', '正常表示数据有效；过期表示无时间戳或超过 120 秒；部分可用表示某些采集器不可用。节点时间差也会影响新鲜度判断。', '正常は新しいデータ、古いデータは時刻なしまたは120秒超、一部利用不可は収集機能の制限。時計差も影響します。', 'Normal : mesures récentes. Ancien : horodatage absent ou plus de 120 s. Partiel : collecteurs indisponibles. Le décalage des horloges peut influer.', 'Норма: свежие данные. Устаревшие: нет времени или старше 120 с. Частичные: недоступные сборщики. Разница часов влияет на оценку.', 'Normal: aktuelle Werte. Veraltet: kein Zeitstempel oder älter als 120 s. Teilweise: nicht verfügbare Erfassung. Zeitunterschiede beeinflussen die Bewertung.'],
+  dns_count: ['DNS entries at trigger time', '触发时 DNS 条目数', '発生時のDNS件数', 'Entrées DNS au déclenchement', 'Записи DNS при срабатывании', 'DNS-Einträge bei Auslösung'],
+  recovered: ['Measurement recovered', '指标已恢复', 'メトリック復旧', 'Mesure rétablie', 'Метрика восстановилась', 'Messwert wieder normal'],
+  rule_changed: ['Rule changed or disabled', '规则已修改或停用', 'ルール変更または無効化', 'Règle modifiée ou désactivée', 'Правило изменено или отключено', 'Regel geändert oder deaktiviert'],
+  rule_removed: ['Rule no longer applies', '规则不再适用', 'ルール対象外', 'Règle non applicable', 'Правило больше не применимо', 'Regel nicht mehr anwendbar'],
+  asset_removed: ['Asset removed', '资产已移除', '資産削除', 'Actif supprimé', 'Узел удалён', 'System entfernt'],
+  http_help: ['Enter IP:port or an HTTP/HTTPS URL, then paste the node token. HTTP sends the token without encryption; use it on a trusted network.', '填写 IP:端口 或 HTTP/HTTPS 地址，再粘贴节点令牌。HTTP 会明文传输令牌，适用于可信网络。', 'IP:ポートまたはHTTP/HTTPS URLとノードトークンを入力。HTTPは暗号化しないため信頼できるネットワークで使用してください。', 'Saisissez IP:port ou une URL HTTP/HTTPS et le jeton du nœud. HTTP transmet le jeton en clair ; utilisez un réseau de confiance.', 'Введите IP:порт или URL HTTP/HTTPS и токен узла. HTTP передаёт токен открыто; используйте доверенную сеть.', 'IP:Port oder HTTP/HTTPS-URL und Systemtoken eingeben. HTTP überträgt den Token unverschlüsselt; für vertrauenswürdige Netzwerke.'],
+  history_policy: ['History keeps minute samples for 24h, then first/last/extreme points per 5 minutes through day 7, and per hour afterward. Collection gaps remain visible.', '历史数据保留最近 24 小时的分钟样本；第 2–7 天按 5 分钟保留首尾和极值，更早按小时保留。断采仍会显示。', '24時間は毎分、7日までは5分、以降は1時間ごとの先頭・末尾・極値を保持。収集欠落も表示します。', 'Mesures par minute sur 24 h, puis début/fin/extrêmes par 5 min jusqu’au 7e jour, et par heure ensuite. Les interruptions restent visibles.', 'Отсчёты по минутам за 24 ч, затем первые/последние/экстремальные за 5 мин до 7 дней и за час далее. Пробелы сбора сохраняются.', 'Minutenwerte für 24 h, danach Anfang/Ende/Extrema je 5 Minuten bis Tag 7 und stündlich danach. Erfassungslücken bleiben sichtbar.']
+};
+function ft(key) {
+  const row = FEATURE_MESSAGES[key];
+  return row ? row[({en:0,zh:1,ja:2,fr:3,ru:4,de:5})[state.language] ?? 0] : key;
+}
+function featureDate(timestamp) {
+  return timestamp ? new Date(Number(timestamp)*1000).toLocaleString(LANGUAGE_LOCALE[state.language] || 'en-US') : '—';
+}
+function alertMetricLabel(metric) {
+  return metrics[metric] ? tr(metrics[metric][0]) : ft(metric);
+}
+function alertValue(metric, value) {
+  if(value == null || !Number.isFinite(Number(value))) return '—';
+  if(metric === 'network') return fmtBytes(value) + '/s';
+  if(metric === 'offline') return ft(Number(value) > 0 ? 'offline' : 'online');
+  const number = new Intl.NumberFormat(LANGUAGE_LOCALE[state.language] || 'en-US', {maximumFractionDigits:2}).format(value);
+  return number + (['cpu','memory','disk'].includes(metric) ? '%' : metric === 'stale' ? ' ' + ft('seconds') : '');
+}
+function featureHeader(title, helper) {
+  return '<header class="modal-head"><div><h3>'+esc(title)+'</h3><p class="helper">'+esc(helper || '')+'</p></div><button type="button" class="close" data-close aria-label="'+esc(ft('close'))+'">×</button></header>';
+}
+function drawFleetHealth() {
+  const target = document.getElementById('fleet-health');
+  if(!target) return;
+  const reports = state.data?.diagnostics?.nodes || [];
+  target.innerHTML = '<div class="fleet-label">'+esc(ft('fleet'))+'</div><div class="fleet-nodes">'+reports.map(node =>
+    '<button type="button" class="fleet-node '+esc(node.status)+'" data-diagnostic="'+esc(node.id)+'"><i class="health-dot"></i><span>'+esc(node.name)+'</span><small>'+esc(ft(node.status))+'</small></button>').join('')+'</div>';
+  target.querySelectorAll('[data-diagnostic]').forEach(button => button.onclick = () => showDiagnostics(button.dataset.diagnostic));
+  const alerts = document.getElementById('alerts-open');
+  if(alerts) {
+    const count = Number(state.data?.alerts?.active_count) || 0;
+    alerts.textContent = ft('alerts') + ' · ' + count;
+    alerts.classList.toggle('has-alerts', count > 0);
+  }
+  if(state.modalKind === 'diagnostics') updateDiagnostics();
+  if(state.modalKind === 'alerts' && state.alertTab === 'incidents' && Date.now()-state.alertFetchedAt >= 60000) loadAlerts();
+}
+function showDiagnostics(selectedNode) {
+  state.diagnosticNode = selectedNode || null;
+  modal(featureHeader(ft('diagnostics'), ft('diagnostics_help'))+'<div id="diagnostic-list" class="diagnostic-list"></div>', true);
+  state.modalKind = 'diagnostics';
+  updateDiagnostics();
+}
+function updateDiagnostics() {
+  const target = document.getElementById('diagnostic-list');
+  if(!target) return;
+  const reports = [...(state.data?.diagnostics?.nodes || [])];
+  reports.sort((left,right) => Number(right.id === state.diagnosticNode)-Number(left.id === state.diagnosticNode));
+  target.innerHTML = reports.map(node => {
+    const stamp = node.last_success_at ? new Date(node.last_success_at).toLocaleString(LANGUAGE_LOCALE[state.language] || 'en-US') : ft('unavailable_time');
+    const age = node.age_seconds == null ? ft('unavailable_time') : Math.round(node.age_seconds)+' '+ft('seconds');
+    return '<article class="diagnostic-card"><div class="feature-card-head"><strong>'+esc(node.name)+'</strong><span class="health-status '+esc(node.status)+'">'+esc(ft(node.status))+'</span></div><dl class="feature-facts"><div><dt>'+esc(ft('last_success'))+'</dt><dd>'+esc(stamp)+'</dd></div><div><dt>'+esc(ft('sample_age'))+'</dt><dd>'+esc(age)+'</dd></div><div><dt>'+esc(ft('latency'))+'</dt><dd>'+(node.latency_ms == null ? '—' : esc(node.latency_ms)+' ms')+'</dd></div></dl>'+
+      (node.error ? '<p class="asset-error">'+esc(node.error)+'</p>' : '')+
+      (node.issues.length ? '<ul class="diagnostic-issues">'+node.issues.map(issue => '<li><strong>'+esc(alertMetricLabel(issue.metric))+'</strong> · '+esc(ft(issue.kind))+(issue.message ? '<p>'+esc(issue.message)+'</p>' : '')+'</li>').join('')+'</ul>' : (node.status === 'healthy' ? '<p class="helper">'+esc(ft('no_issues'))+'</p>' : ''))+'</article>';
+  }).join('');
+}
+async function showAlerts(tab) {
+  state.alertTab = tab || 'incidents';
+  modal(featureHeader(ft('alerts'), ft('sampler_help'))+'<div id="alert-panel"><p class="helper">'+esc(ft('loading'))+'</p></div>', true);
+  state.modalKind = 'alerts';
+  await loadAlerts();
+}
+async function loadAlerts() {
+  if(state.alertLoading) return;
+  const request = ++state.alertRequest;
+  state.alertLoading = request;
+  try {
+    const data = await api('/api/alerts');
+    if(request !== state.alertRequest || state.modalKind !== 'alerts') return;
+    state.alertData = data; state.alertFetchedAt = Date.now();
+    renderAlertPanel();
+  } catch(error) {
+    const target = document.getElementById('alert-panel');
+    if(target && state.modalKind === 'alerts') {
+      target.innerHTML = '<p class="asset-error">'+esc(tr(error.message))+'</p><button type="button" class="button" id="alert-retry">'+esc(ft('retry'))+'</button>';
+      document.getElementById('alert-retry').onclick = loadAlerts;
+    }
+  } finally { if(state.alertLoading === request) state.alertLoading = false; }
+}
+function incidentCard(item) {
+  const title = item.rule_name || alertMetricLabel(item.metric);
+  const baseline = item.baseline;
+  const context = item.context || {};
+  const processRows = (context.processes || []).map(process => '<tr><td>'+esc(process.name)+'</td><td>'+esc(process.pid)+'</td><td>'+esc(alertValue('cpu', process.cpu))+'</td><td>'+esc(fmtBytes(process.memory))+'</td></tr>').join('');
+  const observations = (processRows ? '<div class="table-scroll"><table class="data-table"><thead><tr><th>'+esc(tr('进程'))+'</th><th>PID</th><th>CPU</th><th>'+esc(tr('内存'))+'</th></tr></thead><tbody>'+processRows+'</tbody></table></div>' : '')+
+    (context.logins || []).map(entry => '<p class="context-log"><b>'+esc(entry.kind)+'</b> '+esc(entry.message)+'</p>').join('')+
+    '<p class="helper">'+esc(ft('dns_count'))+': '+esc(context.dns?.count ?? 0)+'</p>'+
+    (context.connection_error ? '<p class="asset-error">'+esc(context.connection_error)+'</p>' : '')+
+    Object.entries(context.collector_errors || {}).map(([metric,error]) => '<p class="asset-error">'+esc(alertMetricLabel(metric))+': '+esc(error)+'</p>').join('');
+  const baselineInfo = baseline ? '<p class="baseline-evidence">'+esc(ft('median'))+': '+esc(alertValue(item.metric,baseline.median))+' · MAD: '+esc(alertValue(item.metric,baseline.mad))+' · '+baseline.samples+' '+esc(ft('samples'))+'</p><p class="helper">'+esc(ft('baseline_help'))+' '+esc(ft('baseline_frozen'))+'</p>' : '';
+  return '<article class="incident '+esc(item.status)+'"><div class="feature-card-head"><div><strong>'+esc(title)+'</strong><div class="metric-sub">'+esc(item.node_name)+' · '+esc(alertMetricLabel(item.metric))+' · '+esc(ft(item.mode))+'</div></div><span class="health-status '+(item.status === 'active' ? 'offline' : 'healthy')+'">'+esc(ft(item.status))+'</span></div>'+
+    '<dl class="feature-facts"><div><dt>'+esc(ft('triggered'))+'</dt><dd>'+esc(featureDate(item.triggered_at))+'</dd></div><div><dt>'+esc(ft(item.metric === 'offline' ? 'condition' : 'trigger'))+'</dt><dd>'+esc(item.metric === 'offline' ? ft('offline') : alertValue(item.metric,item.threshold))+'</dd></div><div><dt>'+esc(ft('current'))+'</dt><dd>'+esc(alertValue(item.metric,item.last_value))+'<small>'+esc(featureDate(item.last_observed_at))+'</small></dd></div><div><dt>'+esc(ft('peak'))+'</dt><dd>'+esc(alertValue(item.metric,item.peak))+'</dd></div></dl>'+
+    '<details><summary>'+esc(ft('context'))+'</summary><p class="helper">'+esc(ft('began'))+': '+esc(featureDate(item.started_at))+' · '+esc(ft('recovery'))+': '+esc(alertValue(item.metric,item.recovery))+'</p>'+baselineInfo+observations+'<p class="helper">'+esc(ft('context_help'))+'</p></details>'+
+    (item.status === 'resolved' ? '<p class="helper">'+esc(ft('ended'))+': '+esc(featureDate(item.resolved_at))+' · '+esc(ft(item.resolution_reason || 'recovered'))+'</p>' : '')+
+    '<div class="incident-actions">'+(item.acknowledged_at ? '<span class="helper">'+esc(ft('acknowledged'))+' · '+esc(featureDate(item.acknowledged_at))+'</span>' : '<button type="button" class="button subtle" data-ack="'+esc(item.id)+'">'+esc(ft('acknowledge'))+'</button>')+'</div></article>';
+}
+function renderAlertPanel() {
+  const target = document.getElementById('alert-panel'), data = state.alertData;
+  if(!target || !data) return;
+  const tabs = '<div class="feature-tabs" role="tablist">'+['incidents','rules'].map(tab => '<button type="button" role="tab" aria-selected="'+(state.alertTab === tab)+'" class="button '+(state.alertTab === tab ? 'primary' : 'subtle')+'" data-alert-tab="'+tab+'">'+esc(ft(tab === 'incidents' ? 'timeline' : 'rules'))+'</button>').join('')+'</div>';
+  if(state.alertTab === 'incidents') {
+    const assets = [{id:'*',name:ft('all_nodes')},{id:'local',name:nodeFor('local')?.name || 'Local'}].concat(state.config.assets || []);
+    for(const item of data.incidents)if(!assets.some(asset => asset.id === item.node))assets.push({id:item.node,name:item.node_name});
+    const items = data.incidents.filter(item => (state.alertStatus === 'all' || item.status === state.alertStatus) && (state.alertNode === '*' || item.node === state.alertNode));
+    target.innerHTML = tabs+'<div class="feature-toolbar"><select id="incident-status" class="select-mini" aria-label="'+esc(ft('alerts'))+'">'+['all','active','resolved'].map(status => '<option value="'+status+'" '+(state.alertStatus === status ? 'selected' : '')+'>'+esc(ft(status))+'</option>').join('')+'</select><select id="incident-node" class="select-mini" aria-label="'+esc(ft('node'))+'">'+assets.map(asset => '<option value="'+esc(asset.id)+'" '+(state.alertNode === asset.id ? 'selected' : '')+'>'+esc(asset.name)+'</option>').join('')+'</select><span class="helper">'+esc(ft('active'))+': '+data.active_count+'</span></div><div class="incident-list">'+(items.length ? items.map(incidentCard).join('') : '<div class="empty">'+esc(ft('no_incidents'))+'</div>')+'</div>';
+    document.getElementById('incident-status').onchange = event => {state.alertStatus = event.target.value;renderAlertPanel()};
+    document.getElementById('incident-node').onchange = event => {state.alertNode = event.target.value;renderAlertPanel()};
+    target.querySelectorAll('[data-ack]').forEach(button => button.onclick = async () => {
+      button.disabled = true;
+      try {
+        state.alertData = await api('/api/alerts','POST',{action:'ack',id:button.dataset.ack});
+        if(state.modalKind === 'alerts') renderAlertPanel();
+        await refresh();
+      } catch(error) {button.disabled = false;toast(ft('failed'))}
+    });
+  } else {
+    const rows = data.rules.map(rule => {
+      const asset = rule.node === '*' ? ft('all_nodes') : nodeFor(rule.node)?.name || state.config.assets.find(asset => asset.id === rule.node)?.name || rule.node;
+      const ruleStates = Object.entries(data.states || {}).filter(([key]) => key.startsWith(rule.id+':')).map(([,value]) => value.evaluation);
+      const waiting = ruleStates.includes('warming_up') ? 'warming_up' : ruleStates.includes('unavailable') ? 'unavailable' : '';
+      return '<article class="rule-card"><div class="feature-card-head"><div><strong>'+esc(rule.name || alertMetricLabel(rule.metric))+'</strong><div class="metric-sub">'+esc(asset)+' · '+esc(ft(rule.mode))+'</div></div><span class="tag '+(rule.enabled ? 'good' : '')+'">'+esc(ft(rule.enabled ? 'enabled' : 'disabled'))+'</span></div><p class="helper">'+esc(ft(rule.metric === 'offline' ? 'condition' : rule.mode === 'baseline' ? 'minimum_delta' : 'trigger'))+': '+esc(rule.metric === 'offline' ? ft('offline') : alertValue(rule.metric,rule.threshold))+' · '+esc(ft('duration'))+': '+rule.duration/60+'</p>'+(rule.enabled && waiting ? '<p class="helper">'+esc(ft(waiting))+'</p>' : '')+'<div class="rule-actions"><button type="button" class="button subtle" data-edit-rule="'+esc(rule.id)+'">'+esc(ft('edit'))+'</button><button type="button" class="button danger" data-remove-rule="'+esc(rule.id)+'">'+esc(ft('remove'))+'</button></div></article>';
+    }).join('');
+    target.innerHTML = tabs+'<div class="feature-toolbar"><button type="button" class="button primary" id="add-alert-rule" '+(data.rules.length >= 32 ? 'disabled' : '')+'>'+esc(ft('add_rule'))+'</button><span class="helper">'+esc(ft('rule_limit'))+'</span></div><div id="rule-editor"></div><div class="rule-list">'+(rows || '<div class="empty">'+esc(ft('no_rules'))+'</div>')+'</div>';
+    document.getElementById('add-alert-rule').onclick = () => editAlertRule();
+    target.querySelectorAll('[data-edit-rule]').forEach(button => button.onclick = () => editAlertRule(data.rules.find(rule => rule.id === button.dataset.editRule)));
+    target.querySelectorAll('[data-remove-rule]').forEach(button => button.onclick = async () => {
+      button.disabled = true;
+      try {
+        state.alertData = await api('/api/alerts','POST',{action:'save_rules',rules:data.rules.filter(rule => rule.id !== button.dataset.removeRule)});
+        if(state.modalKind === 'alerts') renderAlertPanel();
+        await refresh();
+      } catch(error) {button.disabled = false;toast(ft('failed'))}
+    });
+  }
+  target.querySelectorAll('[data-alert-tab]').forEach(button => button.onclick = () => {state.alertTab = button.dataset.alertTab;renderAlertPanel()});
+}
+function editAlertRule(existing) {
+  const rule = existing || {id:'r-'+(crypto.randomUUID ? crypto.randomUUID() : Date.now()),name:'',node:'*',metric:'cpu',mode:'threshold',threshold:90,recovery:85,duration:180,cooldown:300,enabled:true};
+  const assets = [{id:'*',name:ft('all_nodes')},{id:'local',name:nodeFor('local')?.name || 'Local'}].concat(state.config.assets || []);
+  const target = document.getElementById('rule-editor');
+  target.innerHTML = '<form id="alert-rule-form" class="rule-editor"><div class="form-grid"><div class="field full"><label for="rule-name">'+esc(ft('name'))+'</label><input id="rule-name" maxlength="80" value="'+esc(rule.name)+'"></div><div class="field"><label for="rule-node">'+esc(ft('node'))+'</label><select id="rule-node">'+assets.map(asset => '<option value="'+esc(asset.id)+'" '+(rule.node === asset.id ? 'selected' : '')+'>'+esc(asset.name)+'</option>').join('')+'</select></div><div class="field"><label for="rule-metric">'+esc(ft('metric'))+'</label><select id="rule-metric">'+['cpu','memory','disk','network','load','offline','stale'].map(metric => '<option value="'+metric+'" '+(rule.metric === metric ? 'selected' : '')+'>'+esc(alertMetricLabel(metric))+'</option>').join('')+'</select></div><div class="field full"><label for="rule-mode">'+esc(ft('mode'))+'</label><select id="rule-mode">'+['threshold','baseline'].map(mode => '<option value="'+mode+'" '+(rule.mode === mode ? 'selected' : '')+'>'+esc(ft(mode))+'</option>').join('')+'</select></div><div class="field" id="rule-threshold-field"><label for="rule-threshold" id="rule-threshold-label"></label><input id="rule-threshold" type="number" min="0" step="any" required value="'+rule.threshold+'"></div><div class="field" id="rule-recovery-field"><label for="rule-recovery">'+esc(ft('recovery'))+'</label><input id="rule-recovery" type="number" min="0" step="any" required value="'+rule.recovery+'"></div><div class="field"><label for="rule-duration">'+esc(ft('duration'))+'</label><input id="rule-duration" type="number" min="0" max="1440" step="any" required value="'+rule.duration/60+'"></div><div class="field"><label for="rule-cooldown">'+esc(ft('cooldown'))+'</label><input id="rule-cooldown" type="number" min="0" max="10080" step="any" required value="'+rule.cooldown/60+'"></div><div class="field full"><label class="checkbox-label"><input id="rule-enabled" type="checkbox" '+(rule.enabled ? 'checked' : '')+'>'+esc(ft('enabled'))+'</label></div></div><p class="helper hidden" id="rule-baseline-help">'+esc(ft('baseline_help'))+'</p><p class="error-message" id="rule-error" role="alert"></p><div class="modal-actions"><button type="button" class="button subtle" id="rule-cancel">'+esc(ft('cancel'))+'</button><button type="submit" class="button primary">'+esc(ft('save'))+'</button></div></form>';
+  const mode = document.getElementById('rule-mode'), metric = document.getElementById('rule-metric');
+  function updateFields(reset) {
+    const availability = ['offline','stale'].includes(metric.value), offline = metric.value === 'offline';
+    if(availability) mode.value = 'threshold';
+    mode.disabled = availability;
+    const baseline = mode.value === 'baseline';
+    document.getElementById('rule-threshold-field').classList.toggle('hidden',offline);
+    document.getElementById('rule-recovery-field').classList.toggle('hidden',offline || baseline);
+    document.getElementById('rule-baseline-help').classList.toggle('hidden',!baseline);
+    document.getElementById('rule-threshold-label').textContent = ft(baseline ? 'minimum_delta' : 'trigger') + (metric.value === 'network' ? ' (B/s)' : ['cpu','memory','disk'].includes(metric.value) ? ' (%)' : '');
+    if(offline) {document.getElementById('rule-threshold').value = 0;document.getElementById('rule-recovery').value = 0}
+    else if(reset) {
+      document.getElementById('rule-threshold').value = metric.value === 'stale' ? 120 : baseline ? 10 : metric.value === 'load' ? 4 : metric.value === 'network' ? 10485760 : 90;
+      document.getElementById('rule-recovery').value = metric.value === 'stale' ? 60 : metric.value === 'load' ? 2 : metric.value === 'network' ? 5242880 : 85;
+    }
+  }
+  mode.onchange = () => updateFields(true); metric.onchange = () => updateFields(true); updateFields(false);
+  document.getElementById('rule-cancel').onclick = () => {target.innerHTML = ''};
+  document.getElementById('rule-name').focus({preventScroll:true});
+  document.getElementById('alert-rule-form').onsubmit = async event => {
+    event.preventDefault();
+    const next = {id:rule.id,name:document.getElementById('rule-name').value,node:document.getElementById('rule-node').value,metric:metric.value,mode:mode.value,threshold:Number(document.getElementById('rule-threshold').value),recovery:mode.value === 'baseline' ? 0 : Number(document.getElementById('rule-recovery').value),duration:Math.round(Number(document.getElementById('rule-duration').value)*60),cooldown:Math.round(Number(document.getElementById('rule-cooldown').value)*60),enabled:document.getElementById('rule-enabled').checked};
+    const rules = state.alertData.rules.filter(item => item.id !== rule.id).concat(next);
+    const submit = event.target.querySelector('[type=submit]'); submit.disabled = true;
+    try {
+      state.alertData = await api('/api/alerts','POST',{action:'save_rules',rules});
+      if(state.modalKind === 'alerts') renderAlertPanel();
+      toast(ft('saved')); await refresh();
+    } catch(error) {const field = document.getElementById('rule-error');if(field)field.textContent = ft('failed');submit.disabled = false}
+  };
 }
 boot();
 </script></body></html>'''
@@ -2375,11 +3118,25 @@ class TinyWatchHandler(BaseHTTPRequestHandler):
                 return
             self._json(HTTPStatus.OK, _config_for_browser())
             return
+        if path == "/api/alerts":
+            if self._require_session():
+                self._json(HTTPStatus.OK, _alerts_response())
+            return
+        if path == "/api/diagnostics":
+            if not self._require_session():
+                return
+            try:
+                self._json(HTTPStatus.OK, _diagnostics_response(collect_cluster_snapshot()))
+            except Exception as exc:
+                self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": _safe_text(exc, 180)})
+            return
         if path == "/api/metrics":
             if not self._require_session():
                 return
             try:
-                self._json(HTTPStatus.OK, collect_cluster_snapshot())
+                snapshot = collect_cluster_snapshot()
+                self._json(HTTPStatus.OK, dict(snapshot, diagnostics=_diagnostics_response(snapshot),
+                                               alerts=_alert_counts()))
             except Exception as exc:
                 self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": _safe_text(exc, 180)})
             return
@@ -2486,6 +3243,21 @@ class TinyWatchHandler(BaseHTTPRequestHandler):
                 return
             self._json(HTTPStatus.OK, {"ok": True})
             return
+        if path == "/api/alerts":
+            try:
+                if value.get("action") == "save_rules":
+                    _save_alert_rules(value.get("rules"))
+                elif value.get("action") == "ack":
+                    if not _acknowledge_incident(value.get("id")):
+                        self._json(HTTPStatus.NOT_FOUND, {"error": "Incident not found"})
+                        return
+                else:
+                    raise ValueError("Invalid alert action")
+            except ValueError as exc:
+                self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+            self._json(HTTPStatus.OK, _alerts_response())
+            return
         self._json(HTTPStatus.NOT_FOUND, {"error": "未找到"})
 
     def _create_session(self):
@@ -2526,11 +3298,6 @@ class TinyWatchHandler(BaseHTTPRequestHandler):
                 if not name:
                     raise ValueError("资产名称不能为空")
                 url = _validate_asset_url(item.get("url", ""))
-                parsed_url = urllib.parse.urlsplit(url)
-                old_asset = previous.get(asset_id, {})
-                if (parsed_url.scheme == "http" and not _is_loopback_host(parsed_url.hostname)
-                        and (not old_asset or old_asset.get("url") != url)):
-                    raise ValueError("远程资产必须使用 HTTPS；HTTP 仅限 localhost / 回环地址")
                 password = item.get("password")
                 if not isinstance(password, str) or not password:
                     password = previous.get(asset_id, {}).get("password", "")
@@ -2560,6 +3327,14 @@ class TinyWatchHandler(BaseHTTPRequestHandler):
             STORE.data["widgets"] = widgets
             STORE.data["theme"] = theme
             STORE.data["history_retention_days"] = retention_days
+            removed_nodes = set(previous) - identifiers
+            for incident in STORE.data.get("incidents", []):
+                if incident.get("status") == "active" and incident.get("node") in removed_nodes:
+                    _resolve_incident(incident, time.time(), "asset_removed")
+            STORE.data["alert_rules"] = [rule for rule in STORE.data.get("alert_rules", [])
+                                          if rule.get("node") not in removed_nodes]
+            STORE.data["alert_states"] = {key: item for key, item in STORE.data.get("alert_states", {}).items()
+                                           if key.split(":", 1)[-1] not in removed_nodes}
             retention_cutoff = time.time() - retention_days * 24 * 60 * 60
             pruned = _prune_history_database(STORE.data, retention_cutoff)
             backup_retention_days = retention_days if pruned or previous_retention_days != retention_days else None

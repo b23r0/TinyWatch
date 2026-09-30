@@ -38,5 +38,5 @@ jobs:
       - name: Run standard-library regression suite
         run: python -m unittest discover -s tests -v
 
-      - name: Check embedded UI JavaScript syntax
+      - name: Check embedded UI JavaScript syntax and behavior
         run: python scripts/check_inline_js.py
