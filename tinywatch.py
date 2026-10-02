@@ -1,11 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""TinyWatch: a dependency-free, cross-platform server monitoring dashboard.
+"""TinyWatch server, system collectors and embedded browser UI.
 
-Run with ``python3 tinywatch.py`` and open http://127.0.0.1:8765.
-The web UI, HTTP API, collectors, and JSON-backed configuration live in this
-single file. Platform-specific collectors use the standard library and native
-system interfaces or commands when a portable Python API does not exist.
+Run ``python3 tinywatch.py`` and open http://127.0.0.1:8765.
 """
 
 from __future__ import annotations
@@ -30,6 +27,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+import urllib.error
 import uuid
 from datetime import datetime, timezone
 from http import HTTPStatus
@@ -57,6 +55,16 @@ HISTORY_RETENTION_OPTIONS = (1, 3, 7, 14, 30)
 HISTORY_RETENTION_MAX = 30 * 24 * 60 * 60
 HISTORY_RANGES = {"1h": 60 * 60, "6h": 6 * 60 * 60, "24h": 24 * 60 * 60, "3d": 3 * 24 * 60 * 60, "7d": 7 * 24 * 60 * 60, "14d": 14 * 24 * 60 * 60, "30d": 30 * 24 * 60 * 60}
 HISTORY_LAST_WRITE = 0.0
+# Expensive native commands are cached independently of fast resource counters.
+COLLECTOR_INTERVALS = {"cpu": 2, "memory": 2, "network": 2, "load": 2,
+                       "disk": 30, "processes": 10, "logins": 60, "dns": 60, "info": 30}
+COLLECTOR_CACHE = {}
+COLLECTOR_CACHE_LOCK = threading.RLock()
+SLOW_COLLECTORS = {"disk", "processes", "logins", "dns", "info"}
+DETAILS_RUNNING = False
+MAX_SERVICES = 24
+MAX_NOTIFICATION_JOBS = 128
+MAX_TIMELINE_EVENTS = 2048
 SAMPLE_LOCK = threading.RLock()
 SNAPSHOT_LOCK = threading.Lock()
 SNAPSHOT_CACHE = {"sampled_at": 0.0, "data": None}
@@ -641,12 +649,15 @@ def _processes_linux():
                         uid = _number(line.split()[1])
                         break
                 old = PREVIOUS["processes"].get(pid)
+                start_ticks = _number(fields[19])
+                if old and (len(old) < 3 or old[2] != start_ticks):
+                    old = None
                 elapsed = max(0.01, now - old[1]) if old else 0
                 cpu_pct = max(0.0, min(100.0 * (os.cpu_count() or 1),
                                        100.0 * (cpu_seconds - old[0]) / elapsed)) if old and elapsed else 0.0
-                new_previous[pid] = (cpu_seconds, now)
+                new_previous[pid] = (cpu_seconds, now, start_ticks)
                 process_network = network_rates.get(pid) if network_rates is not None else None
-                rows.append({"pid": pid, "name": _safe_text(command, 100), "user": str(uid) if uid is not None else "—",
+                rows.append({"pid": pid, "started": start_ticks, "name": _safe_text(command, 100), "user": str(uid) if uid is not None else "—",
                              "state": state, "cpu": round(cpu_pct, 1), "memory": rss,
                              "memory_percent": round(100.0 * rss / total_memory, 2) if total_memory else 0.0,
                              "network_connections": _process_connection_count(pid),
@@ -827,7 +838,7 @@ def _dns_cache():
                 entries.append({"name": _safe_text(match.group(2), 180), "type": _safe_text(match.group(1).upper(), 16),
                                 "value": _safe_text(match.group(3), 180)})
     if not entries and system != "windows":
-        # A visible fallback is preferable to claiming the resolver cache is empty.
+        # Keep the hosts-file fallback distinguishable from a resolver cache.
         for line in _read_text("/etc/hosts", 128_000).splitlines():
             line = line.split("#", 1)[0].strip()
             fields = line.split()
@@ -858,13 +869,46 @@ def collect_snapshot():
         return data
 
 
-def _collect_safely(name, collector, fallback, errors):
-    """Keep one failing platform collector from taking down the full snapshot."""
+def _partition_id(item):
+    """Stable partition identity; labels stay separate from API/storage keys."""
+    identity = str(item.get("device", "")) + "\0" + str(item.get("mount", ""))
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
+
+
+def _collect_safely(name, collector, fallback, errors, refresh=False):
+    """Cache collector results and isolate platform errors."""
+    now = time.monotonic()
+    with COLLECTOR_CACHE_LOCK:
+        cached = COLLECTOR_CACHE.get(name)
+    interval = COLLECTOR_INTERVALS.get(name, 30)
+    if DETAILS_RUNNING and name in SLOW_COLLECTORS and not refresh:
+        if not cached:
+            errors[name] = "Waiting for background collection"
+            return copy.deepcopy(fallback)
+        if cached["error"]:
+            errors[name] = cached["error"]
+        elif time.time() - cached["stamp"] > max(120, interval * 3):
+            errors[name] = "Background collection is stale"
+        return copy.deepcopy(cached["data"])
+    if cached and now - cached["at"] < (min(interval, 10) if cached["error"] else interval):
+        if cached["error"]:
+            errors[name] = cached["error"]
+        return copy.deepcopy(cached["data"])
+    error = None
     try:
-        return collector()
+        data = collector()
+        if name == "disk":
+            for item in data.get("partitions", []):
+                item["id"] = _partition_id(item)
     except Exception as exc:
-        errors[name] = _safe_text(exc, 180) or "collector failed"
-        return fallback
+        error = _safe_text(exc, 180) or "collector failed"
+        errors[name] = error
+        data = fallback
+    with COLLECTOR_CACHE_LOCK:
+        COLLECTOR_CACHE[name] = {"at": time.monotonic(), "stamp": time.time(),
+                                                              "duration_ms": round((time.monotonic() - now) * 1000, 1),
+                                 "data": copy.deepcopy(data), "error": error}
+    return data
 
 
 def _collect_snapshot_now():
@@ -895,18 +939,7 @@ def _collect_snapshot_now():
         dns = _collect_safely("dns", _dns_cache,
                               {"source": "unavailable", "count": 0, "entries": []}, errors)
 
-        def collect_host_profile():
-            uname = platform.uname()
-            uptime_seconds = _uptime_seconds()
-            return {"hostname": _safe_text(socket.gethostname(), 160), "cpu": _cpu_brand(),
-                    "logical_cores": logical_cores, "memory_total": memory["total"],
-                    "system": _safe_text(platform.platform(), 240), "os": _safe_text(uname.system, 80),
-                    "release": _safe_text(uname.release, 120), "version": _safe_text(uname.version, 220),
-                    "architecture": _safe_text(uname.machine, 80), "uptime_seconds": uptime_seconds,
-                    "uptime": _format_uptime(uptime_seconds), "sessions": _sessions(),
-                    "python": platform.python_version()}
-
-        info = _collect_safely("info", collect_host_profile,
+        info = _collect_safely("info", _host_profile,
                                {"hostname": "unknown", "cpu": "unavailable",
                                 "logical_cores": logical_cores, "memory_total": memory["total"],
                                 "system": "unavailable", "os": system or "unknown",
@@ -914,10 +947,47 @@ def _collect_snapshot_now():
                                 "architecture": "unavailable", "uptime_seconds": 0,
                                 "uptime": "unavailable", "sessions": [],
                                 "python": platform.python_version()}, errors)
+        if memory.get("supported", True) and memory.get("total"):
+            info["memory_total"] = memory["total"]
         return {"sampled_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                 "cpu": cpu, "memory": memory, "disk": disks, "network": network, "load": load,
                 "processes": processes, "logins": logins, "dns": dns, "info": info,
-                "collector_errors": errors}
+                "collector_errors": errors,
+                "collector_status": _collector_metadata()}
+
+
+def _collector_metadata():
+    with COLLECTOR_CACHE_LOCK:
+        return {name: {"sampled_at": entry["stamp"], "interval_seconds": COLLECTOR_INTERVALS[name],
+                       "duration_ms": entry["duration_ms"]} for name, entry in COLLECTOR_CACHE.items()}
+
+
+def _host_profile():
+    uname = platform.uname()
+    uptime = _uptime_seconds()
+    with COLLECTOR_CACHE_LOCK:
+        memory = COLLECTOR_CACHE.get("memory", {}).get("data", {})
+    return {"hostname": _safe_text(socket.gethostname(), 160), "cpu": _cpu_brand(),
+            "logical_cores": os.cpu_count() or 1, "memory_total": memory.get("total", 0),
+            "system": _safe_text(platform.platform(), 240), "os": _safe_text(uname.system, 80),
+            "release": _safe_text(uname.release, 120), "version": _safe_text(uname.version, 220),
+            "architecture": _safe_text(uname.machine, 80), "uptime_seconds": uptime,
+            "uptime": _format_uptime(uptime), "sessions": _sessions(), "python": platform.python_version()}
+
+
+def _details_sampler(stop_event):
+    """Refresh slow collectors outside the resource sample lock."""
+    system = platform.system().lower()
+    process_collector = _processes_linux if system == "linux" else _processes_windows if system == "windows" else _processes_other
+    collectors = {"info": _host_profile, "disk": _disk_snapshot, "processes": process_collector,
+                  "logins": _login_events, "dns": _dns_cache}
+    while not stop_event.is_set():
+        _worker_tick("details")
+        for name, collector in collectors.items():
+            if stop_event.is_set():
+                return
+            _collect_safely(name, collector, {} if name in ("info", "disk", "dns") else [], {}, refresh=True)
+        stop_event.wait(1)
 
 
 def default_store_path():
@@ -930,6 +1000,9 @@ def default_store_path():
 def empty_database():
     return {"schema": 1, "password": None, "agent_token": secrets.token_urlsafe(32),
             "alert_rules": default_alert_rules(), "alert_states": {}, "incidents": [],
+            "timeline": [], "node_fingerprints": {},
+            "heartbeats": [], "service_revision": 0, "services": [], "service_states": {}, "service_history": {}, "maintenance": [],
+            "notifications": {"enabled": False, "url": ""}, "notification_queue": [],
             "assets": [], "history": {}, "history_retention_days": HISTORY_RETENTION_DEFAULT_DAYS, "widgets": [{"id": "local-cpu", "node": "local", "metric": "cpu"},
                                        {"id": "local-memory", "node": "local", "metric": "memory"},
                                        {"id": "local-network", "node": "local", "metric": "network"},
@@ -956,7 +1029,10 @@ def _prune_history_database(database, cutoff):
                             if isinstance(point, list) and point and _number(point[0]) >= cutoff]
                 if len(filtered) != len(points):
                     changed = True
-                node_series[metric] = filtered
+                if not filtered and metric.startswith("disk@"):
+                    del node_series[metric]
+                else:
+                    node_series[metric] = filtered
     incidents = database.get("incidents", [])
     if isinstance(incidents, list):
         retained = [item for item in incidents if isinstance(item, dict) and
@@ -964,7 +1040,99 @@ def _prune_history_database(database, cutoff):
         if retained != incidents:
             database["incidents"] = retained
             changed = True
+    events = database.get("timeline", [])
+    kept = [event for event in events if isinstance(event, dict) and _number(event.get("timestamp")) >= cutoff]
+    if kept != events:
+        database["timeline"] = kept
+        changed = True
+    for service_id, buckets in list(database.get("service_history", {}).items()):
+        kept = [bucket for bucket in buckets if bucket.get("last_at", 0) >= cutoff][-2048:]
+        if kept != buckets:
+            database["service_history"][service_id] = kept
+            changed = True
+    windows = database.get("maintenance", [])
+    kept = [window for window in windows if window.get("end", 0) >= cutoff]
+    if kept != windows:
+        database["maintenance"] = kept
+        changed = True
     return changed
+
+
+WORKER_LOCK = threading.Lock()
+WORKER_HEALTH = {}
+
+
+def _worker_tick(name, **fields):
+    with WORKER_LOCK:
+        WORKER_HEALTH.setdefault(name, {}).update(last_tick=time.time(), **fields)
+
+
+def _worker_entry(name, target, stop_event):
+    _worker_tick(name, running=True, failed=False)
+    try:
+        target(stop_event)
+    except Exception:
+        _worker_tick(name, failed=True)
+        sys.stderr.write("TinyWatch background worker stopped: " + name + "\n")
+    finally:
+        with WORKER_LOCK:
+            WORKER_HEALTH[name]["running"] = False
+
+
+def _runtime_health(now):
+    with WORKER_LOCK:
+        workers = copy.deepcopy(WORKER_HEALTH)
+    for name, worker in workers.items():
+        worker["age_seconds"] = max(0, int(now-worker["last_tick"]))
+        worker["stale"] = worker["age_seconds"] > (180 if name in ("history", "details") else 30)
+    with STORE.lock:
+        pending = [job for job in STORE.data.get("notification_queue", []) if job.get("status") == "pending"]
+        oldest = max((now-job["created_at"] for job in pending), default=0)
+        shards = STORE.path.with_name(STORE.path.name + ".history")
+        try:
+            shard_bytes = sum(path.stat().st_size for path in shards.iterdir() if HISTORY_FILE_PATTERN.fullmatch(path.name))
+        except OSError:
+            shard_bytes = None
+        return {"workers": workers, "last_persisted_at": STORE.last_success_at,
+                "write_failures": STORE.write_failures, "notification_pending": len(pending),
+                "notification_oldest_seconds": max(0, int(oldest)), "history_bytes": shard_bytes}
+
+
+HISTORY_FILE_PATTERN = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}-[a-f0-9]{64}\.jsonl")
+
+
+def _hydrate_history(database, path):
+    """Validate all referenced shards before accepting a database generation."""
+    manifest = database.pop("history_files", None)
+    if manifest is None:
+        return database
+    if not isinstance(manifest, list) or len(manifest) > 370:
+        raise ValueError("Invalid history manifest")
+    history, services = {}, {}
+    directory = path.with_name(path.name + ".history")
+    for name in manifest:
+        if not isinstance(name, str) or not HISTORY_FILE_PATTERN.fullmatch(name):
+            raise ValueError("Invalid history shard name")
+        content = (directory / name).read_bytes()
+        if hashlib.sha256(content).hexdigest() != name[11:-6]:
+            raise ValueError("History shard checksum mismatch")
+        for line in content.splitlines():
+            row = json.loads(line)
+            if not isinstance(row, list) or len(row) != 4 or row[0] not in ("host", "service"):
+                raise ValueError("Invalid history record")
+            kind, identity, metric, point = row
+            if not isinstance(identity, str) or not isinstance(metric, str):
+                raise ValueError("Invalid history identity")
+            if kind == "host":
+                if not isinstance(point, list) or not point or not isinstance(point[0], (int, float)):
+                    raise ValueError("Invalid host history point")
+                history.setdefault(identity, {}).setdefault(metric, []).append(point)
+            else:
+                if not isinstance(point, dict) or not isinstance(point.get("bucket"), (int, float)):
+                    raise ValueError("Invalid service history bucket")
+                services.setdefault(identity, []).append(point)
+    database["history"], database["service_history"] = history, services
+    return database
 
 
 class JsonStore:
@@ -977,6 +1145,11 @@ class JsonStore:
         self.recovered_from_backup = False
         self.persisted_retention_days = None
         self.last_compact_at = 0
+        self.last_save_ms = None
+        self.last_success_at = None
+        self.write_failures = 0
+        self.last_prune_at = 0
+        self.encoded_bytes = self.path.stat().st_size if self.path.exists() else 0
         self._known_main_signature = None
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.data = self._load()
@@ -1015,6 +1188,10 @@ class JsonStore:
             return None, ValueError("unsupported or invalid database schema")
         default = empty_database()
         default.update(value)
+        try:
+            _hydrate_history(default, path.with_name(path.name[:-4]) if path.name.endswith(".bak") else path)
+        except (OSError, UnicodeError, ValueError, TypeError, KeyError) as exc:
+            return None, exc
         return default, None
 
     def _preserve_corrupt_file(self):
@@ -1063,12 +1240,8 @@ class JsonStore:
 
     @staticmethod
     def _valid_database_file(path):
-        try:
-            with path.open("r", encoding="utf-8") as stream:
-                value = json.load(stream)
-            return isinstance(value, dict) and value.get("schema") == 1
-        except (OSError, UnicodeError, ValueError):
-            return False
+        database, error = JsonStore._read_database(path)
+        return database is not None and error is None
 
     def _main_is_known_good(self):
         try:
@@ -1094,20 +1267,76 @@ class JsonStore:
         except OSError:
             pass
 
+    def _encode_generation(self, database):
+        """Write daily shards before publishing their index."""
+        days = {}
+        for identity, metrics in database.get("history", {}).items():
+            for metric, points in metrics.items():
+                for point in points:
+                    day = datetime.fromtimestamp(point[0], timezone.utc).strftime("%Y-%m-%d")
+                    days.setdefault(day, []).append(["host", identity, metric, point])
+        for identity, buckets in database.get("service_history", {}).items():
+            for bucket in buckets:
+                day = datetime.fromtimestamp(bucket["bucket"], timezone.utc).strftime("%Y-%m-%d")
+                days.setdefault(day, []).append(["service", identity, "latency", bucket])
+        directory = self.path.with_name(self.path.name + ".history")
+        directory.mkdir(parents=True, exist_ok=True)
+        manifest = []
+        for day, rows in sorted(days.items()):
+            rows.sort(key=lambda row: (row[0], row[1], row[2], row[3][0] if row[0] == "host" else row[3]["bucket"]))
+            content = ("\n".join(json.dumps(row, ensure_ascii=False, separators=(",", ":"), sort_keys=True) for row in rows)+"\n").encode("utf-8")
+            name = day + "-" + hashlib.sha256(content).hexdigest() + ".jsonl"
+            target = directory / name
+            if not target.exists():
+                temporary = directory / (name + ".tmp")
+                self._write_synced(temporary, content)
+                os.replace(temporary, target)
+            manifest.append(name)
+        # Sync the shard directory before an index can refer to its new entries.
+        if os.name != "nt":
+            descriptor = os.open(str(directory), os.O_RDONLY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        index = {key: value for key, value in database.items() if key not in ("history", "service_history", "history_files")}
+        index["history_files"] = manifest
+        return json.dumps(index, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
+
+    def _cleanup_shards(self):
+        """Delete only our named shards absent from both committed generations."""
+        referenced = set()
+        for path in (self.path, self.backup_path):
+            if path.exists():
+                with path.open(encoding="utf-8") as stream:
+                    referenced.update(json.load(stream).get("history_files", []))
+        directory = self.path.with_name(self.path.name + ".history")
+        for path in directory.iterdir():
+            if HISTORY_FILE_PATTERN.fullmatch(path.name) and path.name not in referenced:
+                path.unlink()
+
     def save(self, backup_retention_days=None):
+        try:
+            self._save_generation(backup_retention_days)
+        except OSError:
+            self.write_failures += 1
+            raise
+
+    def _save_generation(self, backup_retention_days=None):
+        started = time.monotonic()
         with self.lock:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             temporary = self.path.with_name(self.path.name + ".tmp")
             backup_temporary = self.backup_path.with_name(self.backup_path.name + ".tmp")
-            encoded = json.dumps(self.data, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
+            encoded = self._encode_generation(self.data)
             self._write_synced(temporary, encoded)
             if self._main_is_known_good():
                 if backup_retention_days is not None:
                     with self.path.open("r", encoding="utf-8") as current:
-                        previous = json.load(current)
+                        previous = _hydrate_history(json.load(current), self.path)
                     previous["history_retention_days"] = backup_retention_days
                     _prune_history_database(previous, time.time() - backup_retention_days * 24 * 60 * 60)
-                    backup_content = json.dumps(previous, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
+                    backup_content = self._encode_generation(previous)
                     self._write_synced(backup_temporary, backup_content)
                 else:
                     with self.path.open("rb") as current, backup_temporary.open("wb") as backup:
@@ -1122,10 +1351,19 @@ class JsonStore:
             elif self.recovered_from_backup and backup_retention_days is not None:
                 self._write_synced(backup_temporary, encoded)
                 os.replace(backup_temporary, self.backup_path)
+            committed_signature = self._file_signature(temporary)
             os.replace(temporary, self.path)
-            self._known_main_signature = self._file_signature(self.path)
+            self._known_main_signature = committed_signature
             self.persisted_retention_days = self._retention_days(self.data)
             self._sync_parent_directory()
+            self.encoded_bytes = len(encoded)
+            self.last_save_ms = round((time.monotonic() - started) * 1000, 1)
+            self.last_success_at = int(time.time())
+            try:
+                self._cleanup_shards()
+            except (OSError, ValueError, TypeError):
+                # Garbage collection is best effort; the committed index is valid.
+                pass
 
 
 STORE = None
@@ -1262,6 +1500,9 @@ def _remote_snapshot(asset):
                     or not isinstance(data.get("dns", {}), dict)
                     or not isinstance(data.get("collector_errors", {}), dict)):
                 raise ValueError("invalid metric response")
+            for part in data["disk"].get("partitions", [])[:120]:
+                if isinstance(part, dict):
+                    part["id"] = _partition_id(part)
             try:
                 sampled = datetime.fromisoformat(str(data.get("sampled_at", "")).replace("Z", "+00:00"))
                 if sampled.tzinfo is None:
@@ -1305,12 +1546,7 @@ def _point_values(metric, point):
 
 
 def _compact_history_database(database, now):
-    """Retain actual first/last/extreme samples, never average away short peaks.
-
-    Recent 24h stays at one minute; older data uses 5-minute buckets and data
-    older than 7 days uses hourly buckets. Explicit gap flags survive repeated
-    compaction, so sparse retention never creates or conceals collection gaps.
-    """
+    """Compact older samples into 5-minute/hourly buckets, keeping extrema and gaps."""
     changed = False
     history = database.get("history", {})
     if not isinstance(history, dict):
@@ -1319,7 +1555,7 @@ def _compact_history_database(database, now):
         if not isinstance(series, dict):
             continue
         for metric, points in list(series.items()):
-            if not isinstance(points, list) or metric not in ALERT_METRICS[:5]:
+            if not isinstance(points, list) or (metric not in ALERT_METRICS[:5] and metric != "disk_worst" and not metric.startswith("disk@")):
                 continue
             groups, current, key, previous = [], [], None, None
             for point in points:
@@ -1360,11 +1596,33 @@ def _compact_history_database(database, now):
             if retained != points:
                 series[metric] = retained
                 changed = True
+    # Context rows are bounded snapshots, not numeric chart samples.
+    for series in history.values():
+        if not isinstance(series, dict):
+            continue
+        rows = series.get("observations", [])
+        buckets = {}
+        for row in rows:
+            if not isinstance(row, list) or len(row) != 2:
+                continue
+            stamp = _number(row[0])
+            resolution = 3600 if stamp < now - 7 * 86400 else 300 if stamp < now - 86400 else 60
+            key = (resolution, stamp // resolution)
+            if key not in buckets:
+                buckets[key] = [row]
+            elif resolution > 60:
+                buckets[key] = [buckets[key][0], row]
+            else:
+                buckets[key].append(row)
+        retained = [row for bucket in buckets.values() for row in bucket]
+        if retained != rows:
+            series["observations"] = retained
+            changed = True
     return changed
 
 
 def default_alert_rules():
-    """Quiet starter rules; all timings are evaluated by the minute sampler."""
+    """Default rules evaluated by the minute sampler."""
     rules = []
     for metric, duration in (("cpu", 180), ("memory", 180), ("disk", 300), ("offline", 120)):
         rules.append({"id": "default-" + metric, "name": "", "node": "*", "metric": metric,
@@ -1395,7 +1653,7 @@ def _sample_age(node, now):
         return None
 
 
-def _metric_value(node, metric, now):
+def _metric_value(node, metric, now, partition="*"):
     """Missing/failed measurements are unknown, never a zero or a recovery."""
     if metric == "offline":
         return 0.0 if node.get("online") else 1.0
@@ -1418,6 +1676,17 @@ def _metric_value(node, metric, now):
     if metric == "network":
         rx, tx = _finite_value(item.get("rx_rate")), _finite_value(item.get("tx_rate"))
         return _finite_value(rx + tx) if rx is not None and tx is not None else None
+    if metric == "disk":
+        partitions = item.get("partitions", [])
+        selected = [part for part in partitions if partition == "*" or
+                    (part.get("id") or _partition_id(part)) == partition]
+        values = [_finite_value(part.get("percent")) for part in selected]
+        values = [value for value in values if value is not None]
+        if values:
+            return max(values)
+        if partition != "*" or partitions:
+            return None
+        # Older agents without partition detail expose only aggregate usage.
     return _finite_value(item.get("percent"))
 
 
@@ -1425,7 +1694,7 @@ def _historical_value(metric, point):
     values = _point_values(metric, point)
     if metric == "network":
         return values.get("total")
-    return values.get(3 if metric in ("memory", "disk") else 1)
+    return values.get(3 if metric in ("memory", "disk", "disk_worst") or metric.startswith("disk@") else 1)
 
 
 def _baseline_for(node_id, metric, now, minimum_delta):
@@ -1434,6 +1703,10 @@ def _baseline_for(node_id, metric, now, minimum_delta):
     values = []
     for point in history:
         if not isinstance(point, list) or not point or not now - 86400 <= _number(point[0]) <= now - 600:
+            continue
+        # Extreme-point retention is intentionally biased toward peaks. Use only
+        # raw minute rows for statistical baselines, never compacted extrema.
+        if _point_metadata(point).get("resolution", 60) > 60:
             continue
         value = _historical_value(metric, point)
         if value is not None and math.isfinite(value):
@@ -1482,20 +1755,28 @@ def _validate_alert_rules(value, valid_nodes):
         name, enabled = raw.get("name", ""), raw.get("enabled", True)
         if not isinstance(name, str) or len(name) > 80 or not isinstance(enabled, bool):
             raise ValueError("Invalid rule name or enabled flag")
+        partition = raw.get("partition", "*")
+        if not isinstance(partition, str) or (partition != "*" and not re.fullmatch(r"[a-f0-9]{24}", partition)):
+            raise ValueError("Invalid partition identity")
+        if metric != "disk" and partition != "*":
+            raise ValueError("Partition selection requires a disk rule")
+        if partition != "*" and node_id == "*":
+            raise ValueError("A partition rule requires a specific asset")
         identifiers.add(rule_id)
         rules.append({"id": rule_id, "name": name.strip(), "node": node_id, "metric": metric,
                       "mode": mode, "threshold": threshold, "recovery": recovery,
-                      "duration": int(duration), "cooldown": int(cooldown), "enabled": enabled})
+                      "duration": int(duration), "cooldown": int(cooldown), "enabled": enabled, "partition": partition})
     return rules
 
 
 def _incident_context(node):
-    """Bounded observations near the trigger; correlations are not diagnoses."""
+    """Capture bounded process and login context for an incident."""
     metrics = node.get("metrics") or {}
     processes = sorted([item for item in metrics.get("processes", []) if isinstance(item, dict)],
                        key=lambda item: _finite_value(item.get("cpu")) or 0, reverse=True)[:3]
     return {"processes": [{"pid": _number(item.get("pid")), "name": _safe_text(item.get("name"), 80),
-                           "cpu": _finite_value(item.get("cpu")), "memory": _number(item.get("memory"))}
+                           "cpu": _finite_value(item.get("cpu")), "memory": _number(item.get("memory")),
+                           "started": item.get("started")}
                           for item in processes],
             "logins": [{"kind": _safe_text(item.get("kind"), 40),
                         "message": _safe_text(item.get("message"), 180)}
@@ -1504,19 +1785,31 @@ def _incident_context(node):
                     "source": _safe_text((metrics.get("dns") or {}).get("source"), 80)},
             "collector_errors": {str(key)[:30]: _safe_text(value, 180)
                                  for key, value in metrics.get("collector_errors", {}).items()},
-            "connection_error": _safe_text(node.get("error"), 180)}
+            "connection_error": _safe_text(node.get("error"), 180),
+            "sampled_at": metrics.get("sampled_at"),
+            "capabilities": {name: bool(metrics.get(name)) and name not in metrics.get("collector_errors", {})
+                             and metrics[name].get("supported", True) and metrics[name].get("available", True)
+                             for name in ("cpu", "memory", "disk", "network") if isinstance(metrics.get(name), dict)},
+            "collector_status": {name: copy.deepcopy(entry) for name, entry in
+                                 metrics.get("collector_status", {}).items() if name in ("processes", "logins", "dns")}}
+
+
+def _alert_partition_mount(node, rule):
+    if rule["metric"] != "disk":
+        return ""
+    parts = (node.get("metrics") or {}).get("disk", {}).get("partitions", [])
+    selected = [part for part in parts if rule.get("partition", "*") == "*" or
+                (part.get("id") or _partition_id(part)) == rule["partition"]]
+    return _safe_text(max(selected, key=lambda part: _number(part.get("percent"))).get("mount"), 256) if selected else ""
 
 
 def _resolve_incident(incident, now, reason):
     incident.update(status="resolved", resolved_at=int(now), resolution_reason=reason)
+    _queue_notification(incident, "resolved", now)
 
 
 def _evaluate_alerts(nodes, now):
-    """Persistent state machine: pending -> active -> resolved, with hysteresis.
-
-    A collection gap resets pending duration. Unknown metrics leave an active
-    incident open; acknowledgement never suppresses collection or recovery.
-    """
+    """Advance pending/active incidents; missing measurements cannot resolve them."""
     states = STORE.data.setdefault("alert_states", {})
     incidents = STORE.data.setdefault("incidents", [])
     active = {item["id"]: item for item in incidents if item.get("status") == "active"}
@@ -1532,14 +1825,16 @@ def _evaluate_alerts(nodes, now):
             valid_keys.add(key)
             state = states.setdefault(key, {})
             incident = active.get(state.get("active_id"))
-            value = _metric_value(node, rule["metric"], now)
+            value = _metric_value(node, rule["metric"], now, rule.get("partition", "*"))
             baseline = None
             if incident:
-                # Freeze the triggering baseline: a sustained incident must not
-                # become its own normal and silently recover as the baseline drifts.
+                # Keep an active incident's baseline fixed until recovery.
                 baseline = incident.get("baseline")
             elif rule["mode"] == "baseline":
-                baseline = _baseline_for(node_id, rule["metric"], now, rule["threshold"])
+                history_metric = rule["metric"]
+                if history_metric == "disk":
+                    history_metric = "disk_worst" if rule.get("partition", "*") == "*" else "disk@" + rule["partition"]
+                baseline = _baseline_for(node_id, history_metric, now, rule["threshold"])
             threshold = baseline["threshold"] if baseline else rule["threshold"]
             recovery = baseline["recovery"] if baseline else rule["recovery"]
             last_observation = state.get("observed_at", now)
@@ -1576,8 +1871,10 @@ def _evaluate_alerts(nodes, now):
                         "acknowledged_at": None, "threshold": threshold, "recovery": recovery,
                         "duration": rule["duration"], "value": value, "last_value": value,
                         "peak": value, "last_observed_at": int(now), "baseline": baseline,
-                        "context": _incident_context(node)}
+                        "context": _incident_context(node), "partition": rule.get("partition", "*"),
+                        "partition_mount": _alert_partition_mount(node, rule)}
             incidents.append(incident)
+            _queue_notification(incident, "active", now)
             state["active_id"] = incident["id"]
             state.pop("pending_since", None)
     for key in list(states):
@@ -1612,6 +1909,17 @@ def _alert_counts():
 
 
 def _save_alert_rules(value):
+    with STORE.lock:
+        previous = STORE.data
+        STORE.data = copy.deepcopy(previous)
+        try:
+            return _apply_alert_rules(value)
+        except Exception:
+            STORE.data = previous
+            raise
+
+
+def _apply_alert_rules(value):
     with STORE.lock:
         valid_nodes = {"local"} | {asset["id"] for asset in STORE.data.get("assets", [])}
         rules = _validate_alert_rules(value, valid_nodes)
@@ -1699,10 +2007,12 @@ def _diagnostics_response(snapshot, now=None):
                         "age_seconds": age, "last_success_at": node.get("last_success_at") or metrics.get("sampled_at"),
                         "latency_ms": node.get("latency_ms"), "issues": issues,
                         "error": _safe_text(node.get("error"), 180),
-                        "platform": _safe_text((metrics.get("info") or {}).get("os"), 40)})
-    return {"nodes": reports, "sampled_at": snapshot.get("sampled_at"),
+                        "platform": _safe_text((metrics.get("info") or {}).get("os"), 40),
+                        "collectors": copy.deepcopy(metrics.get("collector_status", {}))})
+    return {"runtime": _runtime_health(now), "nodes": reports, "sampled_at": snapshot.get("sampled_at"),
             "history_interval": HISTORY_INTERVAL, "cache_seconds": CLUSTER_CACHE_SECONDS,
-            "asset_limit": MAX_ASSETS, "rule_limit": MAX_ALERT_RULES}
+            "asset_limit": MAX_ASSETS, "rule_limit": MAX_ALERT_RULES,
+            "storage": {"bytes": getattr(STORE, "encoded_bytes", 0), "last_write_ms": getattr(STORE, "last_save_ms", None)}}
 
 
 def _record_history(nodes, now=None):
@@ -1722,6 +2032,9 @@ def _record_history(nodes, now=None):
         for node_id, node in nodes.items():
             metrics = node.get("metrics") if node.get("online") else None
             if not isinstance(metrics, dict):
+                continue
+            age = _sample_age(node, now)
+            if age is not None and (age > 120 or age < -120):
                 continue
             series = history.setdefault(str(node_id), {})
             if not isinstance(series, dict):
@@ -1749,6 +2062,16 @@ def _record_history(nodes, now=None):
                 "network": [interfaces],
                 "load": [round(_finite_value(value) or 0, 3) for value in load[:3]],
             }
+            if disk.get("supported", True) and "disk" not in metrics.get("collector_errors", {}):
+                partitions = disk.get("partitions", [])[:120]
+                for part in partitions:
+                    part_id = part.get("id") or _partition_id(part)
+                    samples["disk@" + part_id] = [round(_number(part.get("used"))), round(_number(part.get("total"))),
+                                                   round(_number(part.get("percent")), 2)]
+                if partitions:
+                    worst = max(partitions, key=lambda part: _number(part.get("percent")))
+                    samples["disk_worst"] = [round(_number(worst.get("used"))), round(_number(worst.get("total"))),
+                                              round(_number(worst.get("percent")), 2)]
             collector_errors = metrics.get("collector_errors", {})
             if not isinstance(collector_errors, dict):
                 collector_errors = {}
@@ -1759,12 +2082,18 @@ def _record_history(nodes, now=None):
                                 "load": bool(load)}
             for metric, values in samples.items():
                 if (metric in collector_errors or not metric_available.get(metric, True)
-                        or _metric_value(node, metric, now) is None):
+                        or _metric_value(node, "disk" if metric.startswith("disk@") or metric == "disk_worst" else metric, now) is None):
                     continue
                 points = series.setdefault(metric, [])
                 if not isinstance(points, list):
                     points = series[metric] = []
-                points.append([int(now)] + values)
+                row = [int(now)] + values
+                if (metric in ("memory", "disk", "disk_worst") or metric.startswith("disk@")) and points and len(points[-1]) > 2 and points[-1][2] != values[1]:
+                    # A resize changes the denominator; start a new chart segment.
+                    row.append({"resolution": 60, "gap_before": True})
+                points.append(row)
+            series.setdefault("observations", []).append([int(now), _incident_context(node)])
+            _record_node_changes(node_id, node, now)
         _prune_history_database(STORE.data, cutoff)
         if now - STORE.last_compact_at >= HISTORY_COMPACT_INTERVAL:
             _compact_history_database(STORE.data, now)
@@ -1773,7 +2102,8 @@ def _record_history(nodes, now=None):
         HISTORY_LAST_WRITE = now
 
 
-def _history_response(node_id, metric, range_name, interface="", start=None, end=None):
+def _history_response(node_id, metric, range_name, interface="", start=None, end=None, partition=""):
+    history_metric = "disk@" + partition if metric == "disk" and partition else metric
     now = time.time()
     if range_name == "custom":
         if start is None or end is None or not math.isfinite(start) or not math.isfinite(end):
@@ -1792,7 +2122,7 @@ def _history_response(node_id, metric, range_name, interface="", start=None, end
         if not isinstance(all_history, dict):
             all_history = {}
         node_history = all_history.get(node_id, {})
-        points = node_history.get(metric, []) if isinstance(node_history, dict) else []
+        points = node_history.get(history_metric, []) if isinstance(node_history, dict) else []
         result, gaps = [], []
         previous_timestamp = None
         missing_interface = False
@@ -1829,7 +2159,7 @@ def _history_response(node_id, metric, range_name, interface="", start=None, end
         original_count = len(result)
         result, gaps = _limit_history_points(result, gaps, metric)
     return {"node": node_id, "metric": metric, "range": range_name, "interface": interface,
-            "start": start, "end": end, "points": result, "gaps": gaps,
+            "start": start, "end": end, "partition": partition, "points": result, "gaps": gaps,
             "source_count": original_count, "downsampled": original_count > len(result),
             "retention_policy": {"raw_hours": 24, "five_minute_days": 7, "older_bucket_seconds": 3600}}
 
@@ -1903,6 +2233,7 @@ def _history_sampler(stop_event):
     """Collect cluster metrics in the background while the service is running."""
     next_sample_at = time.monotonic()
     while not stop_event.is_set():
+        _worker_tick("history")
         try:
             snapshot = collect_cluster_snapshot(force_refresh=True)
             _record_history(snapshot["nodes"])
@@ -1915,6 +2246,583 @@ def _history_sampler(stop_event):
             delay = 0
         if stop_event.wait(delay):
             break
+
+
+def _append_timeline(node_id, timestamp, kind, message):
+    events = STORE.data.setdefault("timeline", [])
+    event = {"id": uuid.uuid4().hex, "node": node_id, "timestamp": int(timestamp),
+             "kind": kind, "message": _safe_text(message, 240)}
+    events.append(event)
+    events.sort(key=lambda item: item["timestamp"])
+    del events[:-MAX_TIMELINE_EVENTS]
+    return event
+
+
+def _record_node_changes(node_id, node, now):
+    """Compare with the last snapshot; login times record first observation."""
+    metrics = node.get("metrics") or {}
+    errors = metrics.get("collector_errors", {})
+    info = metrics.get("info") or {}
+    previous = STORE.data.setdefault("node_fingerprints", {}).get(node_id, {})
+    current = dict(previous)
+    fields = {"system_change": [info.get("system"), info.get("release"), info.get("version")],
+              "interfaces_change": sorted(str(item.get("name")) for item in metrics.get("network", {}).get("interfaces", [])),
+              "partitions_change": sorted([str(item.get("id") or _partition_id(item)), _safe_text(item.get("mount"), 256), _number(item.get("total"))]
+                                           for item in metrics.get("disk", {}).get("partitions", []))}
+    for kind, value in fields.items():
+        collector = {"system_change": "info", "interfaces_change": "network", "partitions_change": "disk"}[kind]
+        if collector in errors or (isinstance(metrics.get(collector), dict) and metrics[collector].get("supported") is False):
+            continue
+        if kind in previous and previous[kind] != value:
+            _append_timeline(node_id, now, kind, " → ".join((str(previous[kind]), str(value))))
+        current[kind] = value
+    uptime = _finite_value(info.get("uptime_seconds"))
+    if "info" not in errors and uptime is not None:
+        if previous.get("uptime") is not None and uptime < previous["uptime"] - 120:
+            _append_timeline(node_id, now, "reboot", "")
+        current["uptime"] = uptime
+    if "logins" not in errors:
+        logins = metrics.get("logins", [])[:60]
+        signatures = [hashlib.sha256(json.dumps(item, sort_keys=True).encode()).hexdigest() for item in logins]
+        if "logins" in previous:
+            for item, signature in zip(logins, signatures):
+                if signature not in previous["logins"]:
+                    _append_timeline(node_id, now, "login_observed", str(item.get("message") or item))
+        current["logins"] = list(dict.fromkeys(signatures + previous.get("logins", [])))[:256]
+    STORE.data["node_fingerprints"][node_id] = current
+
+
+def _add_annotation(value):
+    """Add or remove a bounded, local annotation; no commands are executed."""
+    with STORE.lock:
+        if value.get("action") == "remove":
+            event_id = value.get("id")
+            events = STORE.data.get("timeline", [])
+            event = next((item for item in events if item["id"] == event_id and item["kind"] == "annotation"), None)
+            if event is None:
+                raise ValueError("Annotation not found")
+            events.remove(event)
+            STORE.save()
+            return {"ok": True}
+        node_id = value.get("node")
+        valid_nodes = {"local"} | {item["id"] for item in STORE.data.get("assets", [])}
+        stamp = _finite_value(value.get("timestamp"))
+        now = time.time()
+        message = value.get("message")
+        if (not isinstance(node_id, str) or node_id not in valid_nodes or stamp is None or
+                not now - _history_retention_seconds() <= stamp <= now or
+                not isinstance(message, str) or not message.strip() or len(message) > 240):
+            raise ValueError("Invalid asset, time or annotation (maximum 240 characters)")
+        event = _append_timeline(node_id, stamp, "annotation", message.strip())
+        STORE.save()
+        return event
+
+
+def _investigation_response(node_id, start, end, partition=""):
+    """Read a retained investigation window without requesting new samples."""
+    now = time.time()
+    if (not isinstance(node_id, str) or len(node_id) > 100 or not math.isfinite(start) or not math.isfinite(end)
+            or start >= end or end > now + 60 or start < now - _history_retention_seconds()
+            or end - start > _history_retention_seconds()):
+        raise ValueError("Invalid investigation time range")
+    with STORE.lock:
+        charts = {metric: _history_response(node_id, metric, "custom", start=start, end=end,
+                                            partition=partition if metric == "disk" else "")
+                  for metric in ("cpu", "memory", "disk", "network", "load")}
+        events = [copy.deepcopy(item) for item in STORE.data.get("timeline", [])
+                  if item["node"] == node_id and start <= item["timestamp"] <= end]
+        incidents = [copy.deepcopy(item) for item in STORE.data.get("incidents", [])
+                     if item["node"] == node_id and item["started_at"] <= end and
+                     (item.get("resolved_at") is None or item["resolved_at"] >= start)]
+        observations = STORE.data.get("history", {}).get(node_id, {}).get("observations", [])
+        observations = [copy.deepcopy(row) for row in observations if start <= row[0] <= end]
+        if len(observations) > 240:
+            step = math.ceil(len(observations) / 239)
+            last = observations[-1]
+            observations = observations[::step]
+            if observations[-1] != last:
+                observations.append(last)
+        name = next((asset["name"] for asset in STORE.data.get("assets", []) if asset["id"] == node_id), node_id)
+    return {"node": node_id, "name": name, "start": start, "end": min(end, now), "charts": charts,
+            "events": events, "incidents": incidents, "observations": observations,
+            "generated_at": int(now), "sample_interval": HISTORY_INTERVAL}
+
+
+def _outbound_url(value):
+    if not isinstance(value, str) or len(value) > 1024:
+        raise ValueError("Invalid HTTP URL")
+    parsed = urllib.parse.urlsplit(value.strip())
+    if (parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username is not None
+            or parsed.password is not None or parsed.fragment or any(ord(char) < 33 for char in value)):
+        raise ValueError("Use an HTTP/HTTPS URL without embedded credentials or fragment")
+    try:
+        parsed.port
+    except ValueError:
+        raise ValueError("Invalid port") from None
+    return parsed.geturl()
+
+
+def _maintenance_for(node_id, now):
+    return next((window for window in STORE.data.get("maintenance", [])
+                 if window["node"] in ("*", node_id) and window["start"] <= now < window["end"]), None)
+
+
+def _queue_notification(incident, kind, now):
+    """Store minimal transitions, never host context or monitoring credentials."""
+    if _maintenance_for(incident["node"], now):
+        if kind == "resolved":
+            for job in STORE.data.get("notification_queue", []):
+                if job["id"] == incident["id"] + ":active" and job["status"] == "pending":
+                    job["status"] = "cancelled"
+        if kind == "active":
+            incident["notification_suppressed"] = True
+        return
+    config = STORE.data.get("notifications", {})
+    if not config.get("enabled") or not config.get("url"):
+        return
+    key = incident["id"] + ":" + kind
+    jobs = STORE.data.setdefault("notification_queue", [])
+    if any(job["id"] == key for job in jobs):
+        incident.pop("notification_suppressed", None)
+        return
+    if len(jobs) >= MAX_NOTIFICATION_JOBS:
+        removable = next((job for job in jobs if job["status"] != "pending"), None)
+        if removable is None:
+            incident["notification_dropped"] = True
+            return
+        jobs.remove(removable)
+    jobs.append({"id": key, "status": "pending", "attempts": 0, "next_at": int(now),
+                 "created_at": int(now), "payload": {"event_id": key, "event": kind, "incident_id": incident["id"],
+                 "node": incident["node"], "node_name": incident["node_name"], "metric": incident["metric"],
+                 "name": incident["rule_name"], "value": incident["last_value"], "threshold": incident["threshold"],
+                 "triggered_at": incident["triggered_at"], "resolved_at": incident.get("resolved_at"),
+                 "reason": incident.get("resolution_reason")}})
+    incident.pop("notification_suppressed", None)
+
+
+def _service_response():
+    with STORE.lock:
+        now = time.time()
+        return copy.deepcopy({"revision": STORE.data.get("service_revision", 0), "heartbeats": STORE.data.get("heartbeats", []), "services": STORE.data.get("services", []), "states": STORE.data.get("service_states", {}),
+                "history": {key: [bucket for bucket in rows if bucket["last_at"] >= now-86400][-288:]
+                            for key, rows in STORE.data.get("service_history", {}).items()}, "maintenance": STORE.data.get("maintenance", []),
+                "notifications": STORE.data.get("notifications", {}),
+                "deliveries": [{key: job.get(key) for key in ("id", "status", "attempts", "created_at", "next_at", "error")}
+                               for job in STORE.data.get("notification_queue", [])[-30:][::-1]],
+                "active_maintenance": [window["id"] for window in STORE.data.get("maintenance", []) if window["start"] <= now < window["end"]]})
+
+
+class ConfigurationConflict(ValueError):
+    """A stale editor must reload rather than overwrite a newer configuration."""
+
+
+def _save_services(value):
+    with STORE.lock:
+        revision = STORE.data.get("service_revision", 0)
+        if type(value.get("revision")) is not int or value["revision"] != revision:
+            raise ConfigurationConflict("Configuration changed. Refresh and retry.")
+        previous = STORE.data
+        STORE.data = copy.deepcopy(previous)
+        try:
+            result = _apply_services(value)
+        except Exception:
+            STORE.data = previous
+            raise
+        return result
+
+
+def _apply_services(value):
+    with STORE.lock:
+        valid_nodes = {"local"} | {asset["id"] for asset in STORE.data.get("assets", [])}
+        if value.get("action") == "notifications":
+            enabled = value.get("enabled")
+            if not isinstance(enabled, bool):
+                raise ValueError("Invalid notification flag")
+            url = _outbound_url(value.get("url")) if value.get("url") else ""
+            if enabled and not url:
+                raise ValueError("Webhook URL is required")
+            STORE.data["notifications"] = {"enabled": enabled, "url": url}
+        elif value.get("action") == "maintenance":
+            windows = value.get("windows")
+            if not isinstance(windows, list) or len(windows) > 32:
+                raise ValueError("At most 32 maintenance windows")
+            clean, ids = [], set()
+            for window in windows:
+                if not isinstance(window, dict):
+                    raise ValueError("Invalid maintenance window")
+                identity, node = window.get("id"), window.get("node")
+                start, end = _finite_value(window.get("start")), _finite_value(window.get("end"))
+                label = window.get("name", "")
+                if (not isinstance(identity, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", identity)
+                        or identity in ids or not isinstance(node, str) or node not in valid_nodes | {"*"}
+                        or start is None or end is None or start >= end or end-start > 30*86400
+                        or not isinstance(label, str) or len(label) > 80):
+                    raise ValueError("Invalid maintenance identity, asset or date range")
+                ids.add(identity)
+                clean.append({"id": identity, "node": node, "start": int(start), "end": int(end), "name": label.strip()})
+            STORE.data["maintenance"] = clean
+        elif value.get("action") == "heartbeats":
+            rows = value.get("heartbeats")
+            if not isinstance(rows, list) or len(rows) > 24:
+                raise ValueError("At most 24 heartbeat jobs")
+            old = {job["id"]: job for job in STORE.data.get("heartbeats", [])}
+            service_ids = {item["id"] for item in STORE.data.get("services", [])}
+            clean, identities = [], set()
+            for row in rows:
+                if not isinstance(row, dict):
+                    raise ValueError("Invalid heartbeat")
+                identity, node, name = row.get("id"), row.get("node"), row.get("name")
+                interval, grace = row.get("interval"), row.get("grace")
+                if (not isinstance(identity, str) or not re.fullmatch(r"job-[A-Za-z0-9_-]{1,90}", identity)
+                        or identity in identities or identity in service_ids or not isinstance(node, str) or node not in valid_nodes
+                        or not isinstance(name, str) or not name.strip() or len(name) > 80
+                        or type(interval) is not int or not 60 <= interval <= 30*86400
+                        or type(grace) is not int or not 0 <= grace <= 7*86400):
+                    raise ValueError("Invalid heartbeat identity, interval or grace")
+                identities.add(identity)
+                prior = old.get(identity, {})
+                clean.append({"id": identity, "node": node, "name": name.strip(), "interval": interval,
+                              "grace": grace, "token": prior.get("token") or secrets.token_urlsafe(24),
+                              "created_at": prior.get("created_at", int(time.time())),
+                              "last_success_at": prior.get("last_success_at"), "last_duration_ms": prior.get("last_duration_ms")})
+            removed = set(old)-identities
+            moved = {job["id"] for job in clean if job["id"] in old and old[job["id"]]["node"] != job["node"]}
+            for identity in moved:
+                STORE.data.get("service_states", {}).pop(identity, None)
+            for incident in STORE.data.get("incidents", []):
+                if incident.get("status") == "active" and incident.get("service_id") in removed | moved:
+                    _resolve_incident(incident, time.time(), "rule_changed")
+            for identity in removed:
+                STORE.data.get("service_states", {}).pop(identity, None)
+                STORE.data.get("service_history", {}).pop(identity, None)
+            STORE.data["heartbeats"] = clean
+        elif value.get("action") == "services":
+            rows = value.get("services")
+            if not isinstance(rows, list) or len(rows) > MAX_SERVICES:
+                raise ValueError("At most 24 service monitors")
+            clean, ids = [], set()
+            for row in rows:
+                if not isinstance(row, dict):
+                    raise ValueError("Invalid service")
+                identity, node, protocol = row.get("id"), row.get("node"), row.get("protocol")
+                name, target, match = row.get("name"), row.get("target"), row.get("match", "")
+                interval, timeout = _finite_value(row.get("interval")), _finite_value(row.get("timeout"))
+                failures = _finite_value(row.get("failures"))
+                if (not isinstance(identity, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", identity) or identity in ids or identity.startswith("job-")
+                        or not isinstance(node, str) or node not in valid_nodes or protocol not in ("http", "tcp")
+                        or not isinstance(name, str) or not name.strip() or len(name) > 80
+                        or interval is None or interval != int(interval) or not 30 <= interval <= 3600
+                        or timeout is None or not 1 <= timeout <= 10 or failures is None or failures != int(failures) or not 1 <= failures <= 10
+                        or not isinstance(match, str) or len(match) > 128 or not isinstance(row.get("enabled", True), bool)):
+                    raise ValueError("Invalid service identity or limits")
+                status = row.get("status", 200)
+                if isinstance(status, bool) or not isinstance(status, int) or not 200 <= status <= 599:
+                    raise ValueError("Invalid expected HTTP status")
+                port = row.get("port", 443)
+                if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+                    raise ValueError("Invalid TCP port")
+                if protocol == "http":
+                    target = _outbound_url(target)
+                elif not isinstance(target, str) or len(target) > 253 or not re.fullmatch(r"[A-Za-z0-9_.:\-]+", target):
+                    raise ValueError("Use a TCP hostname or IP without a URL or port")
+                ids.add(identity)
+                clean.append({"id": identity, "node": node, "name": name.strip(), "protocol": protocol,
+                              "target": target, "port": port, "match": match, "status": status,
+                              "interval": int(interval), "timeout": timeout, "failures": int(failures), "enabled": row.get("enabled", True)})
+            old = {item["id"]: item for item in STORE.data.get("services", [])}
+            current = {item["id"]: item for item in clean}
+            identity_fields = ("node", "protocol", "target", "port", "match", "status")
+            changed = {key for key in old if key not in current or any(old[key].get(field) != current[key].get(field) for field in identity_fields)}
+            for incident in STORE.data.get("incidents", []):
+                if incident.get("status") == "active" and incident.get("service_id") in changed:
+                    _resolve_incident(incident, time.time(), "rule_changed")
+            for key in changed:
+                STORE.data.get("service_states", {}).pop(key, None)
+                STORE.data.get("service_history", {}).pop(key, None)
+            for identity, service in current.items():
+                if identity not in old or identity in changed:
+                    continue
+                state = STORE.data.get("service_states", {}).get(identity)
+                if state and any(old[identity].get(field) != service.get(field) for field in ("enabled", "failures", "interval", "timeout")):
+                    state["failed_count"] = 0
+                    state.pop("failed_since", None)
+                for incident in STORE.data.get("incidents", []):
+                    if incident.get("service_id") == identity and incident.get("status") == "active":
+                        incident["rule_name"] = service["name"]
+                        if not service["enabled"]:
+                            _resolve_incident(incident, time.time(), "monitor_disabled")
+                            if state:
+                                state.pop("active_id", None)
+            STORE.data["services"] = clean
+        else:
+            raise ValueError("Invalid service configuration action")
+        STORE.data["service_revision"] = STORE.data.get("service_revision", 0) + 1
+        STORE.save()
+    return _service_response()
+
+
+def _probe_service(service):
+    """Check the configured target; socket timeouts may not bound DNS resolution."""
+    started = time.monotonic()
+    code, error, ok = None, "", False
+    try:
+        if service["protocol"] == "tcp":
+            with socket.create_connection((service["target"], service["port"]), timeout=service["timeout"]):
+                ok = True
+        else:
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _RejectRedirectHandler())
+            request = urllib.request.Request(service["target"], headers={"User-Agent": APP_NAME + "/" + APP_VERSION})
+            try:
+                response = opener.open(request, timeout=service["timeout"])
+            except urllib.error.HTTPError as exc:
+                response = exc
+            with response:
+                code = response.code
+                body = response.read(65536) if service["match"] else b""
+            ok = code == service["status"] and (not service["match"] or service["match"] in body.decode("utf-8", "replace"))
+            if not ok:
+                error = "unexpected_status" if code != service["status"] else "content_mismatch"
+    except Exception:
+        error = "connection_failed"
+    return {"sampled_at": int(time.time()), "ok": ok, "latency_ms": round((time.monotonic()-started)*1000, 1),
+            "status_code": code, "error": error}
+
+
+def _record_probe(service, result):
+    now, identity = result["sampled_at"], service["id"]
+    states = STORE.data.setdefault("service_states", {})
+    state = states.setdefault(identity, {})
+    # An unobserved gap resets consecutive failures instead of extending evidence.
+    if now-state.get("sampled_at", now) > service["interval"]*2+service["timeout"]:
+        state["failed_count"] = 0
+        state.pop("failed_since", None)
+    if result["ok"]:
+        state.pop("failed_since", None)
+    else:
+        state.setdefault("failed_since", now)
+    state["failed_count"] = 0 if result["ok"] else min(1000000, state.get("failed_count", 0)+1)
+    state.update(result)
+    incident = next((item for item in STORE.data.get("incidents", []) if item.get("id") == state.get("active_id") and item.get("status") == "active"), None)
+    if incident:
+        incident["last_value"] = 0 if result["ok"] else 1
+        incident["last_observed_at"] = now
+        if result["ok"]:
+            _resolve_incident(incident, now, "recovered")
+            state.pop("active_id", None)
+    elif state["failed_count"] >= service["failures"]:
+        incident = {"id": uuid.uuid4().hex, "service_id": identity, "rule_id": "service-"+identity,
+                    "rule_name": service["name"], "node": service["node"],
+                    "node_name": next((item["name"] for item in STORE.data.get("assets", []) if item["id"] == service["node"]), socket.gethostname() if service["node"] == "local" else service["node"]),
+                    "metric": "service", "mode": "threshold", "status": "active", "started_at": state.get("failed_since", now),
+                    "triggered_at": now, "resolved_at": None, "acknowledged_at": None,
+                    "threshold": 0, "recovery": 0, "duration": now-state.get("failed_since", now), "value": 1, "last_value": 1, "peak": 1,
+                    "last_observed_at": now, "baseline": None, "context": {"probe_error": result["error"]}}
+        STORE.data.setdefault("incidents", []).append(incident)
+        state["active_id"] = incident["id"]
+        _queue_notification(incident, "active", now)
+    buckets = STORE.data.setdefault("service_history", {}).setdefault(identity, [])
+    bucket_time = now//300*300
+    if not buckets or buckets[-1]["bucket"] != bucket_time:
+        buckets.append({"bucket": bucket_time, "first_at": now, "last_at": now, "samples": 0, "successes": 0,
+                        "sum_ms": 0, "min_ms": result["latency_ms"], "max_ms": result["latency_ms"]})
+    bucket = buckets[-1]
+    bucket.update(last_at=now, samples=bucket["samples"]+1, successes=bucket["successes"]+int(result["ok"]),
+                  sum_ms=bucket["sum_ms"]+result["latency_ms"], min_ms=min(bucket["min_ms"], result["latency_ms"]),
+                  max_ms=max(bucket["max_ms"], result["latency_ms"]))
+    del buckets[:-2048]
+
+
+def _heartbeat_service(job):
+    return dict(job, failures=1, timeout=0)
+
+
+def _check_heartbeats():
+    """A missed deadline opens once; only a successful report recovers it."""
+    now = int(time.time())
+    with STORE.lock:
+        changed = False
+        previous = None
+        for job in STORE.data.get("heartbeats", []):
+            deadline = (job.get("last_success_at") or job["created_at"])+job["interval"]+job["grace"]
+            state = STORE.data.get("service_states", {}).get(job["id"], {})
+            if now > deadline and not state.get("active_id"):
+                if previous is None:
+                    previous = copy.deepcopy(STORE.data)
+                _record_probe(_heartbeat_service(job), {"sampled_at": now, "ok": False,
+                              "latency_ms": 0, "status_code": None, "error": "heartbeat_overdue"})
+                changed = True
+        if changed:
+            try:
+                STORE.save()
+            except Exception:
+                STORE.data = previous
+                raise
+
+
+def _receive_heartbeat(value, token):
+    if not isinstance(token, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", token):
+        return False
+    with STORE.lock:
+        job = next((item for item in STORE.data.get("heartbeats", [])
+                    if isinstance(token, str) and hmac.compare_digest(item["token"], token)), None)
+        if job is None:
+            return False
+        duration = value.get("duration_ms", 0)
+        if isinstance(duration, bool) or not isinstance(duration, (int, float)) or not math.isfinite(duration) or not 0 <= duration <= 30*86400*1000:
+            raise ValueError("Invalid task duration")
+        previous = copy.deepcopy(STORE.data)
+        try:
+            now = int(time.time())
+            job["last_success_at"] = now
+            job["last_duration_ms"] = duration
+            _record_probe(_heartbeat_service(job), {"sampled_at": now, "ok": True, "latency_ms": duration,
+                          "status_code": None, "error": ""})
+            STORE.save()
+        except Exception:
+            STORE.data = previous
+            raise
+        return True
+
+
+def _service_sampler(stop_event):
+    """At most four outstanding probes; missed ticks are skipped, never queued."""
+    due, running, configurations, started = {}, {}, {}, {}
+    dirty, last_save = False, time.monotonic()
+    pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="tinywatch-probe")
+    try:
+        while not stop_event.is_set():
+            _worker_tick("services", probe_slots_used=len(running), probe_slots_limit=4,
+                         probes_overdue=sum(time.monotonic()-started[future] > service["timeout"]+30
+                                            for future, service in running.items()),
+                         oldest_probe_seconds=int(max((time.monotonic()-stamp for stamp in started.values()), default=0)))
+            try:
+                _check_heartbeats()
+            except OSError:
+                sys.stderr.write("TinyWatch heartbeat worker: database write failed\n")
+            with STORE.lock:
+                services = copy.deepcopy(STORE.data.get("services", []))
+            current = {service["id"]: service for service in services}
+            completed = [(future, service) for future, service in running.items() if future.done()]
+            if completed:
+                with STORE.lock:
+                    current = {item["id"]: item for item in STORE.data.get("services", [])}
+                    changed, urgent = False, False
+                    for future, service in completed:
+                        del running[future]
+                        started.pop(future, None)
+                        if current.get(service["id"]) == service:
+                            before = STORE.data.get("service_states", {}).get(service["id"], {}).get("active_id")
+                            _record_probe(service, future.result())
+                            after = STORE.data.get("service_states", {}).get(service["id"], {}).get("active_id")
+                            urgent = urgent or before != after
+                            changed = True
+                    if changed:
+                        if time.time()-STORE.last_prune_at >= 60:
+                            _prune_history_database(STORE.data, time.time()-_history_retention_seconds())
+                            STORE.last_prune_at = time.time()
+                        dirty = True
+                        if urgent:
+                            try:
+                                STORE.save()
+                                dirty = False
+                            except OSError:
+                                sys.stderr.write("TinyWatch service worker: database write failed\n")
+                            last_save = time.monotonic()
+            if dirty and time.monotonic()-last_save >= 10:
+                with STORE.lock:
+                    try:
+                        STORE.save()
+                        dirty = False
+                    except OSError:
+                        sys.stderr.write("TinyWatch service worker: database write failed\n")
+                last_save = time.monotonic()
+            busy = {service["id"] for service in running.values()}
+            for identity in list(due):
+                if identity not in current:
+                    del due[identity]
+                    configurations.pop(identity, None)
+            now = time.monotonic()
+            for service in services:
+                if configurations.get(service["id"]) != service:
+                    configurations[service["id"]] = service
+                    due[service["id"]] = now+secrets.randbelow(5)
+            # Oldest due monitor first, so slow targets cannot starve later rows.
+            for service in sorted(services, key=lambda item: due[item["id"]]):
+                identity = service["id"]
+                if not service["enabled"] or identity in busy or len(running) >= 4:
+                    continue
+                due.setdefault(identity, now+secrets.randbelow(5))
+                if now >= due[identity]:
+                    with STORE.lock:
+                        latest = next((item for item in STORE.data.get("services", []) if item["id"] == identity), None)
+                        if latest != service:
+                            continue
+                    future = pool.submit(_probe_service, service)
+                    running[future] = service
+                    started[future] = time.monotonic()
+                    due[identity] = now+service["interval"]
+            stop_event.wait(1)
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+        if dirty:
+            with STORE.lock:
+                try:
+                    STORE.save()
+                except OSError:
+                    sys.stderr.write("TinyWatch service worker: final database write failed\n")
+
+
+def _notification_sampler(stop_event):
+    """Deliver outside store/collector locks with finite retries and expiry."""
+    while not stop_event.wait(2):
+        _worker_tick("notifications")
+        try:
+            with STORE.lock:
+                now = time.time()
+                config = copy.deepcopy(STORE.data.get("notifications", {}))
+                if not config.get("enabled") or not config.get("url"):
+                    continue
+                resumed = False
+                for incident in STORE.data.get("incidents", []):
+                    if incident.get("status") == "active" and incident.get("notification_suppressed") and not _maintenance_for(incident["node"], now):
+                        _queue_notification(incident, "active", now)
+                        resumed = True
+                        if incident.get("notification_dropped"):
+                            incident.pop("notification_suppressed", None)
+                if resumed:
+                    STORE.save()
+                config = copy.deepcopy(STORE.data.get("notifications", {}))
+                if not config.get("enabled") or not config.get("url"):
+                    continue
+                jobs = STORE.data.get("notification_queue", [])
+                job = next((item for item in jobs if item["status"] == "pending" and item["next_at"] <= now
+                            and not _maintenance_for(item["payload"]["node"], now)), None)
+                if job is None:
+                    continue
+                if now-job["created_at"] > 86400:
+                    job.update(status="expired", error="delivery_expired")
+                    STORE.save()
+                    continue
+                snapshot = copy.deepcopy(job)
+            ok = False
+            try:
+                request = urllib.request.Request(config["url"], data=json.dumps(snapshot["payload"]).encode(),
+                                                 headers={"Content-Type": "application/json"}, method="POST")
+                opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _RejectRedirectHandler())
+                with opener.open(request, timeout=5) as response:
+                    ok = 200 <= response.status < 300
+            except Exception:
+                pass
+            with STORE.lock:
+                job = next((item for item in STORE.data.get("notification_queue", []) if item["id"] == snapshot["id"]), None)
+                if job is not None:
+                    job["attempts"] += 1
+                    job["status"] = "delivered" if ok else "failed" if job["attempts"] >= 5 else "pending"
+                    job["error"] = "" if ok else "delivery_failed"
+                    job["next_at"] = int(time.time()+min(900, 30*2**job["attempts"]))
+                    STORE.save()
+        except Exception:
+            sys.stderr.write("TinyWatch notification worker: persistence or delivery failure\n")
 
 
 HTML_PAGE = r'''<!doctype html>
@@ -1952,6 +2860,8 @@ HTML_PAGE = r'''<!doctype html>
 .incident details{border-top:1px solid var(--line);padding-top:10px}.incident summary{cursor:pointer;font-size:12px;color:var(--accent2)}.context-log,.diagnostic-issues{font-size:11px;overflow-wrap:anywhere}.diagnostic-issues{padding-left:18px}.diagnostic-issues li{margin:8px 0}.diagnostic-issues p{margin:3px 0;color:var(--muted)}.table-scroll{overflow:auto}.baseline-evidence{font-size:12px;color:var(--accent2)}
 .rule-editor{padding:15px;border:1px solid var(--accent2);border-radius:12px;margin-bottom:16px}.checkbox-label{display:flex!important;align-items:center;gap:8px}.checkbox-label input{width:auto!important}.rule-actions,.incident-actions{margin-bottom:0}.panel-actions{flex-wrap:wrap}.modal .helper{overflow-wrap:anywhere}
 @media(max-width:680px){.feature-facts{gap:10px}.feature-toolbar{align-items:stretch}.feature-toolbar select{flex:1;min-width:0}.fleet-node{flex-wrap:wrap}.fleet-node small{font-size:9px}.incident,.rule-card,.diagnostic-card{padding:12px}.feature-card-head{gap:8px}.health-status{max-width:45%;text-align:center}.feature-tabs button{flex:1;font-size:11px}.rule-editor .form-grid{grid-template-columns:1fr}.feature-card-head .metric-sub{overflow-wrap:anywhere}}
+.replay-charts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.replay-chart{border:1px solid var(--line);border-radius:12px;padding:12px;min-width:0}.replay-chart h4{margin:0}.replay-chart .mini-chart{height:180px}.replay-events{display:grid;gap:8px;margin:14px 0;max-height:260px;overflow:auto}.replay-event{padding:10px;background:var(--surface2);border-left:3px solid var(--accent2);border-radius:8px;overflow-wrap:anywhere}.replay-event.annotation{border-left-color:var(--accent)}.replay-readout{font-variant-numeric:tabular-nums}.replay-toolbar{display:flex;flex-wrap:wrap;gap:7px;margin:12px 0}.replay-context{overflow-wrap:anywhere}.replay-marker{stroke:var(--warn);stroke-width:1;stroke-dasharray:2 3;pointer-events:none}.replay-event button{float:right}.replay-window-controls{display:flex;gap:6px;flex-wrap:wrap}@media(max-width:680px){.replay-charts{grid-template-columns:1fr}.replay-toolbar .button{flex:1}.modal.wide-modal{max-height:90vh}.replay-chart .mini-chart{height:165px}}
+.service-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.service-grid .helper{overflow-wrap:anywhere}.service-grid .mini-chart{height:148px}@media(max-width:680px){.service-grid{grid-template-columns:1fr}.panel-actions{flex-wrap:wrap}}
 </style></head><body><div id="app"></div><div id="toast" class="toast"></div><div id="chart-tooltip" class="chart-tooltip" role="tooltip"></div>
 <script>
 const app=document.getElementById('app');
@@ -2216,16 +3126,19 @@ function bindLanguageSelector() {
   };
 }
 
-const state={authenticated:false,setup:false,config:null,data:null,history:{},historical:{},historyPending:{},historyRanges:{},historyCustom:{},chartData:{},chartSequence:0,timer:null,freshnessTimer:null,lastRefreshAt:0,refreshFailed:false,dragged:null,modal:null,modalKind:'',alertData:null,alertTab:'incidents',alertStatus:'all',alertNode:'*',alertRequest:0,alertFetchedAt:0,alertLoading:false,view:'overview',language:LANGUAGE_NAMES[readPreference('tinywatch.language','en')]?readPreference('tinywatch.language','en'):'en'};
+const state={authenticated:false,setup:false,config:null,data:null,history:{},historical:{},historyPending:{},historyRequests:{},serviceTab:"monitors",serviceData:null,serviceRequest:0,serviceLoading:false,serviceFetchedAt:0,serviceEditing:false,replay:null,replayRequest:0,replayController:null,refreshing:false,pollGeneration:0,historyRanges:{},historyCustom:{},chartData:{},chartSequence:0,timer:null,freshnessTimer:null,lastRefreshAt:0,refreshFailed:false,dragged:null,modal:null,modalKind:'',alertData:null,alertTab:'incidents',alertStatus:'all',alertNode:'*',alertRequest:0,alertFetchedAt:0,alertLoading:false,view:'overview',language:LANGUAGE_NAMES[readPreference('tinywatch.language','en')]?readPreference('tinywatch.language','en'):'en'};
 document.documentElement.lang=state.language;
 const metrics={cpu:['处理器','◉'],memory:['内存','▤'],network:['网络流量','↕'],disk:['磁盘','▣'],load:['系统负载','⌁'],processes:['进程','▥'],logins:['登录事件','⌑'],dns:['DNS 缓存','⌘'],info:['主机信息','◈']};
 const fmtBytes=n=>{n=Number(n)||0;const u=['B','KB','MB','GB','TB'];let i=0;while(n>=1024&&i<u.length-1){n/=1024;i++}return new Intl.NumberFormat(LANGUAGE_LOCALE[state.language]||'en-US',{minimumFractionDigits:i?1:0,maximumFractionDigits:i?1:0}).format(i===0?Math.round(n):n)+' '+u[i]};
 const pct=n=>Math.max(0,Math.min(100,Number(n)||0));
 const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-async function api(path,method='GET',body){const r=await fetch(path,{method,headers:body?{'Content-Type':'application/json'}:{},body:body?JSON.stringify(body):undefined,credentials:'same-origin'});let j={};try{j=await r.json()}catch(e){}if(!r.ok){const error=new Error(j.error||('HTTP '+r.status));error.status=r.status;throw error}return j}
+async function api(path,method='GET',body,signal){const r=await fetch(path,{signal,method,headers:body?{'Content-Type':'application/json'}:{},body:body?JSON.stringify(body):undefined,credentials:'same-origin'});let j={};try{j=await r.json()}catch(e){}if(!r.ok){const error=new Error(j.error||('HTTP '+r.status));error.status=r.status;throw error}return j}
 function toast(text){const el=document.getElementById('toast');el.textContent=tr(text);el.classList.add('show');setTimeout(()=>el.classList.remove('show'),2200)}
 function setTheme(theme){document.documentElement.dataset.theme=theme||'dark'}
 function authScreen(isSetup){
+  state.serviceRequest++;state.serviceEditing=false;
+  state.pollGeneration++;clearTimeout(state.timer);clearInterval(state.freshnessTimer);
+  state.replayRequest++;state.replayController?.abort();for(const request of Object.values(state.historyRequests))request.controller.abort();
   state.setup=isSetup;
   app.innerHTML='<div class="auth-wrap"><section class="auth-card"><div class="auth-tools">'+languageSelector()+'</div><div class="brand" style="padding:0"><div class="brand-mark">◈</div><div><strong>TinyWatch</strong><small>INFRASTRUCTURE CONSOLE</small></div></div><h1>'+(isSetup?'建立管理员密码':'欢迎回来')+'</h1><p>'+(isSetup?'首次使用，请设置用于此控制台的密码。':'登录后查看主机与网络资产指标。')+'</p><form id="auth-form">'+(isSetup?'<div class="field"><label>首次设置代码</label><input id="setup-token" type="password" autocomplete="off" required placeholder="输入一次性设置代码"><div class="helper">请使用启动 TinyWatch 的终端中显示的一次性代码。</div></div>':'')+'<div class="field"><label>管理员密码</label><input id="password" type="password" autocomplete="'+(isSetup?'new-password':'current-password')+'" required minlength="'+(isSetup?'10':'1')+'" autofocus placeholder="'+(isSetup?'至少 10 个字符':'输入密码')+'"></div>'+(isSetup?'<div class="field"><label>确认密码</label><input id="password2" type="password" autocomplete="new-password" required minlength="10" placeholder="再次输入密码"></div>':'')+'<div id="auth-error" class="error-message"></div><button class="button primary" type="submit">'+(isSetup?'设置密码并继续':'登录控制台')+'</button></form><div class="login-note">密码使用 PBKDF2-SHA256 加盐存储在本机 JSON 数据库中。</div></section></div>';
   document.documentElement.lang=state.language;
@@ -2243,10 +3156,11 @@ async function enterApp(){
   catch(error){state.authenticated=false;authScreen(false)}
 }
 function startPolling(){
+  const generation=++state.pollGeneration;
   clearTimeout(state.timer);
   clearInterval(state.freshnessTimer);
   state.freshnessTimer=setInterval(updateFreshnessIndicator,1000);
-  const poll=async()=>{await refresh();if(state.authenticated)state.timer=setTimeout(poll,2500)};
+  const poll=async()=>{await refresh();if(state.authenticated&&generation===state.pollGeneration)state.timer=setTimeout(poll,document.hidden?30000:2500)};
   poll();
 }
 function updateFreshnessIndicator(){
@@ -2266,9 +3180,10 @@ function updateFreshnessIndicator(){
   }
 }
 async function refresh(){
-  if(!state.authenticated)return;
+  if(!state.authenticated||state.refreshing)return;
+  state.refreshing=true;
   try{
-    const data=await api('/api/metrics');state.data=data;state.lastRefreshAt=Date.now();state.refreshFailed=false;
+    const data=await api('/api/metrics');if(!state.authenticated)return;state.data=data;state.lastRefreshAt=Date.now();state.refreshFailed=false;
     for(const [id,node] of Object.entries(data.nodes||{})){
       if(!node.online||!node.metrics)continue;
       const metric=node.metrics;pushHistory(id+':cpu',metric.cpu.percent);
@@ -2282,18 +3197,22 @@ async function refresh(){
   }catch(error){
     if(error.status===401){state.authenticated=false;clearTimeout(state.timer);clearInterval(state.freshnessTimer);authScreen(false)}
     else{state.refreshFailed=true;updateFreshnessIndicator()}
-  }
+  }finally{state.refreshing=false}
 }
+document.addEventListener('visibilitychange',()=>{if(state.authenticated&&!document.hidden)startPolling()});
 function pushHistory(key,value){const values=state.history[key]||(state.history[key]=[]);values.push([Date.now()/1000,Number(value)||0]);if(values.length>36)values.shift()}
 function nodeFor(id){return state.data&&state.data.nodes&&state.data.nodes[id]}
 function render(){
   if(!state.config)return;
+  state.serviceRequest++;state.serviceEditing=false;
   state.modalKind='';state.modal=null;state.alertRequest++;state.alertLoading=false;
-  app.innerHTML='<div class="shell"><aside class="sidebar"><div class="brand"><div class="brand-mark">◈</div><div><strong>TinyWatch</strong><small>INFRASTRUCTURE</small></div></div><nav class="nav" aria-label="Main navigation"><button class="active" data-view="overview"><span class="nav-icon">⌂</span><span>总览</span></button><button data-menu="assets"><span class="nav-icon">⌘</span><span>资产</span></button><button data-menu="settings"><span class="nav-icon">⚙</span><span>设置</span></button></nav></aside><main class="main"><header class="topbar"><div><div class="eyebrow">LIVE INFRASTRUCTURE</div><h1 class="page-title" id="page-title">系统总览</h1></div><div class="top-actions">'+languageSelector()+'<span class="status-pill" id="live-status"><i class="dot"></i><span id="live-status-label">实时采集</span></span><button class="icon-button" id="theme-toggle" title="切换主题" aria-label="Switch theme">◐</button><button class="icon-button" id="logout-button" title="退出登录" aria-label="Sign out">↗</button></div></header><section class="host-panel"><div class="host-panel-head"><div><h2>主机信息</h2><p>本地节点 · HOST PROFILE</p></div></div><div id="host-summary"></div></section><section class="overview" id="overview"></section><section id="fleet-health" class="fleet-health" aria-label="Asset health"></section><div class="section-head"><div><h2 id="panel-title">自定义监控面板</h2><p id="panel-description">拖拽卡片调整布局 · 数据每 2.5 秒更新</p></div><div class="panel-actions" id="panel-actions"><button type="button" class="button subtle" id="alerts-open">Alerts · 0</button><button class="button subtle" id="assets-manage">管理资产</button><button class="button primary" id="add-widget">＋ 添加监控</button></div></div><section class="dashboard" id="dashboard" aria-live="polite"></section><div class="grid-footer" id="updated-at">正在连接监控节点…</div></main></div><div id="modal" class="modal-backdrop"></div>';
+  app.innerHTML='<div class="shell"><aside class="sidebar"><div class="brand"><div class="brand-mark">◈</div><div><strong>TinyWatch</strong><small>INFRASTRUCTURE</small></div></div><nav class="nav" aria-label="Main navigation"><button class="active" data-view="overview"><span class="nav-icon">⌂</span><span>总览</span></button><button data-menu="assets"><span class="nav-icon">⌘</span><span>资产</span></button><button data-menu="settings"><span class="nav-icon">⚙</span><span>设置</span></button></nav></aside><main class="main"><header class="topbar"><div><div class="eyebrow">LIVE INFRASTRUCTURE</div><h1 class="page-title" id="page-title">系统总览</h1></div><div class="top-actions">'+languageSelector()+'<span class="status-pill" id="live-status"><i class="dot"></i><span id="live-status-label">实时采集</span></span><button class="icon-button" id="theme-toggle" title="切换主题" aria-label="Switch theme">◐</button><button class="icon-button" id="logout-button" title="退出登录" aria-label="Sign out">↗</button></div></header><section class="host-panel"><div class="host-panel-head"><div><h2>主机信息</h2><p>本地节点 · HOST PROFILE</p></div></div><div id="host-summary"></div></section><section class="overview" id="overview"></section><section id="fleet-health" class="fleet-health" aria-label="Asset health"></section><div class="section-head"><div><h2 id="panel-title">自定义监控面板</h2><p id="panel-description">拖拽卡片调整布局 · 数据每 2.5 秒更新</p></div><div class="panel-actions" id="panel-actions"><button type="button" class="button subtle" id="services-open">'+esc(ft('services'))+'</button><button type="button" class="button subtle" id="replay-open">' + esc(ft('replay')) + ' </button><button type="button" class="button subtle" id="alerts-open">Alerts · 0</button><button class="button subtle" id="assets-manage">管理资产</button><button class="button primary" id="add-widget">＋ 添加监控</button></div></div><section class="dashboard" id="dashboard" aria-live="polite"></section><div class="grid-footer" id="updated-at">正在连接监控节点…</div></main></div><div id="modal" class="modal-backdrop"></div>';
   document.documentElement.lang=state.language;localizeDOM(app);bindLanguageSelector();
   document.getElementById('theme-toggle').onclick=toggleTheme;
   document.getElementById('logout-button').onclick=logout;
   document.getElementById('assets-manage').onclick=showAssets;
+  document.getElementById('services-open').onclick=()=>showServices();
+  document.getElementById('replay-open').onclick=()=>showReplay('local');
   document.getElementById('alerts-open').onclick=()=>showAlerts();
   document.getElementById('add-widget').onclick=showAddWidget;
   document.querySelectorAll('.nav button').forEach(button=>{
@@ -2317,12 +3236,13 @@ function draw(){
   const activeChart=document.activeElement&&document.activeElement.matches('.mini-chart')?document.activeElement:null;
   const activeWidget=activeChart&&activeChart.closest('.widget');
   const focusRestore=activeChart?{widget:activeWidget&&activeWidget.dataset.widget,index:activeChart.dataset.activeIndex||'0'}:null;
-  state.chartData={};state.chartSequence=0;
+  // Keep chart identities for unchanged cards and an open investigation.
   const local=nodeFor('local');if(!local||!local.metrics)return;
   const metricsLocal=local.metrics;const alive=Object.values(state.data.nodes).filter(node=>node.online).length;const total=Object.keys(state.data.nodes).length;
   const overview=document.getElementById('overview');const dashboard=document.getElementById('dashboard');
   const summary=document.getElementById('host-summary');
-  summary.innerHTML='<article class="host-info-card">'+infoCard(metricsLocal)+'</article>';localizeDOM(summary);
+  const profileHTML='<article class="host-info-card">'+infoCard(metricsLocal)+'</article>';
+  if(summary.dataset.profile!==profileHTML){summary.innerHTML=profileHTML;summary.dataset.profile=profileHTML;localizeDOM(summary)}
   overview.classList.remove('hidden');
   document.getElementById('panel-actions').classList.remove('hidden');
   document.getElementById('panel-title').textContent=tr('自定义监控面板');
@@ -2333,12 +3253,31 @@ function draw(){
   drawFleetHealth();
   const assets=[{id:'local',name:metricsLocal.info.hostname}].concat(state.config.assets||[]);
   const widgets=(state.config.widgets||[]).filter(widget=>widget.metric!=='info');
-  dashboard.innerHTML='';
-  for(const widget of widgets){
-    const node=nodeFor(widget.node);const asset=assets.find(item=>item.id===widget.node)||{id:widget.node,name:widget.node};
-    const card=document.createElement('article');card.className='widget '+(['processes','logins','dns'].includes(widget.metric)?'wide':'');
-    card.draggable=!widget.transient;card.dataset.widget=widget.id;card.innerHTML=widgetCard(widget,node,asset);dashboard.appendChild(card);localizeDOM(card);bindWidget(card,widget);
+  // Preserve card DOM so refreshes keep focus, selection and drag state.
+  if(!state.dragged){
+    const existing=new Map(Array.from(dashboard.children).map(card=>[card.dataset.widget,card]));
+    for(const widget of widgets){
+      const node=nodeFor(widget.node),asset=assets.find(item=>item.id===widget.node)||{id:widget.node,name:widget.node};
+      let card=existing.get(widget.id);
+      if(!card){card=document.createElement('article');card.className='widget '+(['processes','logins','dns'].includes(widget.metric)?'wide':'');card.draggable=!widget.transient;card.dataset.widget=widget.id}
+      const details=node?.metrics||{},iface=widget.metric==='network'?(state.history[widget.node+':iface']||''):widget.metric==='disk'?(state.history[widget.node+':partition']||''):'';
+      const selection=historySelectionKey(widget.node,widget.metric,iface),range=state.historyRanges[selection]||'1h';
+      const cached=state.historical[historyCacheKey(widget.node,widget.metric,range,iface,state.historyCustom[selection])];
+      const signature=JSON.stringify([widget,node?.online,node?.error,asset,state.language,details[widget.metric],details.collector_errors?.[widget.metric],
+        widget.metric==='load'?details.info?.os:null,widget.metric==='load'?details.cpu?.logical_cores:null,
+        details.collector_status?.[widget.metric],iface,range,state.historyCustom[selection],cached?.fetchedAt,
+        state.config.history_retention_days,['cpu','memory','disk','network','load'].includes(widget.metric)&&!cached?state.lastRefreshAt:null]);
+      // History expiry needs checking even when current measurements are static.
+      historySelector(widget,node);
+      if(card.dataset.signature!==signature){card.innerHTML=widgetCard(widget,node,asset);card.dataset.signature=signature;localizeDOM(card);bindWidget(card,widget)}
+      existing.delete(widget.id);
+      const position=widgets.indexOf(widget);
+      if(dashboard.children[position]!==card)dashboard.insertBefore(card,dashboard.children[position]||null);
+    }
+    for(const card of existing.values())card.remove();
   }
+  const chartIds=new Set(Array.from(document.querySelectorAll('[data-chart-id]')).map(chart=>chart.dataset.chartId));
+  for(const id of Object.keys(state.chartData))if(!chartIds.has(id))delete state.chartData[id];
   if(focusRestore&&focusRestore.widget){
     const card=Array.from(dashboard.children).find(item=>item.dataset.widget===focusRestore.widget);
     const chart=card&&card.querySelector('.mini-chart');
@@ -2377,9 +3316,13 @@ function widgetCard(widget,node,asset){
   }
   const tools=(widget.metric==='network'&&node&&node.metrics?interfaceSelector(node.metrics.network,widget.node):'')+
     (historySelector(widget,node))+
-    (widget.metric==='disk'&&node&&node.metrics?'<button class="select-mini" data-disk="'+esc(widget.node)+'">分区详情</button>':'')+
+    (widget.metric==='disk'&&node&&node.metrics?partitionSelector(node.metrics.disk,widget.node)+'<button class="select-mini" data-disk="'+esc(widget.node)+'">分区详情</button>':'')+
     (!widget.transient?'<button class="remove-widget" title="移除卡片" aria-label="Remove card">×</button>':'');
-  return '<header class="widget-head"><div class="widget-title"><i>'+title[1]+'</i><div>'+title[0]+'<div class="widget-node">'+esc(asset.name)+'</div></div></div><div class="widget-tools">'+tools+'</div></header>'+content;
+  return '<header class="widget-head"><div class="widget-title"><i>'+title[1]+'</i><div>'+title[0]+'<div class="widget-node">'+esc(asset.name)+'</div></div></div><div class="widget-tools">'+tools+'</div></header>'+content+collectorCaption(node?.metrics?.collector_status?.[widget.metric]);
+}
+function collectorCaption(status){
+  if(!status)return '';
+  return '<div class="helper">'+esc(ft('last_observed'))+': '+esc(featureDate(status.sampled_at))+' · '+esc(ft('cadence'))+': '+esc(status.interval_seconds)+' '+esc(ft('seconds'))+'</div>';
 }
 function cpuCard(metric,node){
   const cores=metric.cpu.cores||[];let bars='';
@@ -2398,13 +3341,24 @@ function interfaceSelector(network,node){
 }
 function networkCard(metric,widget){
   const interfaces=metric.network.interfaces||[];const selected=state.history[widget.node+':iface'];const item=interfaces.find(entry=>entry.name===selected);
+  if(selected&&!item)return '<div class="empty">'+esc(ft('unavailable'))+'</div>'+sparkline(historyChartData(widget.node,'network',selected),'network');
   const rx=item?item.rx_rate:metric.network.rx_rate;const tx=item?item.tx_rate:metric.network.tx_rate;
   const history=historyChartData(widget.node,'network',selected||'');
   return '<div class="duo"><div class="duo-box"><label>↓ 下载</label><strong>'+fmtBytes(rx)+'/s</strong></div><div class="duo-box"><label>↑ 上传</label><strong>'+fmtBytes(tx)+'/s</strong></div></div><div class="metric-sub" style="margin-top:9px">累计接收 '+fmtBytes(item?item.rx_total:interfaces.reduce((sum,entry)=>sum+entry.rx_total,0))+' · 发送 '+fmtBytes(item?item.tx_total:interfaces.reduce((sum,entry)=>sum+entry.tx_total,0))+'</div>'+sparkline(history,'network');
 }
 function diskCard(metric,widget){
-  const disk=metric.disk;const top=(disk.partitions||[]).slice(0,3);const history=historyChartData(widget.node,'disk','');
-  return '<div class="big-value">'+disk.percent+'<small>% used</small></div><div class="metric-sub">已用 '+fmtBytes(disk.used)+' / '+fmtBytes(disk.total)+'</div><div class="track" style="height:7px;margin:12px 0 5px"><span style="width:'+pct(disk.percent)+'%"></span></div>'+top.map(item=>'<div class="disk-line"><span>'+esc(item.mount)+'</span><b>'+fmtBytes(item.used)+' / '+fmtBytes(item.total)+'</b></div>').join('')+sparkline(history,'disk');
+  const parts=metric.disk.partitions||[],selected=state.history[widget.node+':partition']||'';
+  const disk=selected?parts.find(part=>part.id===selected):metric.disk;
+  if(!disk)return '<div class="empty">'+esc(ft('partition_missing'))+'</div>';
+  const top=parts.slice().sort((a,b)=>b.percent-a.percent).slice(0,3),history=historyChartData(widget.node,'disk',selected);
+  return '<div class="big-value">'+disk.percent+'<small>% used</small></div><div class="metric-sub">'+esc(selected?disk.mount:ft('aggregate'))+' · 已用 '+fmtBytes(disk.used)+' / '+fmtBytes(disk.total)+'</div><div class="track" style="height:7px;margin:12px 0 5px"><span style="width:'+pct(disk.percent)+'%"></span></div>'+top.map(item=>'<div class="disk-line"><span>'+esc(item.mount)+'</span><b class="'+(item.percent>=90?'asset-error':'')+'">'+item.percent+'% · '+fmtBytes(item.used)+' / '+fmtBytes(item.total)+'</b></div>').join('')+sparkline(history,'disk');
+}
+function partitionSelector(disk,node){
+  const selected=state.history[node+':partition']||'',parts=disk.partitions||[];
+  const missing=selected&&!parts.some(part=>part.id===selected);
+  return '<select class="select-mini partition-select" aria-label="'+esc(ft('partition'))+'"><option value="">'+esc(ft('aggregate'))+'</option>'+
+    (missing?'<option selected value="'+esc(selected)+'">'+esc(ft('partition_missing'))+'</option>':'')+
+    parts.filter(part=>part.id).map(part=>'<option value="'+esc(part.id)+'" '+(selected===part.id?'selected':'')+'>'+esc(part.mount)+'</option>').join('')+'</select>';
 }
 function loadCard(metric,node){
   const load=metric.load||[];const history=historyChartData(node,'load','');
@@ -2420,7 +3374,7 @@ function historyCacheKey(node,metric,range,iface,custom){
 }
 function historySelector(widget,node){
   if(!node||!node.online||!['cpu','memory','disk','network','load'].includes(widget.metric))return '';
-  const iface=widget.metric==='network'?(state.history[widget.node+':iface']||''):'';
+  const iface=widget.metric==='network'?(state.history[widget.node+':iface']||''):widget.metric==='disk'?(state.history[widget.node+':partition']||''):'';
   const selection=historySelectionKey(widget.node,widget.metric,iface);
   const range=state.historyRanges[selection]||'1h';
   const custom=state.historyCustom[selection];
@@ -2434,12 +3388,17 @@ function requestHistory(node,metric,range,iface,custom){
   if(range==='custom'&&!custom)return;
   const key=historyCacheKey(node,metric,range,iface,custom);const cached=state.historical[key];
   if(state.historyPending[key]||(cached&&Date.now()-cached.fetchedAt<60000))return;
+  const selection=historySelectionKey(node,metric,iface);
+  const previous=state.historyRequests[selection];
+  if(previous&&previous.key!==key)previous.controller.abort();
+  const controller=new AbortController();state.historyRequests[selection]={key,controller};
   state.historyPending[key]=true;
-  const query=new URLSearchParams({node,metric,range});if(iface)query.set('iface',iface);
+  const query=new URLSearchParams({node,metric,range});if(iface)query.set(metric==='disk'?'partition':'iface',iface);
   if(range==='custom'){query.set('start',String(custom.start));query.set('end',String(custom.end))}
-  api('/api/history?'+query.toString()).then(result=>{state.historical[key]={points:result.points||[],gaps:result.gaps||[],fetchedAt:Date.now()};draw()})
-    .catch(error=>{if(error.status===401){state.authenticated=false;authScreen(false)}else toast(error.message)})
-    .finally(()=>{delete state.historyPending[key]});
+  api('/api/history?'+query.toString(),'GET',undefined,controller.signal).then(result=>{if(controller.signal.aborted||!state.authenticated)return;state.historical[key]={points:result.points||[],gaps:result.gaps||[],fetchedAt:Date.now()};
+    const keys=Object.keys(state.historical);if(keys.length>256){keys.sort((a,b)=>state.historical[a].fetchedAt-state.historical[b].fetchedAt);for(const old of keys.slice(0,keys.length-256))delete state.historical[old]}draw()})
+    .catch(error=>{if(error.name==='AbortError')return;if(error.status===401){state.authenticated=false;authScreen(false)}else toast(error.message)})
+    .finally(()=>{delete state.historyPending[key];if(state.historyRequests[selection]?.controller===controller)delete state.historyRequests[selection]});
 }
 function historyChartData(node,metric,iface){
   const selection=historySelectionKey(node,metric,iface);const range=state.historyRanges[selection]||'1h';
@@ -2448,6 +3407,7 @@ function historyChartData(node,metric,iface){
     const index={cpu:1,memory:3,disk:3,load:1};
     return cached.points.map((point,position)=>({timestamp:Number(point[0]),value:metric==='network'?Number(point[1]||0)+Number(point[2]||0):Number(point[index[metric]]||0),rx:Number(point[1]||0),tx:Number(point[2]||0),gapBefore:position<(cached.gaps||[]).length?Boolean(cached.gaps[position]):undefined})).filter(point=>Number.isFinite(point.timestamp)&&Number.isFinite(point.value));
   }
+  if(metric==='disk'&&iface)return []; // Aggregate live data cannot stand in for a selected partition.
   const key=metric==='network'?node+':network:'+(iface||'total'):node+':'+metric;
   return (state.history[key]||[]).map(point=>({timestamp:Number(point[0]),value:Number(point[1])})).filter(point=>Number.isFinite(point.timestamp)&&Number.isFinite(point.value));
 }
@@ -2539,7 +3499,7 @@ function chartTimeLabel(timestamp,span,includeYear){
     ?date.toLocaleTimeString(locale,{hour:'2-digit',minute:'2-digit'})
     :date.toLocaleDateString(locale,includeYear?{year:'2-digit',month:'2-digit',day:'2-digit'}:{month:'2-digit',day:'2-digit'});
 }
-function sparkline(samples,metric){
+function sparkline(samples,metric,windowRange){
   if(!samples||!samples.length)return '<div class="chart-empty">'+tr('暂无历史样本')+'</div>';
   const maximumPoints=240;let points=downsampleHistory(samples,maximumPoints);
   if(!points.length)return '<div class="chart-empty">'+tr('暂无历史样本')+'</div>';
@@ -2550,32 +3510,33 @@ function sparkline(samples,metric){
   const axisMaximum=percentageMetric?100:chartAxisMaximum(Math.max(metric==='network'?4:1,...values));
   const timestamps=points.map(point=>Number(point.timestamp));
   const hasTimeRange=timestamps.length>1&&timestamps.every(Number.isFinite)&&timestamps[timestamps.length-1]>timestamps[0];
-  const firstTime=hasTimeRange?timestamps[0]:0;
-  const timeSpan=hasTimeRange?timestamps[timestamps.length-1]-firstTime:0;
+  const firstTime=windowRange?windowRange.start:hasTimeRange?timestamps[0]:0;
+  const timeSpan=windowRange?windowRange.end-windowRange.start:hasTimeRange?timestamps[timestamps.length-1]-firstTime:0;
   const firstDate=new Date(timestamps[0]*1000),lastDate=new Date(timestamps[timestamps.length-1]*1000);
   const crossesYear=Number.isFinite(firstDate.getTime())&&Number.isFinite(lastDate.getTime())&&firstDate.getFullYear()!==lastDate.getFullYear();
   const pointCount=points.length;
   points=points.map((point,index)=>{
     const value=Math.max(0,Number(point.value)||0);
-    const x=pointCount===1?plotLeft+plotWidth/2:plotLeft+(hasTimeRange?(timestamps[index]-firstTime)/timeSpan:index/(pointCount-1))*plotWidth;
+    const x=pointCount===1&&!windowRange?plotLeft+plotWidth/2:plotLeft+((hasTimeRange||windowRange)?(timestamps[index]-firstTime)/timeSpan:index/(pointCount-1))*plotWidth;
     const y=plotBottom-Math.min(1,value/axisMaximum)*plotHeight;
     return {...point,x,y};
   });
   const ticks=Array.from({length:5},(_,index)=>axisMaximum*(4-index)/4);
   const formatY=value=>percentageMetric
     ?new Intl.NumberFormat(LANGUAGE_LOCALE[state.language]||'en-US',{maximumFractionDigits:0}).format(value)+'%'
+    :metric==='latency'?new Intl.NumberFormat(LANGUAGE_LOCALE[state.language]||'en-US',{maximumFractionDigits:1}).format(value)+' ms'
     :metric==='network'?fmtBytes(value)+'/s'
     :new Intl.NumberFormat(LANGUAGE_LOCALE[state.language]||'en-US',{maximumFractionDigits:2}).format(value);
   const grid=ticks.map(value=>{
     const y=plotBottom-(value/axisMaximum)*plotHeight;
     return '<line class="chart-grid" x1="'+plotLeft+'" y1="'+y.toFixed(1)+'" x2="'+plotRight+'" y2="'+y.toFixed(1)+'"></line><text class="chart-label" x="'+(plotLeft-7)+'" y="'+(y+3).toFixed(1)+'" text-anchor="end">'+formatY(value)+'</text>';
   }).join('');
-  const xTicks=pointCount===1?[{x:points[0].x,timestamp:points[0].timestamp,anchor:'middle',position:'single'}]:[
-    {x:plotLeft,timestamp:points[0].timestamp,anchor:'start',position:'first'},
-    {x:(plotLeft+plotRight)/2,timestamp:hasTimeRange?(firstTime+timeSpan/2):points[Math.floor(pointCount/2)].timestamp,anchor:'middle',position:'middle'},
-    {x:plotRight,timestamp:points[pointCount-1].timestamp,anchor:'end',position:'last'}
+  const xTicks=pointCount===1&&!windowRange?[{x:points[0].x,timestamp:points[0].timestamp,anchor:'middle',position:'single'}]:[
+    {x:plotLeft,timestamp:windowRange?windowRange.start:points[0].timestamp,anchor:'start',position:'first'},
+    {x:(plotLeft+plotRight)/2,timestamp:(hasTimeRange||windowRange)?(firstTime+timeSpan/2):points[Math.floor(pointCount/2)].timestamp,anchor:'middle',position:'middle'},
+    {x:plotRight,timestamp:windowRange?windowRange.end:points[pointCount-1].timestamp,anchor:'end',position:'last'}
   ];
-  const xLabels=xTicks.map(tick=>'<line class="chart-grid chart-grid-vertical chart-grid-'+tick.position+'" x1="'+tick.x.toFixed(1)+'" y1="'+plotTop+'" x2="'+tick.x.toFixed(1)+'" y2="'+plotBottom+'"></line><text class="chart-label chart-label-x chart-label-'+tick.position+'" x="'+tick.x.toFixed(1)+'" y="125" text-anchor="'+tick.anchor+'">'+chartTimeLabel(Number(tick.timestamp),hasTimeRange?timeSpan:0,crossesYear)+'</text>').join('');
+  const xLabels=xTicks.map(tick=>'<line class="chart-grid chart-grid-vertical chart-grid-'+tick.position+'" x1="'+tick.x.toFixed(1)+'" y1="'+plotTop+'" x2="'+tick.x.toFixed(1)+'" y2="'+plotBottom+'"></line><text class="chart-label chart-label-x chart-label-'+tick.position+'" x="'+tick.x.toFixed(1)+'" y="125" text-anchor="'+tick.anchor+'">'+chartTimeLabel(Number(tick.timestamp),(hasTimeRange||windowRange)?timeSpan:0,crossesYear)+'</text>').join('');
   const segments=[];
   points.forEach(point=>{
     const current=segments[segments.length-1];
@@ -2601,8 +3562,9 @@ function sparkline(samples,metric){
 function bindChartTooltip(chart){
   const tooltip=document.getElementById('chart-tooltip');const data=state.chartData[chart.dataset.chartId];
   if(!tooltip||!data||!data.points.length)return;
-  let hideTimer=null;
+  let hideTimer=null,pointerFrame=null;
   const hide=()=>{
+    if(pointerFrame!==null){cancelAnimationFrame(pointerFrame);pointerFrame=null}
     clearTimeout(hideTimer);tooltip.classList.remove('visible');
     const marker=chart.querySelector('.chart-hover'),crosshair=chart.querySelector('.chart-crosshair');
     if(marker){marker.setAttribute('cx','-10');marker.setAttribute('cy','-10')}
@@ -2611,12 +3573,14 @@ function bindChartTooltip(chart){
   const showPoint=(point,index,clientX,clientY)=>{
     const rect=chart.getBoundingClientRect();if(!rect.width)return;
     chart.dataset.activeIndex=String(index);
+    if(chart.closest('.replay-charts'))syncReplayCursor(point.timestamp);
     const date=new Date(point.timestamp*1000);const dateText=Number.isFinite(date.getTime())?date.toLocaleString(LANGUAGE_LOCALE[state.language]||'en-US'):'—';
     let valueText;
     if(data.metric==='network')valueText=point.rx==null?fmtBytes(point.value)+'/s':fmtBytes(point.value)+'/s  (↓ '+fmtBytes(point.rx||0)+'/s · ↑ '+fmtBytes(point.tx||0)+'/s)';
+    else if(data.metric==='latency')valueText=Number(point.value).toFixed(1)+' ms';
     else if(data.metric==='load')valueText=Number(point.value).toFixed(2);
     else valueText=Number(point.value).toFixed(1)+'%';
-    tooltip.textContent=dateText+'\n'+tr((metrics[data.metric]||['Metric'])[0])+': '+valueText;tooltip.classList.add('visible');
+    tooltip.textContent=dateText+'\n'+alertMetricLabel(data.metric)+': '+valueText;tooltip.classList.add('visible');
     const bounds=tooltip.getBoundingClientRect();let left=clientX+14,top=clientY+14;
     if(left+bounds.width>window.innerWidth-8)left=clientX-bounds.width-14;
     if(top+bounds.height>window.innerHeight-8)top=clientY-bounds.height-14;
@@ -2641,7 +3605,7 @@ function bindChartTooltip(chart){
     showPoint(point,index,rect.left+point.x/320*rect.width,rect.top+point.y/148*rect.height);
   };
   chart.addEventListener('pointerdown',showPointer);
-  chart.addEventListener('pointermove',showPointer);
+  chart.addEventListener('pointermove',event=>{if(pointerFrame!==null)cancelAnimationFrame(pointerFrame);pointerFrame=requestAnimationFrame(()=>{pointerFrame=null;if(chart.isConnected)showPointer(event)})});
   chart.addEventListener('pointerleave',event=>{if(event.pointerType!=='touch')hide()});
   chart.addEventListener('pointercancel',hide);
   chart.addEventListener('focus',showActive);
@@ -2660,14 +3624,15 @@ function bindWidget(el,w){
   el.querySelectorAll('.mini-chart[data-chart-id]').forEach(chart=>bindChartTooltip(chart));
   if(!w.transient){el.ondragstart=()=>{state.dragged=el;el.classList.add('dragging')};el.ondragend=()=>{state.dragged=null;el.classList.remove('dragging');document.querySelectorAll('.drag-over').forEach(x=>x.classList.remove('drag-over'))}}
   const remove=el.querySelector('.remove-widget');if(remove)remove.onclick=()=>{state.config.widgets=state.config.widgets.filter(x=>x.id!==w.id);draw();saveConfig().catch(error=>toast(error.message))};
+  const partition=el.querySelector('.partition-select');if(partition)partition.onchange=()=>{state.history[w.node+':partition']=partition.value;draw()};
   const iface=el.querySelector('.iface-select');if(iface)iface.onchange=()=>{state.history[w.node+':iface']=iface.value;draw()};
   const range=el.querySelector('.history-select');if(range)range.onchange=()=>{const selection=historySelectionKey(w.node,w.metric,range.dataset.interface||'');if(range.value==='custom'){draw();showHistoryRange(w.node,w.metric,range.dataset.interface||'');return}delete state.historyCustom[selection];state.historyRanges[selection]=range.value;draw()};
   const custom=el.querySelector('.history-custom');if(custom)custom.onclick=()=>showHistoryRange(w.node,w.metric,custom.dataset.interface||'');
   const disk=el.querySelector('[data-disk]');if(disk)disk.onclick=()=>showDisks(w.node)
 }
 async function saveConfig(){await api('/api/config','POST',{assets:state.config.assets,widgets:state.config.widgets,theme:state.config.theme,history_retention_days:state.config.history_retention_days});state.config=await api('/api/config')}
-function modal(content,wide){state.modalKind='';state.alertRequest++;state.alertLoading=false;const box=document.getElementById('modal');box.className='modal-backdrop open';box.innerHTML='<section class="modal '+(wide?'wide-modal':'')+'">'+content+'</section>';localizeDOM(box);box.onclick=e=>{if(e.target===box)closeModal()};const close=box.querySelectorAll('[data-close]');close.forEach(x=>x.onclick=closeModal);state.modal=box}
-function closeModal(){state.modalKind='';state.alertRequest++;state.alertLoading=false;const box=document.getElementById('modal');if(box){box.className='modal-backdrop';box.innerHTML=''}state.modal=null}
+function modal(content,wide){state.serviceRequest++;state.serviceLoading=false;state.replayRequest++;state.replayController?.abort();state.modalKind='';state.alertRequest++;state.alertLoading=false;const box=document.getElementById('modal');box.className='modal-backdrop open';box.innerHTML='<section class="modal '+(wide?'wide-modal':'')+'">'+content+'</section>';localizeDOM(box);box.onclick=e=>{if(e.target===box)closeModal()};const close=box.querySelectorAll('[data-close]');close.forEach(x=>x.onclick=closeModal);state.modal=box}
+function closeModal(){state.serviceRequest++;state.replayRequest++;state.replayController?.abort();document.getElementById('chart-tooltip')?.classList.remove('visible');state.modalKind='';state.alertRequest++;state.alertLoading=false;const box=document.getElementById('modal');if(box){box.className='modal-backdrop';box.innerHTML=''}state.modal=null}
 function showDisks(id){const node=nodeFor(id);if(!node||!node.metrics)return;const rows=node.metrics.disk.partitions||[];modal('<header class="modal-head"><h3>磁盘与分区 · '+esc(node.name)+'</h3><button class="close" data-close>×</button></header><div style="overflow:auto"><table class="data-table"><thead><tr><th>挂载点</th><th>设备</th><th>文件系统</th><th>已用 / 总量</th><th>使用率</th></tr></thead><tbody>'+rows.map(x=>'<tr><td>'+esc(x.mount)+'</td><td>'+esc(x.device)+'</td><td>'+esc(x.filesystem)+'</td><td>'+fmtBytes(x.used)+' / '+fmtBytes(x.total)+'</td><td>'+x.percent+'%</td></tr>').join('')+'</tbody></table></div>',true)}
 function showAddWidget(){const assets=[{id:'local',name:nodeFor('local')?.name||'本机'}].concat(state.config.assets||[]);modal('<header class="modal-head"><h3>添加监控卡片</h3><button class="close" data-close>×</button></header><form id="widget-form"><div class="form-grid"><div class="field full"><label>网络资产</label><select id="widget-node">'+assets.map(a=>'<option value="'+esc(a.id)+'">'+esc(a.name)+'</option>').join('')+'</select></div><div class="field full"><label>监控项目</label><select id="widget-metric">'+Object.entries(metrics).filter(([key])=>key!=='info').map(([k,v])=>'<option value="'+k+'">'+v[0]+'</option>').join('')+'</select></div></div><div class="error-message" id="widget-error"></div><div class="modal-actions"><button type="button" class="button subtle" data-close>取消</button><button class="button primary">添加卡片</button></div></form>');document.getElementById('widget-form').onsubmit=async e=>{e.preventDefault();if(state.config.widgets.length>=32){document.getElementById('widget-error').textContent=tr('最多添加 32 张卡片');return}const node=document.getElementById('widget-node').value,metric=document.getElementById('widget-metric').value;state.config.widgets.push({id:crypto.randomUUID?crypto.randomUUID():('w-'+Date.now()),node:node,metric:metric});closeModal();draw();try{await saveConfig()}catch(err){toast(err.message)}}}
 function showHistorySettings(){showSettings()}
@@ -2716,8 +3681,106 @@ function showAssets(){
     try{await saveConfig();showAssets();draw();toast('资产已移除')}catch(error){toast(error.message)}
   });
 }
-// New monitoring controls use explicit translation keys, keeping data and labels separate.
 const FEATURE_MESSAGES = {
+  heartbeat_overdue: ["Task success report overdue", "任务成功上报已超期", "成功報告の期限超過", "Rapport de réussite en retard", "Просрочен отчёт об успехе", "Erfolgsmeldung überfällig"],
+  worker_notifications: ["Notification delivery", "通知投递", "通知送信", "Envoi des notifications", "Доставка уведомлений", "Nachrichtenzustellung"],
+  worker_services: ["Service checks", "服务检查", "サービス確認", "Contrôles de service", "Проверки сервисов", "Dienstprüfungen"],
+  worker_details: ["Host details", "主机详情", "ホスト詳細", "Détails de l’hôte", "Данные хоста", "Hostdetails"],
+  worker_history: ["History sampler", "历史采样", "履歴収集", "Collecte historique", "Сбор истории", "Verlaufserfassung"],
+  monitor_disabled: ["Monitor disabled", "监控已停用", "監視を無効化", "Moniteur désactivé", "Монитор отключён", "Monitor deaktiviert"],
+  heartbeats: ["Scheduled tasks", "定时任务", "定期タスク", "Tâches planifiées", "Плановые задачи", "Geplante Aufgaben"],
+  heartbeat_help: ["Report successful runs with a task token. A missed interval plus grace period opens an incident.", "使用任务令牌上报成功执行；超过周期和宽限期未上报时触发事件。", "トークンで成功を報告。周期と猶予を超えるとアラート。", "Signalez les réussites avec le jeton. Une échéance dépassée déclenche un incident.", "Сообщайте об успехе с токеном. Пропуск срока и отсрочки вызывает инцидент.", "Erfolge mit Token melden. Überschrittene Frist und Toleranz lösen einen Vorfall aus."],
+  heartbeat_token: ["Task token", "任务令牌", "タスクトークン", "Jeton de tâche", "Токен задачи", "Aufgaben-Token"],
+  heartbeat_grace: ["Grace period (minutes)", "宽限期（分钟）", "猶予（分）", "Tolérance (minutes)", "Отсрочка (минуты)", "Toleranz (Minuten)"],
+  heartbeat_interval: ["Expected interval (minutes)", "预期周期（分钟）", "周期（分）", "Intervalle prévu (minutes)", "Ожидаемый интервал (минуты)", "Erwartetes Intervall (Minuten)"],
+  heartbeat_endpoint: ["POST /api/heartbeat with X-TinyWatch-Heartbeat header and JSON {\"duration_ms\":123}. Report only successful completion.", "向 /api/heartbeat 发送 POST，X-TinyWatch-Heartbeat 请求头填写令牌，JSON 为 {\"duration_ms\":123}。仅在成功完成后上报。", "POST /api/heartbeat、ヘッダー X-TinyWatch-Heartbeat、JSON {\"duration_ms\":123}。成功時のみ報告。", "POST /api/heartbeat, en-tête X-TinyWatch-Heartbeat, JSON {\"duration_ms\":123}. Uniquement après réussite.", "POST /api/heartbeat, заголовок X-TinyWatch-Heartbeat, JSON {\"duration_ms\":123}. Только после успеха.", "POST /api/heartbeat mit X-TinyWatch-Heartbeat und JSON {\"duration_ms\":123}. Nur erfolgreiche Abschlüsse melden."],
+  runtime_health: ["Monitor health", "监控程序健康", "監視の状態", "État du moniteur", "Состояние монитора", "Monitorzustand"],
+  write_failures: ["Write failures", "写盘失败次数", "書き込み失敗", "Échecs d’écriture", "Ошибки записи", "Schreibfehler"],
+  queue_age: ["Oldest pending notification", "最早待发通知年龄", "最古の通知", "Âge de notification en attente", "Возраст ожидающего уведомления", "Alter der ältesten Nachricht"],
+  pending_notifications: ["Pending notifications", "待发通知", "未送信通知", "Notifications en attente", "Ожидающие уведомления", "Ausstehende Nachrichten"],
+  probe_slots: ["Probe slots", "探测槽位", "プローブ枠", "Places de sondage", "Слоты проверок", "Prüfplätze"],
+  worker_failed: ["Stopped", "已停止", "停止", "Arrêté", "Остановлен", "Gestoppt"],
+  interval_minutes: ["minutes", "分钟", "分", "minutes", "минуты", "Minuten"],
+
+  refresh_services: ["Refresh", "刷新", "更新", "Actualiser", "Обновить", "Aktualisieren"],
+  notification_dropped: ["Notification queue was full; this transition was not queued.", "通知队列已满，此次事件未入队。", "通知キューが満杯のため送信を登録できませんでした。", "File de notifications pleine ; événement non enregistré.", "Очередь уведомлений заполнена; событие не добавлено.", "Benachrichtigungswarteschlange voll; Ereignis nicht eingereiht."],
+
+  services: ["Services", "服务监控", "サービス監視", "Services", "Сервисы", "Dienste"],
+  service: ["Service availability", "服务可用性", "サービス可用性", "Disponibilité du service", "Доступность сервиса", "Dienstverfügbarkeit"],
+  monitors: ["Monitors", "探测项目", "モニター", "Moniteurs", "Мониторы", "Monitore"],
+  notifications: ["Notifications", "通知", "通知", "Notifications", "Уведомления", "Benachrichtigungen"],
+  maintenance: ["Maintenance windows", "维护窗口", "保守期間", "Périodes de maintenance", "Окна обслуживания", "Wartungsfenster"],
+  probe_help: ["Probes run from this console host. The associated asset selects incident context and maintenance scope, not the probe location.", "探测由控制台主机执行；关联资产用于事件归属和维护范围，不代表从该资产发起探测。", "このコンソールから検査します。関連資産はイベントと保守範囲のみを指定します。", "Les sondes partent de cette console. L’actif associé définit les incidents et la maintenance, pas le lieu de sondage.", "Проверки выполняются с узла панели. Связанный узел задаёт контекст и обслуживание, не место проверки.", "Prüfungen laufen auf dem Konsolenhost. Das zugeordnete System bestimmt Vorfälle und Wartung, nicht den Prüfort."],
+  add_service: ["Add monitor", "添加探测", "モニター追加", "Ajouter un moniteur", "Добавить монитор", "Monitor hinzufügen"],
+  service_limits: ["Up to 24 monitors, intervals 30–3600 seconds. History shows sampled success and mean probe duration in 5-minute buckets over 24h.", "最多 24 项，间隔 30–3600 秒。历史展示 24 小时内的采样成功率和 5 分钟桶的平均探测耗时。", "最大24件、30–3600秒間隔。24時間の成功率と5分平均時間を表示。", "24 moniteurs, intervalles de 30 à 3600 s. Succès échantillonnés et durée moyenne par 5 min sur 24 h.", "До 24 мониторов, интервал 30–3600 с. Успехи и средняя длительность по 5 мин за 24 ч.", "Bis zu 24 Monitore, 30–3600 Sekunden. Stichprobenerfolg und mittlere Dauer je 5 Minuten über 24 h."],
+  pending_probe: ["Waiting for probe", "等待探测", "検査待ち", "En attente de sonde", "Ожидание проверки", "Warten auf Prüfung"],
+  service_ok: ["Available", "可用", "利用可能", "Disponible", "Доступен", "Verfügbar"],
+  service_down: ["Unavailable", "不可用", "利用不可", "Indisponible", "Недоступен", "Nicht verfügbar"],
+  associated_asset: ["Associated asset", "关联资产", "関連資産", "Actif associé", "Связанный узел", "Zugeordnetes System"],
+  maintenance_active: ["Notifications paused for maintenance", "维护中，通知暂停", "保守中・通知停止", "Notifications suspendues pour maintenance", "Обслуживание: уведомления приостановлены", "Benachrichtigungen wegen Wartung pausiert"],
+  sample_success: ["Sample success (24h)", "采样成功率（24h）", "成功率（24時間）", "Succès des sondes (24 h)", "Успешные проверки (24 ч)", "Erfolgreiche Stichproben (24 h)"],
+  consecutive_failures: ["Consecutive failures", "连续失败", "連続失敗", "Échecs consécutifs", "Последовательные сбои", "Aufeinanderfolgende Fehler"],
+  notification_help: ["Send JSON to a generic webhook on incident trigger/recovery. No redirects. Five attempts, 24h expiry, bounded persistent queue. A receiver should deduplicate event_id; delivery may repeat after a crash.", "告警触发/恢复时发送 JSON 到通用 Webhook，不跟随重定向；最多尝试 5 次，24 小时过期，队列持久化且有上限。接收端应按 event_id 去重，崩溃后可能重复投递。", "発生/復旧時にJSONを送信。リダイレクトなし、5回まで、24時間で期限切れ。event_idで重複を除いてください。", "JSON au déclenchement/rétablissement. Sans redirection, 5 tentatives, expiration 24 h. Dédupliquez event_id après un redémarrage.", "JSON при сбое/восстановлении. Без перенаправлений, 5 попыток, срок 24 ч. Устраняйте дубли по event_id.", "JSON bei Auslösung/Ende. Keine Umleitungen, 5 Versuche, 24 h Ablauf. Empfänger sollten event_id deduplizieren."],
+  deliveries: ["Recent deliveries", "最近投递", "最近の配信", "Livraisons récentes", "Последние доставки", "Letzte Zustellungen"],
+  maintenance_help: ["Keep collecting and recording incidents while suppressing notifications for selected assets. Still-active incidents notify after maintenance ends; incidents resolved during maintenance remain silent.", "维护期间继续采样和记录事件，仅暂停所选资产的通知。维护结束后仍活跃的事件会通知；维护期间恢复的事件保持静默。", "保守中も収集と記録を継続。終了時に未解決のイベントを通知します。期間中に復旧したものは通知しません。", "Collecte et incidents maintenus sans notifications. Les incidents encore actifs sont signalés à la fin ; ceux résolus restent silencieux.", "Сбор продолжается без уведомлений. Активные инциденты сообщаются после окна; завершённые в окне остаются тихими.", "Erfassung läuft ohne Benachrichtigungen weiter. Noch aktive Vorfälle werden danach gemeldet, während der Wartung beendete bleiben stumm."],
+  add_window: ["Add window", "添加窗口", "期間追加", "Ajouter une période", "Добавить окно", "Fenster hinzufügen"],
+  service_name: ["Monitor name", "探测名称", "モニター名", "Nom du moniteur", "Название монитора", "Monitorname"],
+  protocol: ["Protocol", "协议", "プロトコル", "Protocole", "Протокол", "Protokoll"],
+  target: ["URL or TCP host", "URL 或 TCP 主机", "URLまたはTCPホスト", "URL ou hôte TCP", "URL или TCP-узел", "URL oder TCP-Host"],
+  expected_status: ["Expected HTTP status", "预期 HTTP 状态码", "期待HTTP状態", "Statut HTTP attendu", "Ожидаемый HTTP-статус", "Erwarteter HTTP-Status"],
+  content_match: ["Literal content match (optional, first 64 KiB, UTF-8)", "内容字面匹配（可选，前 64 KiB，UTF-8）", "本文一致（任意、先頭64 KiB、UTF-8）", "Texte à trouver (facultatif, premiers 64 Kio, UTF-8)", "Текст для поиска (до 64 КиБ, UTF-8, необязательно)", "Textabgleich (optional, erste 64 KiB, UTF-8)"],
+  interval_seconds: ["Interval (seconds)", "间隔（秒）", "間隔（秒）", "Intervalle (secondes)", "Интервал (секунды)", "Intervall (Sekunden)"],
+  failure_threshold: ["Failures before alert", "告警前连续失败次数", "通知までの失敗回数", "Échecs avant alerte", "Сбоев до оповещения", "Fehler bis zum Alarm"],
+  service_edit_help: ["Renaming preserves history. Changing the target or matching conditions resets it. One success resolves an incident.", "改名称保留历史，更换目标或匹配条件才重置；一次成功探测即可恢复事件。", "名前変更は履歴を保持。対象や条件の変更はリセット。成功1回で復旧。", "Renommer conserve l’historique. Changer la cible ou les critères le réinitialise. Un succès résout l’incident.", "Переименование сохраняет историю. Смена цели или условий сбрасывает её. Успех закрывает инцидент.", "Umbenennen bewahrt den Verlauf. Ziel- oder Bedingungsänderungen setzen ihn zurück. Ein Erfolg beendet den Vorfall."],
+  connection_failed: ["Connection, DNS or TLS failed", "连接、DNS 或 TLS 失败", "接続・DNS・TLS失敗", "Échec de connexion, DNS ou TLS", "Ошибка соединения, DNS или TLS", "Verbindung, DNS oder TLS fehlgeschlagen"],
+  unexpected_status: ["Unexpected HTTP status", "HTTP 状态码不符", "HTTP状態が不一致", "Statut HTTP inattendu", "Неожиданный HTTP-статус", "Unerwarteter HTTP-Status"],
+  content_mismatch: ["Expected text not found", "未找到预期内容", "期待する本文なし", "Texte attendu absent", "Ожидаемый текст не найден", "Erwarteter Text nicht gefunden"],
+  delivery_pending: ["Pending", "待投递", "待機", "En attente", "Ожидает", "Ausstehend"],
+  delivery_delivered: ["Delivered", "已投递", "配信済み", "Livré", "Доставлено", "Zugestellt"],
+  delivery_failed: ["Delivery failed", "投递失败", "配信失敗", "Échec de livraison", "Ошибка доставки", "Zustellung fehlgeschlagen"],
+  delivery_expired: ["Expired", "已过期", "期限切れ", "Expiré", "Истекло", "Abgelaufen"],
+  delivery_cancelled: ["Cancelled", "已取消", "中止", "Annulé", "Отменено", "Abgebrochen"],
+  timeout_seconds: ["Timeout (seconds)", "超时（秒）", "タイムアウト（秒）", "Délai (secondes)", "Тайм-аут (секунды)", "Zeitlimit (Sekunden)"],
+
+  last_observed: ["Sample time", "采样时间", "サンプル時刻", "Heure de mesure", "Время отсчёта", "Messzeit"],
+  cadence: ["Interval", "间隔", "間隔", "Intervalle", "Интервал", "Intervall"],
+  collection_time: ["Collection time", "采集耗时", "収集時間", "Durée de collecte", "Время сбора", "Erfassungsdauer"],
+  storage_size: ["Database size", "数据库大小", "DBサイズ", "Taille de la base", "Размер базы", "Datenbankgröße"],
+  storage_write: ["Last database write", "最近数据库写入耗时", "直近DB書込時間", "Dernière écriture de la base", "Последняя запись базы", "Letzte Datenbankschreibdauer"],
+
+  replay: ["Investigate & replay", "调查与回放", "調査と再生", "Analyse et relecture", "Анализ и воспроизведение", "Untersuchung und Rückblick"],
+  partition: ["Partition", "分区", "パーティション", "Partition", "Раздел", "Partition"],
+  partition_missing: ["Partition unavailable", "分区暂不可用", "パーティション利用不可", "Partition indisponible", "Раздел недоступен", "Partition nicht verfügbar"],
+  aggregate: ["All partitions (aggregate)", "全部分区（汇总）", "全パーティション（合計）", "Toutes les partitions (total)", "Все разделы (суммарно)", "Alle Partitionen (gesamt)"],
+  worst_partition: ["Most used partition", "最满分区", "最大使用率のパーティション", "Partition la plus pleine", "Самый заполненный раздел", "Vollste Partition"],
+  replay_help: ["Retained samples share one time axis. Gaps and sparse context are observations, not proof of cause.", "保留样本共用时间轴；缺口和稀疏上下文仅为观测，不能证明故障原因。", "保存データを同じ時間軸で表示。欠落と疎な情報は原因の証明ではありません。", "Axe commun aux mesures conservées. Les lacunes et le contexte ne prouvent pas une cause.", "Сохранённые отсчёты на общей оси. Пробелы и контекст не доказывают причину.", "Gemeinsame Zeitachse für gespeicherte Werte. Lücken und Kontext beweisen keine Ursache."],
+  from: ["From", "开始时间", "開始", "Début", "Начало", "Von"],
+  until: ["Until", "结束时间", "終了", "Fin", "Конец", "Bis"],
+  apply: ["Apply range", "应用时间段", "期間を適用", "Appliquer la période", "Применить период", "Zeitraum anwenden"],
+  export_report: ["Export offline HTML", "导出离线 HTML", "オフラインHTML出力", "Exporter HTML hors ligne", "Экспорт HTML офлайн", "Offline-HTML exportieren"],
+  add_annotation: ["Add annotation", "添加标记", "注釈を追加", "Ajouter une annotation", "Добавить отметку", "Markierung hinzufügen"],
+  annotation: ["Annotation", "手动标记", "注釈", "Annotation", "Отметка", "Markierung"],
+  annotation_message: ["Description (up to 240 characters)", "说明（最多 240 字）", "説明（240文字以内）", "Description (240 caractères maximum)", "Описание (до 240 символов)", "Beschreibung (bis 240 Zeichen)"],
+  system_change: ["System version changed", "系统版本变化", "システム版変更", "Version système modifiée", "Изменение версии системы", "Systemversion geändert"],
+  interfaces_change: ["Network interfaces changed", "网卡变化", "ネットワークIF変更", "Interfaces réseau modifiées", "Изменение интерфейсов", "Netzwerkschnittstellen geändert"],
+  partitions_change: ["Partitions changed", "分区变化", "パーティション変更", "Partitions modifiées", "Изменение разделов", "Partitionen geändert"],
+  reboot: ["Restart observed", "观测到重启", "再起動を検出", "Redémarrage observé", "Обнаружена перезагрузка", "Neustart beobachtet"],
+  login_observed: ["Login first observed here", "首次观测到登录记录", "ログインを初観測", "Connexion observée ici", "Впервые обнаруженная запись входа", "Anmeldung erstmals beobachtet"],
+  replay_events: ["Changes and annotations", "变化与标记", "変更と注釈", "Modifications et annotations", "Изменения и отметки", "Änderungen und Markierungen"],
+  no_events: ["No retained events in this interval.", "该时间段没有保留的事件。", "この期間のイベントはありません。", "Aucun événement conservé sur cette période.", "Нет сохранённых событий за период.", "Keine gespeicherten Ereignisse im Zeitraum."],
+  replay_context: ["Nearest retained process snapshot", "最近的保留进程快照", "最も近い保存プロセス情報", "Instantané de processus conservé le plus proche", "Ближайший сохранённый снимок процессов", "Nächstgelegener gespeicherter Prozessstand"],
+  context_sampling: ["Top 3 CPU processes only; context may be sparse. Login entries are trigger/snapshot context, not a complete audit log.", "仅保留 CPU 前三进程，上下文可能稀疏；登录条目是快照信息，并非完整审计日志。", "CPU上位3プロセスのみ保存。ログイン情報は完全な監査ログではありません。", "Trois processus CPU seulement ; contexte parfois clairsemé. Les connexions ne forment pas un journal exhaustif.", "Только 3 процесса по CPU; контекст может быть редким. Записи входа не являются полным журналом аудита.", "Nur drei CPU-Spitzenprozesse; Kontext kann lückenhaft sein. Anmeldungen sind kein vollständiges Auditprotokoll."],
+  snapshot_age: ["Snapshot distance (seconds)", "快照时间差（秒）", "スナップショットとの差（秒）", "Écart instantané (secondes)", "Расстояние до снимка (секунды)", "Abstand zum Prozessstand (Sekunden)"],
+  previous_window: ["Previous window", "上一时间段", "前の期間", "Période précédente", "Предыдущий период", "Vorheriger Zeitraum"],
+  next_window: ["Next window", "下一时间段", "次の期間", "Période suivante", "Следующий период", "Nächster Zeitraum"],
+  zoom_in: ["Zoom in", "放大", "拡大", "Agrandir", "Увеличить", "Vergrößern"],
+  zoom_out: ["Zoom out", "缩小", "縮小", "Réduire", "Уменьшить", "Verkleinern"],
+  outside_retention: ["The selected time is outside retained history.", "所选时间超出保留历史范围。", "保存履歴の範囲外です。", "La période dépasse l’historique conservé.", "Период вне сохранённой истории.", "Zeitraum außerhalb des gespeicherten Verlaufs."],
+  cursor: ["Inspection time", "检查时间", "確認時刻", "Heure examinée", "Время просмотра", "Untersuchungszeit"],
+  sample_resolution: ["Minute samples for 24h; older charts retain extrema at 5-minute/hourly resolution. Sparse context preserves first/last snapshots.", "24 小时内为分钟样本，更早图表按 5 分钟/小时保留极值；上下文稀疏保留首尾快照。", "24時間は毎分、以降は5分/1時間の極値。古い情報は最初と最後のスナップショットです。", "Mesures par minute sur 24 h, puis extrêmes par 5 min/heure. Contexte ancien limité aux premier/dernier instantanés.", "Минутные отсчёты за 24 ч, затем экстремумы за 5 мин/час. Старый контекст: первый/последний снимок.", "Minutenwerte für 24 h, danach Extrema je 5 Minuten/Stunde. Älterer Kontext behält Anfang/Ende."],
+  generated: ["Generated", "生成时间", "生成時刻", "Généré", "Создано", "Erstellt"],
+  no_credentials: ["This report contains monitoring observations; credentials and dashboard configuration are excluded.", "报告包含监控观测信息，不包含凭证和面板配置。", "レポートには監視情報のみ含み、認証情報や画面設定は含みません。", "Rapport d’observations sans identifiants ni configuration du tableau de bord.", "Отчёт содержит наблюдения, без учётных данных и конфигурации панели.", "Bericht mit Beobachtungen ohne Zugangsdaten und Dashboardkonfiguration."],
+
   alerts: ['Alerts', '告警', 'アラート', 'Alertes', 'Оповещения', 'Alarme'],
   timeline: ['Incident timeline', '事件时间线', 'インシデント履歴', 'Chronologie des incidents', 'История инцидентов', 'Vorfallverlauf'],
   rules: ['Alert rules', '告警规则', 'アラートルール', 'Règles d’alerte', 'Правила оповещений', 'Alarmregeln'],
@@ -2806,6 +3869,7 @@ function alertMetricLabel(metric) {
 function alertValue(metric, value) {
   if(value == null || !Number.isFinite(Number(value))) return '—';
   if(metric === 'network') return fmtBytes(value) + '/s';
+  if(metric==='service')return ft(Number(value)>0?'service_down':'service_ok');
   if(metric === 'offline') return ft(Number(value) > 0 ? 'offline' : 'online');
   const number = new Intl.NumberFormat(LANGUAGE_LOCALE[state.language] || 'en-US', {maximumFractionDigits:2}).format(value);
   return number + (['cpu','memory','disk'].includes(metric) ? '%' : metric === 'stale' ? ' ' + ft('seconds') : '');
@@ -2826,6 +3890,7 @@ function drawFleetHealth() {
     alerts.textContent = ft('alerts') + ' · ' + count;
     alerts.classList.toggle('has-alerts', count > 0);
   }
+  if(state.modalKind==='services'&&['monitors','heartbeats'].includes(state.serviceTab)&&!state.serviceEditing&&Date.now()-state.serviceFetchedAt>=10000)loadServices();
   if(state.modalKind === 'diagnostics') updateDiagnostics();
   if(state.modalKind === 'alerts' && state.alertTab === 'incidents' && Date.now()-state.alertFetchedAt >= 60000) loadAlerts();
 }
@@ -2840,10 +3905,14 @@ function updateDiagnostics() {
   if(!target) return;
   const reports = [...(state.data?.diagnostics?.nodes || [])];
   reports.sort((left,right) => Number(right.id === state.diagnosticNode)-Number(left.id === state.diagnosticNode));
-  target.innerHTML = reports.map(node => {
+  const storage=state.data?.diagnostics?.storage;
+  const runtime=state.data?.diagnostics?.runtime;
+  const health=runtime?'<article class="diagnostic-card"><strong>'+esc(ft('runtime_health'))+'</strong><p class="helper">'+esc(ft('last_success'))+': '+esc(featureDate(runtime.last_persisted_at))+' · '+esc(ft('write_failures'))+': '+runtime.write_failures+'</p><p class="helper">'+esc(ft('pending_notifications'))+': '+runtime.notification_pending+' · '+esc(ft('queue_age'))+': '+runtime.notification_oldest_seconds+' s · '+esc(ft('storage_size'))+': '+esc(fmtBytes(runtime.history_bytes))+'</p>'+Object.entries(runtime.workers).map(([name,worker])=>'<p class="helper"><span class="tag '+(!worker.running||worker.failed||worker.stale||worker.probes_overdue?'bad':'good')+'">'+esc(ft('worker_'+name))+' · '+esc(ft(!worker.running||worker.failed?'worker_failed':worker.stale||worker.probes_overdue?'stale':'healthy'))+'</span> · '+worker.age_seconds+' s'+(worker.probe_slots_limit?' · '+esc(ft('probe_slots'))+' '+worker.probe_slots_used+'/'+worker.probe_slots_limit+' · '+worker.oldest_probe_seconds+' s':'')+'</p>').join('')+'</article>':'';
+  target.innerHTML = health+(storage?'<p class="helper">'+esc(ft('storage_size'))+': '+esc(fmtBytes(storage.bytes))+' · '+esc(ft('storage_write'))+': '+esc(storage.last_write_ms??'—')+' ms</p>':'')+reports.map(node => {
     const stamp = node.last_success_at ? new Date(node.last_success_at).toLocaleString(LANGUAGE_LOCALE[state.language] || 'en-US') : ft('unavailable_time');
     const age = node.age_seconds == null ? ft('unavailable_time') : Math.round(node.age_seconds)+' '+ft('seconds');
     return '<article class="diagnostic-card"><div class="feature-card-head"><strong>'+esc(node.name)+'</strong><span class="health-status '+esc(node.status)+'">'+esc(ft(node.status))+'</span></div><dl class="feature-facts"><div><dt>'+esc(ft('last_success'))+'</dt><dd>'+esc(stamp)+'</dd></div><div><dt>'+esc(ft('sample_age'))+'</dt><dd>'+esc(age)+'</dd></div><div><dt>'+esc(ft('latency'))+'</dt><dd>'+(node.latency_ms == null ? '—' : esc(node.latency_ms)+' ms')+'</dd></div></dl>'+
+      Object.entries(node.collectors||{}).map(([name,status])=>'<p class="helper">'+esc(alertMetricLabel(name))+': '+esc(featureDate(status.sampled_at))+' · '+esc(ft('cadence'))+' '+esc(status.interval_seconds)+' '+esc(ft('seconds'))+' · '+esc(ft('collection_time'))+' '+esc(status.duration_ms)+' ms</p>').join('')+
       (node.error ? '<p class="asset-error">'+esc(node.error)+'</p>' : '')+
       (node.issues.length ? '<ul class="diagnostic-issues">'+node.issues.map(issue => '<li><strong>'+esc(alertMetricLabel(issue.metric))+'</strong> · '+esc(ft(issue.kind))+(issue.message ? '<p>'+esc(issue.message)+'</p>' : '')+'</li>').join('')+'</ul>' : (node.status === 'healthy' ? '<p class="helper">'+esc(ft('no_issues'))+'</p>' : ''))+'</article>';
   }).join('');
@@ -2877,16 +3946,19 @@ function incidentCard(item) {
   const context = item.context || {};
   const processRows = (context.processes || []).map(process => '<tr><td>'+esc(process.name)+'</td><td>'+esc(process.pid)+'</td><td>'+esc(alertValue('cpu', process.cpu))+'</td><td>'+esc(fmtBytes(process.memory))+'</td></tr>').join('');
   const observations = (processRows ? '<div class="table-scroll"><table class="data-table"><thead><tr><th>'+esc(tr('进程'))+'</th><th>PID</th><th>CPU</th><th>'+esc(tr('内存'))+'</th></tr></thead><tbody>'+processRows+'</tbody></table></div>' : '')+
+    (context.probe_error?'<p class="asset-error">'+esc(ft(context.probe_error))+'</p>':'')+
     (context.logins || []).map(entry => '<p class="context-log"><b>'+esc(entry.kind)+'</b> '+esc(entry.message)+'</p>').join('')+
     '<p class="helper">'+esc(ft('dns_count'))+': '+esc(context.dns?.count ?? 0)+'</p>'+
     (context.connection_error ? '<p class="asset-error">'+esc(context.connection_error)+'</p>' : '')+
     Object.entries(context.collector_errors || {}).map(([metric,error]) => '<p class="asset-error">'+esc(alertMetricLabel(metric))+': '+esc(error)+'</p>').join('');
   const baselineInfo = baseline ? '<p class="baseline-evidence">'+esc(ft('median'))+': '+esc(alertValue(item.metric,baseline.median))+' · MAD: '+esc(alertValue(item.metric,baseline.mad))+' · '+baseline.samples+' '+esc(ft('samples'))+'</p><p class="helper">'+esc(ft('baseline_help'))+' '+esc(ft('baseline_frozen'))+'</p>' : '';
-  return '<article class="incident '+esc(item.status)+'"><div class="feature-card-head"><div><strong>'+esc(title)+'</strong><div class="metric-sub">'+esc(item.node_name)+' · '+esc(alertMetricLabel(item.metric))+' · '+esc(ft(item.mode))+'</div></div><span class="health-status '+(item.status === 'active' ? 'offline' : 'healthy')+'">'+esc(ft(item.status))+'</span></div>'+
+  return '<article class="incident '+esc(item.status)+'"><div class="feature-card-head"><div><strong>'+esc(title)+'</strong><div class="metric-sub">'+esc(item.node_name)+' · '+esc(item.partition_mount||'')+' '+esc(alertMetricLabel(item.metric))+' · '+esc(ft(item.mode))+'</div></div><span class="health-status '+(item.status === 'active' ? 'offline' : 'healthy')+'">'+esc(ft(item.status))+'</span></div>'+
     '<dl class="feature-facts"><div><dt>'+esc(ft('triggered'))+'</dt><dd>'+esc(featureDate(item.triggered_at))+'</dd></div><div><dt>'+esc(ft(item.metric === 'offline' ? 'condition' : 'trigger'))+'</dt><dd>'+esc(item.metric === 'offline' ? ft('offline') : alertValue(item.metric,item.threshold))+'</dd></div><div><dt>'+esc(ft('current'))+'</dt><dd>'+esc(alertValue(item.metric,item.last_value))+'<small>'+esc(featureDate(item.last_observed_at))+'</small></dd></div><div><dt>'+esc(ft('peak'))+'</dt><dd>'+esc(alertValue(item.metric,item.peak))+'</dd></div></dl>'+
     '<details><summary>'+esc(ft('context'))+'</summary><p class="helper">'+esc(ft('began'))+': '+esc(featureDate(item.started_at))+' · '+esc(ft('recovery'))+': '+esc(alertValue(item.metric,item.recovery))+'</p>'+baselineInfo+observations+'<p class="helper">'+esc(ft('context_help'))+'</p></details>'+
     (item.status === 'resolved' ? '<p class="helper">'+esc(ft('ended'))+': '+esc(featureDate(item.resolved_at))+' · '+esc(ft(item.resolution_reason || 'recovered'))+'</p>' : '')+
-    '<div class="incident-actions">'+(item.acknowledged_at ? '<span class="helper">'+esc(ft('acknowledged'))+' · '+esc(featureDate(item.acknowledged_at))+'</span>' : '<button type="button" class="button subtle" data-ack="'+esc(item.id)+'">'+esc(ft('acknowledge'))+'</button>')+'</div></article>';
+    (item.notification_dropped?'<p class="asset-error">'+esc(ft('notification_dropped'))+'</p>':'')+
+    (item.status==='active'&&item.notification_suppressed?'<p class="helper">'+esc(ft('maintenance_active'))+'</p>':'')+
+    '<div class="incident-actions"><button type="button" class="button subtle" data-replay="'+esc(item.id)+'">'+esc(ft('replay'))+'</button>'+(item.acknowledged_at ? '<span class="helper">'+esc(ft('acknowledged'))+' · '+esc(featureDate(item.acknowledged_at))+'</span>' : '<button type="button" class="button subtle" data-ack="'+esc(item.id)+'">'+esc(ft('acknowledge'))+'</button>')+'</div></article>';
 }
 function renderAlertPanel() {
   const target = document.getElementById('alert-panel'), data = state.alertData;
@@ -2926,15 +3998,26 @@ function renderAlertPanel() {
       } catch(error) {button.disabled = false;toast(ft('failed'))}
     });
   }
+  target.querySelectorAll('[data-replay]').forEach(button=>button.onclick=()=>{const item=data.incidents.find(entry=>entry.id===button.dataset.replay);if(item)showReplay(item.node,item.triggered_at,item.partition!=='*'?item.partition:'')});
   target.querySelectorAll('[data-alert-tab]').forEach(button => button.onclick = () => {state.alertTab = button.dataset.alertTab;renderAlertPanel()});
 }
 function editAlertRule(existing) {
   const rule = existing || {id:'r-'+(crypto.randomUUID ? crypto.randomUUID() : Date.now()),name:'',node:'*',metric:'cpu',mode:'threshold',threshold:90,recovery:85,duration:180,cooldown:300,enabled:true};
   const assets = [{id:'*',name:ft('all_nodes')},{id:'local',name:nodeFor('local')?.name || 'Local'}].concat(state.config.assets || []);
   const target = document.getElementById('rule-editor');
-  target.innerHTML = '<form id="alert-rule-form" class="rule-editor"><div class="form-grid"><div class="field full"><label for="rule-name">'+esc(ft('name'))+'</label><input id="rule-name" maxlength="80" value="'+esc(rule.name)+'"></div><div class="field"><label for="rule-node">'+esc(ft('node'))+'</label><select id="rule-node">'+assets.map(asset => '<option value="'+esc(asset.id)+'" '+(rule.node === asset.id ? 'selected' : '')+'>'+esc(asset.name)+'</option>').join('')+'</select></div><div class="field"><label for="rule-metric">'+esc(ft('metric'))+'</label><select id="rule-metric">'+['cpu','memory','disk','network','load','offline','stale'].map(metric => '<option value="'+metric+'" '+(rule.metric === metric ? 'selected' : '')+'>'+esc(alertMetricLabel(metric))+'</option>').join('')+'</select></div><div class="field full"><label for="rule-mode">'+esc(ft('mode'))+'</label><select id="rule-mode">'+['threshold','baseline'].map(mode => '<option value="'+mode+'" '+(rule.mode === mode ? 'selected' : '')+'>'+esc(ft(mode))+'</option>').join('')+'</select></div><div class="field" id="rule-threshold-field"><label for="rule-threshold" id="rule-threshold-label"></label><input id="rule-threshold" type="number" min="0" step="any" required value="'+rule.threshold+'"></div><div class="field" id="rule-recovery-field"><label for="rule-recovery">'+esc(ft('recovery'))+'</label><input id="rule-recovery" type="number" min="0" step="any" required value="'+rule.recovery+'"></div><div class="field"><label for="rule-duration">'+esc(ft('duration'))+'</label><input id="rule-duration" type="number" min="0" max="1440" step="any" required value="'+rule.duration/60+'"></div><div class="field"><label for="rule-cooldown">'+esc(ft('cooldown'))+'</label><input id="rule-cooldown" type="number" min="0" max="10080" step="any" required value="'+rule.cooldown/60+'"></div><div class="field full"><label class="checkbox-label"><input id="rule-enabled" type="checkbox" '+(rule.enabled ? 'checked' : '')+'>'+esc(ft('enabled'))+'</label></div></div><p class="helper hidden" id="rule-baseline-help">'+esc(ft('baseline_help'))+'</p><p class="error-message" id="rule-error" role="alert"></p><div class="modal-actions"><button type="button" class="button subtle" id="rule-cancel">'+esc(ft('cancel'))+'</button><button type="submit" class="button primary">'+esc(ft('save'))+'</button></div></form>';
+  target.innerHTML = '<form id="alert-rule-form" class="rule-editor"><div class="form-grid"><div class="field full"><label for="rule-name">'+esc(ft('name'))+'</label><input id="rule-name" maxlength="80" value="'+esc(rule.name)+'"></div><div class="field"><label for="rule-node">'+esc(ft('node'))+'</label><select id="rule-node">'+assets.map(asset => '<option value="'+esc(asset.id)+'" '+(rule.node === asset.id ? 'selected' : '')+'>'+esc(asset.name)+'</option>').join('')+'</select></div><div class="field"><label for="rule-metric">'+esc(ft('metric'))+'</label><select id="rule-metric">'+['cpu','memory','disk','network','load','offline','stale'].map(metric => '<option value="'+metric+'" '+(rule.metric === metric ? 'selected' : '')+'>'+esc(alertMetricLabel(metric))+'</option>').join('')+'</select></div><div class="field full" id="rule-partition-field"><label for="rule-partition">'+esc(ft('partition'))+'</label><select id="rule-partition"></select></div><div class="field full"><label for="rule-mode">'+esc(ft('mode'))+'</label><select id="rule-mode">'+['threshold','baseline'].map(mode => '<option value="'+mode+'" '+(rule.mode === mode ? 'selected' : '')+'>'+esc(ft(mode))+'</option>').join('')+'</select></div><div class="field" id="rule-threshold-field"><label for="rule-threshold" id="rule-threshold-label"></label><input id="rule-threshold" type="number" min="0" step="any" required value="'+rule.threshold+'"></div><div class="field" id="rule-recovery-field"><label for="rule-recovery">'+esc(ft('recovery'))+'</label><input id="rule-recovery" type="number" min="0" step="any" required value="'+rule.recovery+'"></div><div class="field"><label for="rule-duration">'+esc(ft('duration'))+'</label><input id="rule-duration" type="number" min="0" max="1440" step="any" required value="'+rule.duration/60+'"></div><div class="field"><label for="rule-cooldown">'+esc(ft('cooldown'))+'</label><input id="rule-cooldown" type="number" min="0" max="10080" step="any" required value="'+rule.cooldown/60+'"></div><div class="field full"><label class="checkbox-label"><input id="rule-enabled" type="checkbox" '+(rule.enabled ? 'checked' : '')+'>'+esc(ft('enabled'))+'</label></div></div><p class="helper hidden" id="rule-baseline-help">'+esc(ft('baseline_help'))+'</p><p class="error-message" id="rule-error" role="alert"></p><div class="modal-actions"><button type="button" class="button subtle" id="rule-cancel">'+esc(ft('cancel'))+'</button><button type="submit" class="button primary">'+esc(ft('save'))+'</button></div></form>';
   const mode = document.getElementById('rule-mode'), metric = document.getElementById('rule-metric');
+  function updatePartitions(){
+    const node=document.getElementById('rule-node').value,select=document.getElementById('rule-partition');
+    const previous=select.value||rule.partition||'*',parts=nodeFor(node)?.metrics?.disk?.partitions||[];
+    select.innerHTML='<option value="*">'+esc(ft('worst_partition'))+'</option>'+parts.filter(part=>part.id).map(part=>'<option value="'+esc(part.id)+'">'+esc(part.mount)+'</option>').join('');
+    if(node!=='*'&&previous!=='*'&&!parts.some(part=>part.id===previous))select.insertAdjacentHTML('beforeend','<option value="'+esc(previous)+'">'+esc(ft('partition_missing'))+'</option>');
+    select.value=node==='*'?'*':previous;
+    document.getElementById('rule-partition-field').classList.toggle('hidden',metric.value!=='disk');
+  }
+  document.getElementById('rule-node').onchange=updatePartitions;
   function updateFields(reset) {
+    updatePartitions();
     const availability = ['offline','stale'].includes(metric.value), offline = metric.value === 'offline';
     if(availability) mode.value = 'threshold';
     mode.disabled = availability;
@@ -2954,7 +4037,7 @@ function editAlertRule(existing) {
   document.getElementById('rule-name').focus({preventScroll:true});
   document.getElementById('alert-rule-form').onsubmit = async event => {
     event.preventDefault();
-    const next = {id:rule.id,name:document.getElementById('rule-name').value,node:document.getElementById('rule-node').value,metric:metric.value,mode:mode.value,threshold:Number(document.getElementById('rule-threshold').value),recovery:mode.value === 'baseline' ? 0 : Number(document.getElementById('rule-recovery').value),duration:Math.round(Number(document.getElementById('rule-duration').value)*60),cooldown:Math.round(Number(document.getElementById('rule-cooldown').value)*60),enabled:document.getElementById('rule-enabled').checked};
+    const next = {id:rule.id,name:document.getElementById('rule-name').value,node:document.getElementById('rule-node').value,metric:metric.value,partition:metric.value==='disk'?document.getElementById('rule-partition').value:'*',mode:mode.value,threshold:Number(document.getElementById('rule-threshold').value),recovery:mode.value === 'baseline' ? 0 : Number(document.getElementById('rule-recovery').value),duration:Math.round(Number(document.getElementById('rule-duration').value)*60),cooldown:Math.round(Number(document.getElementById('rule-cooldown').value)*60),enabled:document.getElementById('rule-enabled').checked};
     const rules = state.alertData.rules.filter(item => item.id !== rule.id).concat(next);
     const submit = event.target.querySelector('[type=submit]'); submit.disabled = true;
     try {
@@ -2964,6 +4047,280 @@ function editAlertRule(existing) {
     } catch(error) {const field = document.getElementById('rule-error');if(field)field.textContent = ft('failed');submit.disabled = false}
   };
 }
+// Replay reads retained samples; it does not refresh agents.
+function replaySamples(result,metric){
+  const index={cpu:1,memory:3,disk:3,load:1};
+  return (result.points||[]).map((point,i)=>({timestamp:Number(point[0]),
+    value:metric==='network'?Number(point[1])+Number(point[2]):Number(point[index[metric]]),
+    rx:metric==='network'?Number(point[1]):undefined,tx:metric==='network'?Number(point[2]):undefined,
+    gapBefore:Boolean((result.gaps||[])[i])})).filter(point=>Number.isFinite(point.timestamp)&&Number.isFinite(point.value));
+}
+function replayEventList(data){
+  return data.events.concat(data.incidents.flatMap(item=>[
+    {id:item.id,node:item.node,timestamp:item.triggered_at,kind:'alerts',message:(item.rule_name||alertMetricLabel(item.metric))+' · '+ft('active')},
+    ...(item.resolved_at?[{id:item.id+'-resolved',timestamp:item.resolved_at,kind:'alerts',message:(item.rule_name||alertMetricLabel(item.metric))+' · '+ft('resolved')}]:[])
+  ])).filter(item=>item.timestamp>=data.start&&item.timestamp<=data.end).sort((a,b)=>a.timestamp-b.timestamp);
+}
+async function showReplay(node='local',center,partition=''){
+  const now=Math.floor(Date.now()/1000),cutoff=now-(Number(state.config.history_retention_days)||7)*86400;
+  center=Number.isFinite(Number(center))?Number(center):now-900;
+  if(center+900<cutoff){toast(ft('outside_retention'));return}
+  const window={node,partition,start:Math.max(cutoff+60,center-900),end:Math.min(now,center+900)};
+  if(window.start>=window.end){toast(ft('outside_retention'));return}
+  modal(featureHeader(ft('replay'),ft('replay_help'))+'<div id="replay-panel"></div>',true);
+  state.modalKind='replay';state.replay={window,data:null,cursor:center};
+  await loadReplay();
+}
+async function loadReplay(){
+  const replay=state.replay;if(!replay||state.modalKind!=='replay')return;
+  state.replayController?.abort();const controller=new AbortController();state.replayController=controller;
+  const request=++state.replayRequest,query=new URLSearchParams(replay.window);
+  const target=document.getElementById('replay-panel');if(!target)return;
+  target.innerHTML='<p class="helper">'+esc(ft('loading'))+'</p>';
+  try{
+    const data=await api('/api/investigation?'+query,'GET',undefined,controller.signal);
+    if(request!==state.replayRequest||state.modalKind!=='replay'||state.replay!==replay)return;
+    replay.data=data;replay.window.end=data.end;replay.cursor=Math.max(data.start,Math.min(data.end,replay.cursor));renderReplay();
+  }catch(error){
+    if(error.name==='AbortError'||request!==state.replayRequest||state.modalKind!=='replay')return;
+    target.innerHTML='<p class="asset-error">'+esc(tr(error.message))+'</p><button type="button" class="button" id="replay-retry">'+esc(ft('retry'))+'</button>';
+    document.getElementById('replay-retry').onclick=loadReplay;
+  }
+}
+function renderReplay(){
+  const replay=state.replay,data=replay?.data,target=document.getElementById('replay-panel');if(!data||!target)return;
+  const assets=[{id:'local',name:nodeFor('local')?.name||'Local'}].concat(state.config.assets||[]);
+  if(!assets.some(asset=>asset.id===data.node))assets.push({id:data.node,name:data.name});
+  const charts=Object.entries(data.charts).map(([metric,result])=>'<section class="replay-chart" data-replay-metric="'+metric+'"><h4>'+esc(alertMetricLabel(metric))+(metric==='disk'&&replay.window.partition?' · '+esc(ft('partition')):'')+'</h4><div class="metric-sub replay-readout">—</div>'+sparkline(replaySamples(result,metric),metric,data)+'</section>').join('');
+  const events=replayEventList(data);
+  const eventHTML=events.map(item=>'<article class="replay-event '+esc(item.kind)+'">'+
+    (item.kind==='annotation'?'<button type="button" class="button subtle" data-remove-annotation="'+esc(item.id)+'">'+esc(ft('remove'))+'</button>':'')+
+    '<button type="button" class="button subtle" data-event-time="'+item.timestamp+'">'+esc(featureDate(item.timestamp))+'</button><strong>'+esc(ft(item.kind))+'</strong><p>'+esc(item.message)+'</p></article>').join('');
+  target.innerHTML='<form id="replay-range-form"><div class="form-grid"><div class="field"><label for="replay-node">'+esc(ft('node'))+'</label><select id="replay-node">'+assets.map(asset=>'<option value="'+esc(asset.id)+'" '+(data.node===asset.id?'selected':'')+'>'+esc(asset.name)+'</option>').join('')+'</select></div><div class="field"><label for="replay-partition">'+esc(ft('partition'))+'</label><select id="replay-partition"></select></div><div class="field"><label for="replay-start">'+esc(ft('from'))+'</label><input type="datetime-local" id="replay-start" required value="'+localDateTimeValue(new Date(data.start*1000))+'"></div><div class="field"><label for="replay-end">'+esc(ft('until'))+'</label><input type="datetime-local" id="replay-end" required value="'+localDateTimeValue(new Date(data.end*1000))+'"></div></div><div class="replay-toolbar"><button type="submit" class="button primary">'+esc(ft('apply'))+'</button><button type="button" class="button subtle" id="replay-export">'+esc(ft('export_report'))+'</button></div></form>'+
+    '<div class="replay-window-controls">'+[['previous_window','←'],['next_window','→'],['zoom_in','＋'],['zoom_out','−']].map(([key,icon])=>'<button type="button" class="button subtle" data-replay-window="'+key+'" aria-label="'+esc(ft(key))+'" title="'+esc(ft(key))+'">'+icon+'</button>').join('')+'</div>'+
+    '<p class="helper">'+esc(ft('sample_resolution'))+'</p><label for="replay-cursor" class="helper">'+esc(ft('cursor'))+'</label><input type="range" id="replay-cursor" min="'+data.start+'" max="'+data.end+'" step="1" value="'+replay.cursor+'" style="width:100%"><p id="replay-cursor-label" class="helper"></p><div class="replay-charts">'+charts+'</div>'+
+    '<h4>'+esc(ft('replay_context'))+'</h4><div id="replay-context" class="replay-context"></div><p class="helper">'+esc(ft('context_sampling'))+'</p>'+
+    '<h4>'+esc(ft('replay_events'))+'</h4><div class="replay-events">'+(eventHTML||'<p class="helper">'+esc(ft('no_events'))+'</p>')+'</div>'+
+    '<form id="annotation-form"><div class="form-grid"><div class="field"><label for="annotation-time">'+esc(ft('cursor'))+'</label><input id="annotation-time" type="datetime-local" required value="'+localDateTimeValue(new Date(replay.cursor*1000))+'"></div><div class="field"><label for="annotation-message">'+esc(ft('annotation_message'))+'</label><input id="annotation-message" maxlength="240" required autocomplete="off"></div></div><p id="annotation-error" class="error-message" role="alert"></p><div class="modal-actions"><button type="submit" class="button primary">'+esc(ft('add_annotation'))+'</button></div></form>';
+  const nodeSelect=document.getElementById('replay-node'),partitionSelect=document.getElementById('replay-partition');
+  function populatePartitions(){
+    const parts=nodeFor(nodeSelect.value)?.metrics?.disk?.partitions||[],selected=nodeSelect.value===data.node?replay.window.partition:'';
+    partitionSelect.innerHTML='<option value="">'+esc(ft('aggregate'))+'</option>'+parts.filter(part=>part.id).map(part=>'<option value="'+esc(part.id)+'" '+(part.id===selected?'selected':'')+'>'+esc(part.mount)+'</option>').join('');
+    if(selected&&!parts.some(part=>part.id===selected))partitionSelect.insertAdjacentHTML('beforeend','<option selected value="'+esc(selected)+'">'+esc(ft('partition_missing'))+'</option>');
+  }
+  populatePartitions();nodeSelect.onchange=populatePartitions;
+  document.getElementById('replay-range-form').onsubmit=event=>{event.preventDefault();replay.window={node:nodeSelect.value,partition:partitionSelect.value,start:new Date(document.getElementById('replay-start').value).getTime()/1000,end:new Date(document.getElementById('replay-end').value).getTime()/1000};loadReplay()};
+  target.querySelectorAll('[data-replay-window]').forEach(button=>button.onclick=()=>{
+    const span=data.end-data.start,kind=button.dataset.replayWindow,center=replay.cursor||((data.start+data.end)/2);
+    let start=data.start,end=data.end;
+    if(kind==='previous_window'){start-=span;end-=span}
+    if(kind==='next_window'){start+=span;end+=span}
+    if(kind==='zoom_in'){start=center-Math.max(120,span/4);end=center+Math.max(120,span/4)}
+    if(kind==='zoom_out'){start=center-span;end=center+span}
+    const now=Date.now()/1000,cutoff=now-(Number(state.config.history_retention_days)||7)*86400+60;
+    start=Math.max(start,cutoff);end=Math.min(end,now);
+    if(start>=end){toast(ft('outside_retention'));return}
+    replay.window={...replay.window,start,end};loadReplay();
+  });
+  target.querySelectorAll('.mini-chart').forEach(bindChartTooltip);
+  target.querySelectorAll('[data-event-time]').forEach(button=>button.onclick=()=>syncReplayCursor(Number(button.dataset.eventTime)));
+  document.getElementById('replay-cursor').oninput=event=>syncReplayCursor(Number(event.target.value));
+  document.getElementById('replay-export').onclick=exportReplayReport;
+  document.getElementById('annotation-form').onsubmit=async event=>{
+    event.preventDefault();const button=event.target.querySelector('[type=submit]');button.disabled=true;
+    try{
+      await api('/api/annotations','POST',{node:data.node,timestamp:new Date(document.getElementById('annotation-time').value).getTime()/1000,message:document.getElementById('annotation-message').value});
+      if(state.modalKind==='replay'&&state.replay===replay)await loadReplay();
+    }catch(error){const errorField=document.getElementById('annotation-error');if(errorField&&state.replay===replay)errorField.textContent=tr(error.message);button.disabled=false}
+  };
+  target.querySelectorAll('[data-remove-annotation]').forEach(button=>button.onclick=async()=>{
+    button.disabled=true;
+    try{await api('/api/annotations','POST',{action:'remove',id:button.dataset.removeAnnotation});if(state.replay===replay&&state.modalKind==='replay')await loadReplay()}
+    catch(error){button.disabled=false;toast(error.message)}
+  });
+  // Use the shared time window for event markers, including sparse charts.
+  for(const chart of target.querySelectorAll('.mini-chart')){
+    const stride=Math.max(1,Math.ceil(events.length/200));
+    for(const item of events.filter((event,index)=>index%stride===0)){
+      const x=74+(item.timestamp-data.start)/(data.end-data.start)*240;
+      const line=document.createElementNS('http://www.w3.org/2000/svg','line');
+      for(const [key,value] of Object.entries({class:'replay-marker',x1:x,x2:x,y1:9,y2:101}))line.setAttribute(key,String(value));
+      chart.appendChild(line);
+    }
+  }
+  syncReplayCursor(replay.cursor);
+}
+function replayContextHTML(row,cursor){
+  if(!row)return '<p class="helper">'+esc(ft('unavailable'))+'</p>';
+  const context=row[1],processes=context.processes||[];
+  const processStamp=Number(context.collector_status?.processes?.sampled_at)||row[0];
+  return '<p class="helper">'+esc(featureDate(processStamp))+' · '+esc(ft('snapshot_age'))+': '+Math.round(Math.abs(processStamp-cursor))+'</p><div class="table-scroll"><table class="data-table"><thead><tr><th>'+esc(tr('进程'))+'</th><th>PID</th><th>CPU</th><th>'+esc(tr('内存'))+'</th></tr></thead><tbody>'+processes.map(item=>'<tr><td>'+esc(item.name)+'</td><td>'+esc(item.pid)+'</td><td>'+esc(alertValue('cpu',item.cpu))+'</td><td>'+esc(fmtBytes(item.memory))+'</td></tr>').join('')+'</tbody></table></div>'+
+    (context.logins||[]).map(item=>'<p class="helper">'+esc(item.kind)+': '+esc(item.message)+'</p>').join('')+
+    Object.entries(context.capabilities||{}).map(([metric,available])=>'<p class="helper">'+esc(alertMetricLabel(metric))+': '+esc(ft(available?'healthy':'unavailable'))+'</p>').join('')+
+    Object.entries(context.collector_status||{}).map(([metric,status])=>'<p class="helper">'+esc(alertMetricLabel(metric))+': '+esc(featureDate(status.sampled_at))+' · '+esc(ft('cadence'))+' '+esc(status.interval_seconds)+' '+esc(ft('seconds'))+'</p>').join('')+
+    Object.entries(context.collector_errors||{}).map(([metric,error])=>'<p class="asset-error">'+esc(alertMetricLabel(metric))+': '+esc(error)+'</p>').join('');
+}
+function syncReplayCursor(timestamp){
+  const replay=state.replay,data=replay?.data;if(!data||state.modalKind!=='replay')return;
+  timestamp=Math.max(data.start,Math.min(data.end,timestamp));replay.cursor=timestamp;
+  const target=document.getElementById('replay-panel');if(!target)return;
+  document.getElementById('replay-cursor').value=String(timestamp);
+  document.getElementById('replay-cursor-label').textContent=ft('cursor')+': '+featureDate(timestamp);
+  for(const card of target.querySelectorAll('[data-replay-metric]')){
+    const metric=card.dataset.replayMetric,samples=replaySamples(data.charts[metric],metric);
+    const nearest=samples.reduce((best,item)=>!best||Math.abs(item.timestamp-timestamp)<Math.abs(best.timestamp-timestamp)?item:best,null);
+    card.querySelector('.replay-readout').textContent=nearest?alertValue(metric,nearest.value)+' · '+featureDate(nearest.timestamp)+' · Δ '+Math.round(Math.abs(nearest.timestamp-timestamp))+' '+ft('seconds'):'—';
+    const line=card.querySelector('.chart-crosshair'),x=74+(timestamp-data.start)/(data.end-data.start)*240;
+    if(line){line.setAttribute('x1',String(x));line.setAttribute('x2',String(x))}
+  }
+  const nearest=data.observations.reduce((best,row)=>!best||Math.abs(row[0]-timestamp)<Math.abs(best[0]-timestamp)?row:best,null);
+  document.getElementById('replay-context').innerHTML=replayContextHTML(nearest,timestamp);
+  // Do not overwrite the annotation form while the user is typing.
+  const time=document.getElementById('annotation-time');if(!document.getElementById('annotation-message').value&&document.activeElement!==time)time.value=localDateTimeValue(new Date(timestamp*1000));
+}
+function exportReplayReport(){
+  const data=state.replay?.data;if(!data||state.modalKind!=='replay')return;
+  const sections=Array.from(document.querySelectorAll('#replay-panel .replay-chart')).map(card=>{
+    const metric=card.dataset.replayMetric,clone=card.cloneNode(true);
+    clone.querySelectorAll('[data-chart-id]').forEach(chart=>{chart.removeAttribute('data-chart-id');chart.removeAttribute('tabindex')});
+    clone.querySelectorAll('.chart-crosshair,.chart-hover').forEach(item=>item.remove());
+    // Exact retained values are available offline as well as the SVG preview.
+    const rows=data.charts[metric].points.map(point=>'<tr><td>'+esc(featureDate(point[0]))+'</td><td>'+esc(point.slice(1).join(' / '))+'</td></tr>').join('');
+    return clone.outerHTML+'<details><summary>'+esc(ft('samples'))+' · '+data.charts[metric].points.length+'</summary><table class="data-table"><tbody>'+rows+'</tbody></table></details>';
+  }).join('');
+  const events=replayEventList(data).map(item=>'<p><time>'+esc(featureDate(item.timestamp))+'</time> · <strong>'+esc(ft(item.kind))+'</strong> · '+esc(item.message)+'</p>').join('');
+  const contexts=data.observations.map(row=>'<details><summary>'+esc(featureDate(row[0]))+'</summary>'+replayContextHTML(row,row[0])+'</details>').join('');
+  const incidents=document.createElement('div');incidents.innerHTML=data.incidents.map(incidentCard).join('');
+  incidents.querySelectorAll('button').forEach(button=>button.remove());
+  const css=Array.from(document.querySelectorAll('style')).map(style=>style.textContent).join('\n');
+  const html='<!doctype html><html lang="'+esc(state.language)+'" data-theme="'+esc(state.config.theme)+'"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src &#39;none&#39;; style-src &#39;unsafe-inline&#39;"><title>TinyWatch · '+esc(ft('replay'))+'</title><style>'+css+'\nbody{padding:24px;max-width:1100px;margin:auto}.replay-chart{margin-top:12px}details{margin:10px 0}time{font-variant-numeric:tabular-nums}</style></head><body><h1>TinyWatch · '+esc(ft('replay'))+'</h1><h2>'+esc(data.name)+'</h2><p>'+esc(featureDate(data.start))+' — '+esc(featureDate(data.end))+'</p><p class="helper">'+esc(ft('generated'))+': '+esc(featureDate(data.generated_at))+'</p><p>'+esc(ft('no_credentials'))+'</p><p>'+esc(ft('replay_help'))+'</p><p class="helper">'+esc(ft('sample_resolution'))+'</p>'+sections+'<h2>'+esc(ft('alerts'))+'</h2>'+incidents.innerHTML+'<h2>'+esc(ft('replay_events'))+'</h2>'+(events||esc(ft('no_events')))+'<h2>'+esc(ft('replay_context'))+'</h2><p>'+esc(ft('context_sampling'))+'</p>'+contexts+'</body></html>';
+  const url=URL.createObjectURL(new Blob([html],{type:'text/html;charset=utf-8'})),link=document.createElement('a');
+  link.href=url;link.download='tinywatch-report-'+data.generated_at+'.html';document.body.appendChild(link);link.click();link.remove();setTimeout(()=>URL.revokeObjectURL(url),1000);
+}
+
+// Service settings have their own endpoint and revision number.
+async function showServices(tab='monitors'){
+  state.serviceTab=tab;state.serviceEditing=false;state.serviceData=null;
+  modal(featureHeader(ft('services'),ft('probe_help'))+'<div id="service-panel"><p class="helper">'+esc(ft('loading'))+'</p></div>',true);
+  state.modalKind='services';await loadServices();
+}
+async function loadServices(){
+  if(state.serviceLoading)return;
+  const request=++state.serviceRequest;state.serviceLoading=request;
+  try{
+    const data=await api('/api/services');
+    if(state.modalKind!=='services'||request!==state.serviceRequest)return;
+    state.serviceData=data;state.serviceFetchedAt=Date.now();renderServices();
+  }catch(error){if(state.modalKind==='services'&&request===state.serviceRequest){const target=document.getElementById('service-panel');if(target&&!state.serviceData){target.innerHTML='<p class="asset-error">'+esc(tr(error.message))+'</p><button type="button" class="button" id="service-retry">'+esc(ft('retry'))+'</button>';document.getElementById('service-retry').onclick=loadServices}else toast(error.message)}}
+  finally{if(state.serviceLoading===request)state.serviceLoading=false}
+}
+function serviceAssets(all=false){
+  return (all?[{id:'*',name:ft('all_nodes')}]:[]).concat([{id:'local',name:nodeFor('local')?.name||'Local'}],state.config.assets||[]);
+}
+async function saveServices(payload){
+  if(state.serviceSaving)return;
+  state.serviceSaving=true;const request=++state.serviceRequest;
+  try{
+    const data=await api('/api/services','POST',{...payload,revision:state.serviceData.revision});
+    if(request===state.serviceRequest&&state.modalKind==='services'){state.serviceData=data;state.serviceEditing=false;renderServices()}
+    toast(ft('saved'));
+  }finally{state.serviceSaving=false}
+}
+function serviceStatus(service,result){
+  if(!service.enabled)return ft('disabled');
+  if(!result)return ft('pending_probe');
+  if(Date.now()/1000-result.sampled_at>service.interval*2+service.timeout)return ft('stale');
+  return ft(result.ok?'service_ok':'service_down');
+}
+function renderServices(){
+  const target=document.getElementById('service-panel'),data=state.serviceData;if(!target||!data)return;
+  const tabs='<div class="feature-tabs"><button type="button" class="button subtle" id="service-refresh">'+esc(ft('refresh_services'))+'</button>'+['monitors','heartbeats','notifications','maintenance'].map(tab=>'<button type="button" class="button '+(tab===state.serviceTab?'primary':'subtle')+'" data-service-tab="'+tab+'">'+esc(ft(tab))+'</button>').join('')+'</div>';
+  let content='';
+  if(state.serviceTab==='heartbeats'){
+    content='<p class="helper">'+esc(ft('heartbeat_help'))+'</p>'+data.heartbeats.map(job=>{
+      const result=data.states[job.id];
+      return '<article class="diagnostic-card"><div class="feature-card-head"><strong>'+esc(job.name)+'</strong><span class="tag '+(result?.active_id?'bad':'good')+'">'+esc(ft(result?.active_id?'service_down':job.last_success_at?'service_ok':'pending_probe'))+'</span></div><p class="helper">'+esc(ft('last_success'))+': '+esc(featureDate(job.last_success_at))+' · '+esc(ft('cadence'))+': '+job.interval/60+' '+esc(ft('interval_minutes'))+'</p><div class="field"><label>'+esc(ft('heartbeat_token'))+'</label><input readonly aria-label="'+esc(ft('heartbeat_token'))+'" value="'+esc(job.token)+'"></div><div class="modal-actions"><button type="button" class="button" data-edit-job="'+esc(job.id)+'">'+esc(ft('edit'))+'</button><button type="button" class="button danger" data-remove-job="'+esc(job.id)+'">'+esc(ft('remove'))+'</button></div></article>';
+    }).join('')+'<p class="helper">'+esc(ft('heartbeat_endpoint'))+'</p><form id="heartbeat-form"><input id="heartbeat-id" type="hidden"><div class="form-grid"><div class="field"><label for="heartbeat-name">'+esc(ft('service_name'))+'</label><input id="heartbeat-name" required maxlength="80"></div><div class="field"><label for="heartbeat-node">'+esc(ft('node'))+'</label><select id="heartbeat-node">'+serviceAssets().map(asset=>'<option value="'+esc(asset.id)+'">'+esc(asset.name)+'</option>').join('')+'</select></div><div class="field"><label for="heartbeat-interval">'+esc(ft('heartbeat_interval'))+'</label><input id="heartbeat-interval" type="number" min="1" max="43200" required value="1440"></div><div class="field"><label for="heartbeat-grace">'+esc(ft('heartbeat_grace'))+'</label><input id="heartbeat-grace" type="number" min="0" max="10080" required value="10"></div></div><p id="service-error" class="error-message" role="alert"></p><div class="modal-actions"><button class="button primary" type="submit">'+esc(ft('save'))+'</button></div></form>';
+  }else if(state.serviceTab==='monitors'){
+    content='<div class="feature-toolbar"><button type="button" class="button primary" id="add-service" '+(data.services.length>=24?'disabled':'')+'>'+esc(ft('add_service'))+'</button><span class="helper">'+esc(ft('service_limits'))+'</span></div><div id="service-editor"></div><div class="service-grid">'+data.services.map(service=>{
+      const result=data.states[service.id],buckets=data.history[service.id]||[];
+      const samples=buckets.reduce((sum,bucket)=>sum+bucket.samples,0),successes=buckets.reduce((sum,bucket)=>sum+bucket.successes,0);
+      const history=buckets.map((bucket,index)=>({timestamp:bucket.last_at,value:bucket.sum_ms/bucket.samples,
+        gapBefore:index>0&&bucket.first_at-buckets[index-1].last_at>service.interval*2+service.timeout}));
+      const maintenance=data.maintenance.some(window=>data.active_maintenance.includes(window.id)&&['*',service.node].includes(window.node));
+      return '<article class="diagnostic-card"><div class="feature-card-head"><strong>'+esc(service.name)+'</strong><span class="tag '+(result?.ok?'good':'bad')+'">'+esc(serviceStatus(service,result))+'</span></div><p class="helper">'+esc(service.protocol.toUpperCase())+' · '+esc(service.target)+(service.protocol==='tcp'?':'+service.port:'')+'</p><p class="helper">'+esc(ft('associated_asset'))+': '+esc(serviceAssets().find(asset=>asset.id===service.node)?.name||service.node)+(maintenance?' · '+esc(ft('maintenance_active')):'')+'</p><div class="duo"><div class="duo-box"><label>'+esc(ft('latency'))+'</label><strong>'+(result?esc(result.latency_ms)+' ms':'—')+'</strong></div><div class="duo-box"><label>'+esc(ft('sample_success'))+'</label><strong>'+(samples?(successes/samples*100).toFixed(1)+'%':'—')+'</strong></div></div>'+sparkline(history,'latency')+'<p class="helper">'+esc(ft('last_observed'))+': '+esc(featureDate(result?.sampled_at))+' · '+esc(ft('cadence'))+': '+service.interval+' '+esc(ft('seconds'))+'</p>'+
+        (result&&!result.ok?'<p class="asset-error">'+esc(ft(result.error))+(result.status_code?' · HTTP '+result.status_code:'')+' · '+esc(ft('consecutive_failures'))+': '+result.failed_count+'</p>':'')+
+        '<div class="replay-toolbar"><button type="button" class="button subtle" data-edit-service="'+esc(service.id)+'">'+esc(ft('edit'))+'</button><button type="button" class="button danger" data-remove-service="'+esc(service.id)+'">'+esc(ft('remove'))+'</button></div></article>';
+    }).join('')+'</div>';
+  }else if(state.serviceTab==='notifications'){
+    const config=data.notifications;
+    content='<p class="helper">'+esc(ft('notification_help'))+'</p><form id="notification-form"><div class="field"><label for="notification-url">Webhook URL</label><input id="notification-url" type="url" maxlength="1024" value="'+esc(config.url)+'" placeholder="https://example.com/webhook"></div><label class="checkbox-label"><input id="notification-enabled" type="checkbox" '+(config.enabled?'checked':'')+'>'+esc(ft('enabled'))+'</label><p id="service-error" class="error-message" role="alert"></p><div class="modal-actions"><button type="submit" class="button primary">'+esc(ft('save'))+'</button></div></form><h4>'+esc(ft('deliveries'))+'</h4>'+data.deliveries.map(job=>'<div class="disk-line"><span>'+esc(featureDate(job.created_at))+'<div class="metric-sub">'+esc(job.id)+'</div></span><span>'+esc(ft('delivery_'+job.status))+' · '+job.attempts+'/5'+(job.error?' · '+esc(ft(job.error)):'')+'</span></div>').join('');
+  }else{
+    content='<p class="helper">'+esc(ft('maintenance_help'))+'</p>'+data.maintenance.map(window=>'<article class="replay-event"><strong>'+esc(window.name||ft('maintenance'))+'</strong> · '+esc(serviceAssets(true).find(asset=>asset.id===window.node)?.name||window.node)+'<p>'+esc(featureDate(window.start))+' — '+esc(featureDate(window.end))+'</p>'+(data.active_maintenance.includes(window.id)?'<span class="tag">'+esc(ft('maintenance_active'))+'</span>':'')+'<button type="button" class="button danger" data-remove-maintenance="'+esc(window.id)+'">'+esc(ft('remove'))+'</button></article>').join('')+
+      '<form id="maintenance-form"><div class="form-grid"><div class="field"><label for="maintenance-name">'+esc(ft('annotation_message'))+'</label><input id="maintenance-name" maxlength="80"></div><div class="field"><label for="maintenance-node">'+esc(ft('node'))+'</label><select id="maintenance-node">'+serviceAssets(true).map(asset=>'<option value="'+esc(asset.id)+'">'+esc(asset.name)+'</option>').join('')+'</select></div><div class="field"><label for="maintenance-start">'+esc(ft('from'))+'</label><input id="maintenance-start" type="datetime-local" required value="'+localDateTimeValue(new Date())+'"></div><div class="field"><label for="maintenance-end">'+esc(ft('until'))+'</label><input id="maintenance-end" type="datetime-local" required value="'+localDateTimeValue(new Date(Date.now()+3600000))+'"></div></div><p id="service-error" class="error-message" role="alert"></p><div class="modal-actions"><button type="submit" class="button primary">'+esc(ft('add_window'))+'</button></div></form>';
+  }
+  target.innerHTML=tabs+content;
+  document.getElementById('service-refresh').onclick=loadServices;
+  target.querySelectorAll('[data-service-tab]').forEach(button=>button.onclick=()=>{state.serviceTab=button.dataset.serviceTab;state.serviceEditing=false;renderServices()});
+  target.querySelectorAll('.mini-chart').forEach(bindChartTooltip);
+  if(state.serviceTab==='monitors'){
+    document.getElementById('add-service').onclick=()=>editService();
+    target.querySelectorAll('[data-edit-service]').forEach(button=>button.onclick=()=>editService(data.services.find(service=>service.id===button.dataset.editService)));
+    target.querySelectorAll('[data-remove-service]').forEach(button=>button.onclick=async()=>{button.disabled=true;try{await saveServices({action:'services',services:data.services.filter(service=>service.id!==button.dataset.removeService)})}catch(error){button.disabled=false;toast(error.message)}});
+  }
+  const heartbeatForm=document.getElementById('heartbeat-form');
+  if(heartbeatForm){
+    heartbeatForm.oninput=()=>{state.serviceEditing=true};
+    target.querySelectorAll('input[readonly]').forEach(input=>input.onclick=()=>input.select());
+    target.querySelectorAll('[data-edit-job]').forEach(button=>button.onclick=()=>{
+      const job=data.heartbeats.find(item=>item.id===button.dataset.editJob);
+      document.getElementById('heartbeat-id').value=job.id;document.getElementById('heartbeat-name').value=job.name;
+      document.getElementById('heartbeat-node').value=job.node;document.getElementById('heartbeat-interval').value=job.interval/60;
+      document.getElementById('heartbeat-grace').value=job.grace/60;state.serviceEditing=true;
+      document.getElementById('heartbeat-name').focus();
+    });
+    target.querySelectorAll('[data-remove-job]').forEach(button=>button.onclick=async()=>{button.disabled=true;try{await saveServices({action:'heartbeats',heartbeats:data.heartbeats.filter(job=>job.id!==button.dataset.removeJob)})}catch(error){button.disabled=false;toast(error.message)}});
+    heartbeatForm.onsubmit=event=>{
+      const id=document.getElementById('heartbeat-id').value||'job-'+(crypto.randomUUID?crypto.randomUUID():Date.now());
+      const job={id,name:document.getElementById('heartbeat-name').value,node:document.getElementById('heartbeat-node').value,interval:Number(document.getElementById('heartbeat-interval').value)*60,grace:Number(document.getElementById('heartbeat-grace').value)*60};
+      submitServiceForm(event,{action:'heartbeats',heartbeats:data.heartbeats.filter(item=>item.id!==id).concat(job)});
+    };
+  }
+  const notificationForm=document.getElementById('notification-form');
+  if(notificationForm)notificationForm.onsubmit=event=>submitServiceForm(event,{action:'notifications',url:document.getElementById('notification-url').value,enabled:document.getElementById('notification-enabled').checked});
+  const maintenanceForm=document.getElementById('maintenance-form');
+  if(maintenanceForm)maintenanceForm.onsubmit=event=>{
+    const window={id:'m-'+(crypto.randomUUID?crypto.randomUUID():Date.now()),name:document.getElementById('maintenance-name').value,node:document.getElementById('maintenance-node').value,start:new Date(document.getElementById('maintenance-start').value).getTime()/1000,end:new Date(document.getElementById('maintenance-end').value).getTime()/1000};
+    submitServiceForm(event,{action:'maintenance',windows:data.maintenance.concat(window)});
+  };
+  target.querySelectorAll('[data-remove-maintenance]').forEach(button=>button.onclick=async()=>{button.disabled=true;try{await saveServices({action:'maintenance',windows:data.maintenance.filter(window=>window.id!==button.dataset.removeMaintenance)})}catch(error){button.disabled=false;toast(error.message)}});
+}
+async function submitServiceForm(event,payload){
+  event.preventDefault();const submit=event.target.querySelector('[type=submit]');submit.disabled=true;
+  try{await saveServices(payload)}catch(error){const target=document.getElementById('service-error');if(target)target.textContent=tr(error.message);submit.disabled=false}
+}
+function editService(existing){
+  state.serviceEditing=true;
+  const service=existing||{id:'s-'+(crypto.randomUUID?crypto.randomUUID():Date.now()),name:'',node:'local',protocol:'http',target:'',port:443,status:200,match:'',interval:60,timeout:5,failures:3,enabled:true};
+  const target=document.getElementById('service-editor');
+  target.innerHTML='<form id="service-form" class="rule-editor"><div class="form-grid"><div class="field"><label for="service-name">'+esc(ft('service_name'))+'</label><input id="service-name" required maxlength="80" value="'+esc(service.name)+'"></div><div class="field"><label for="service-node">'+esc(ft('associated_asset'))+'</label><select id="service-node">'+serviceAssets().map(asset=>'<option value="'+esc(asset.id)+'" '+(service.node===asset.id?'selected':'')+'>'+esc(asset.name)+'</option>').join('')+'</select></div><div class="field"><label for="service-protocol">'+esc(ft('protocol'))+'</label><select id="service-protocol"><option value="http">HTTP / HTTPS</option><option value="tcp">TCP</option></select></div><div class="field"><label for="service-target">'+esc(ft('target'))+'</label><input id="service-target" required maxlength="1024" value="'+esc(service.target)+'"></div><div class="field" id="service-port-field"><label for="service-port">TCP port</label><input id="service-port" type="number" min="1" max="65535" value="'+service.port+'"></div><div class="field" id="service-status-field"><label for="service-status">'+esc(ft('expected_status'))+'</label><input id="service-status" type="number" min="200" max="599" value="'+service.status+'"></div><div class="field full" id="service-match-field"><label for="service-match">'+esc(ft('content_match'))+'</label><input id="service-match" maxlength="128" value="'+esc(service.match)+'"></div><div class="field"><label for="service-interval">'+esc(ft('interval_seconds'))+'</label><input id="service-interval" type="number" required min="30" max="3600" value="'+service.interval+'"></div><div class="field"><label for="service-timeout">'+esc(ft('timeout_seconds'))+'</label><input id="service-timeout" type="number" required min="1" max="10" step="any" value="'+service.timeout+'"></div><div class="field"><label for="service-failures">'+esc(ft('failure_threshold'))+'</label><input id="service-failures" type="number" required min="1" max="10" value="'+service.failures+'"></div><label class="checkbox-label"><input id="service-enabled" type="checkbox" '+(service.enabled?'checked':'')+'>'+esc(ft('enabled'))+'</label></div><p class="helper">'+esc(ft('probe_help'))+' '+esc(ft('service_edit_help'))+'</p><p id="service-error" class="error-message" role="alert"></p><div class="modal-actions"><button type="button" class="button subtle" id="service-cancel">'+esc(ft('cancel'))+'</button><button type="submit" class="button primary">'+esc(ft('save'))+'</button></div></form>';
+  const protocol=document.getElementById('service-protocol');protocol.value=service.protocol;
+  function updateFields(){
+    const tcp=protocol.value==='tcp';
+    document.getElementById('service-port-field').classList.toggle('hidden',!tcp);
+    document.getElementById('service-status-field').classList.toggle('hidden',tcp);
+    document.getElementById('service-match-field').classList.toggle('hidden',tcp);
+    document.getElementById('service-target').placeholder=tcp?'127.0.0.1':'https://example.com/health';
+  }
+  protocol.onchange=updateFields;updateFields();
+  document.getElementById('service-cancel').onclick=()=>{state.serviceEditing=false;renderServices()};
+  document.getElementById('service-form').onsubmit=event=>{
+    const next={id:service.id,name:document.getElementById('service-name').value,node:document.getElementById('service-node').value,protocol:protocol.value,target:document.getElementById('service-target').value,port:Number(document.getElementById('service-port').value),status:Number(document.getElementById('service-status').value),match:document.getElementById('service-match').value,interval:Number(document.getElementById('service-interval').value),timeout:Number(document.getElementById('service-timeout').value),failures:Number(document.getElementById('service-failures').value),enabled:document.getElementById('service-enabled').checked};
+    submitServiceForm(event,{action:'services',services:state.serviceData.services.filter(item=>item.id!==service.id).concat(next)});
+  };
+  document.getElementById('service-name').focus({preventScroll:true});
+}
+
 boot();
 </script></body></html>'''
 
@@ -3048,7 +4405,7 @@ class TinyWatchHandler(BaseHTTPRequestHandler):
     sys_version = ""
 
     def log_message(self, fmt, *args):
-        # Keep the compact access log useful without ever echoing request bodies.
+        # Request bodies may contain credentials; log only the request line.
         sys.stdout.write("[%s] %s %s\n" % (self.log_date_time_string(), self.address_string(), fmt % args))
 
     def _send(self, status, body, content_type="application/json; charset=utf-8", headers=None):
@@ -3140,6 +4497,23 @@ class TinyWatchHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": _safe_text(exc, 180)})
             return
+        if path == "/api/services":
+            if self._require_session():
+                self._json(HTTPStatus.OK, _service_response())
+            return
+        if path == "/api/investigation":
+            if not self._require_session():
+                return
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            try:
+                partition = query.get("partition", [""])[0]
+                if partition and not re.fullmatch(r"[a-f0-9]{24}", partition):
+                    raise ValueError("Invalid partition")
+                self._json(HTTPStatus.OK, _investigation_response(query.get("node", ["local"])[0],
+                           float(query.get("start", [""])[0]), float(query.get("end", [""])[0]), partition))
+            except (TypeError, ValueError, OverflowError) as exc:
+                self._json(HTTPStatus.BAD_REQUEST, {"error": _safe_text(exc, 180)})
+            return
         if path == "/api/history":
             if not self._require_session():
                 return
@@ -3156,7 +4530,10 @@ class TinyWatchHandler(BaseHTTPRequestHandler):
                 if range_name == "custom":
                     start = float(query.get("start", [""])[0])
                     end = float(query.get("end", [""])[0])
-                self._json(HTTPStatus.OK, _history_response(node_id, metric, range_name, interface[:120], start, end))
+                partition = query.get("partition", [""])[0]
+                if partition and not re.fullmatch(r"[a-f0-9]{24}", partition):
+                    raise ValueError("Invalid partition")
+                self._json(HTTPStatus.OK, _history_response(node_id, metric, range_name, interface[:120], start, end, partition))
             except (KeyError, TypeError, ValueError, OverflowError) as exc:
                 self._json(HTTPStatus.BAD_REQUEST, {"error": _safe_text(exc, 180)})
             return
@@ -3171,6 +4548,15 @@ class TinyWatchHandler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.BAD_REQUEST, {"error": _safe_text(exc, 180)})
             return
 
+        if path == "/api/heartbeat":
+            try:
+                ok = _receive_heartbeat(value, self.headers.get("X-TinyWatch-Heartbeat", ""))
+                self._json(HTTPStatus.OK if ok else HTTPStatus.FORBIDDEN, {"ok": ok})
+            except ValueError as exc:
+                self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            except OSError:
+                self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "Heartbeat could not be persisted"})
+            return
         if path == "/api/setup":
             with STORE.lock:
                 if STORE.data.get("password") is not None:
@@ -3235,11 +4621,30 @@ class TinyWatchHandler(BaseHTTPRequestHandler):
                 pass
             self._json(HTTPStatus.OK, {"ok": True}, {"Set-Cookie": _session_cookie("", 0)})
             return
+        if path == "/api/services":
+            try:
+                self._json(HTTPStatus.OK, _save_services(value))
+            except ConfigurationConflict as exc:
+                self._json(HTTPStatus.CONFLICT, {"error": str(exc)})
+            except ValueError as exc:
+                self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            except OSError:
+                self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "Configuration could not be persisted"})
+            return
+        if path == "/api/annotations":
+            try:
+                self._json(HTTPStatus.OK, _add_annotation(value))
+            except ValueError as exc:
+                self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return
         if path == "/api/config":
             try:
                 self._save_config(value)
             except ValueError as exc:
                 self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+            except OSError:
+                self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "Configuration could not be persisted"})
                 return
             self._json(HTTPStatus.OK, {"ok": True})
             return
@@ -3271,6 +4676,16 @@ class TinyWatchHandler(BaseHTTPRequestHandler):
         self._json(HTTPStatus.OK, {"ok": True}, {"Set-Cookie": _session_cookie(token, 43200)})
 
     def _save_config(self, value):
+        with STORE.lock:
+            previous = STORE.data
+            STORE.data = copy.deepcopy(previous)
+            try:
+                return self._apply_config(value)
+            except Exception:
+                STORE.data = previous
+                raise
+
+    def _apply_config(self, value):
         raw_assets = value.get("assets", [])
         raw_widgets = value.get("widgets", [])
         if not isinstance(raw_assets, list) or len(raw_assets) > MAX_ASSETS:
@@ -3328,6 +4743,18 @@ class TinyWatchHandler(BaseHTTPRequestHandler):
             STORE.data["theme"] = theme
             STORE.data["history_retention_days"] = retention_days
             removed_nodes = set(previous) - identifiers
+            for node_id in removed_nodes:
+                STORE.data.get("node_fingerprints", {}).pop(node_id, None)
+            removed_services = {item["id"] for item in STORE.data.get("services", []) if item["node"] in removed_nodes}
+            STORE.data["services"] = [item for item in STORE.data.get("services", []) if item["id"] not in removed_services]
+            removed_jobs = {item["id"] for item in STORE.data.get("heartbeats", []) if item["node"] in removed_nodes}
+            STORE.data["heartbeats"] = [item for item in STORE.data.get("heartbeats", []) if item["id"] not in removed_jobs]
+            removed_services |= removed_jobs
+            STORE.data["service_revision"] = STORE.data.get("service_revision", 0) + 1
+            STORE.data["maintenance"] = [item for item in STORE.data.get("maintenance", []) if item["node"] not in removed_nodes]
+            for identity in removed_services:
+                STORE.data.get("service_states", {}).pop(identity, None)
+                STORE.data.get("service_history", {}).pop(identity, None)
             for incident in STORE.data.get("incidents", []):
                 if incident.get("status") == "active" and incident.get("node") in removed_nodes:
                     _resolve_incident(incident, time.time(), "asset_removed")
@@ -3346,6 +4773,31 @@ class TinyWatchServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
+    def __init__(self, *args, **kwargs):
+        self.request_slots = threading.BoundedSemaphore(32)
+        super().__init__(*args, **kwargs)
+
+    def get_request(self):
+        request, address = super().get_request()
+        request.settimeout(10)
+        return request, address
+
+    def process_request(self, request, client_address):
+        if not self.request_slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self.request_slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.request_slots.release()
+
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="TinyWatch - dependency-free server monitoring dashboard")
@@ -3358,7 +4810,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if not 0 <= args.port <= 65535:
         parser.error("--port must be between 0 and 65535")
-    global STORE, SETUP_TOKEN, SECURE_COOKIE
+    global STORE, SETUP_TOKEN, SECURE_COOKIE, DETAILS_RUNNING
     try:
         STORE = JsonStore(args.data)
         SETUP_TOKEN = secrets.token_urlsafe(24) if STORE.data.get("password") is None else None
@@ -3381,8 +4833,14 @@ def main(argv=None):
     if args.host in ("0.0.0.0", "::"):
         print("LAN mode enabled; protect access with a firewall and use HTTPS via a trusted reverse proxy.")
     history_stop = threading.Event()
-    history_thread = threading.Thread(target=_history_sampler, args=(history_stop,),
+    history_thread = threading.Thread(target=_worker_entry, args=("history", _history_sampler, history_stop),
                                       name="tinywatch-history", daemon=True)
+    DETAILS_RUNNING = True
+    workers = [threading.Thread(target=_worker_entry, args=(name[len("tinywatch-"):], target, history_stop), name=name, daemon=True)
+               for target, name in ((_details_sampler, "tinywatch-details"), (_service_sampler, "tinywatch-services"),
+                                    (_notification_sampler, "tinywatch-notifications"))]
+    for worker in workers:
+        worker.start()
     history_thread.start()
     try:
         server.serve_forever(poll_interval=0.5)
@@ -3391,6 +4849,9 @@ def main(argv=None):
     finally:
         history_stop.set()
         history_thread.join(timeout=45)
+        for worker in workers:
+            worker.join(timeout=10)
+        DETAILS_RUNNING = False
         server.server_close()
     return 0
 
