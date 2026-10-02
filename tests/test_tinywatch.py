@@ -38,7 +38,9 @@ class JsonStoreTests(unittest.TestCase):
         current = json.loads(self.path.read_text(encoding="utf-8"))
         self.assertEqual(backup["theme"], "light")
         self.assertEqual(current["theme"], "dark")
-        self.assertEqual(backup["history"]["local"]["cpu"], [[now - 60, 2]])
+        restored_backup, error = tinywatch.JsonStore._read_database(self.path.with_name("data.json.bak"))
+        self.assertIsNone(error)
+        self.assertEqual(restored_backup["history"]["local"]["cpu"], [[now - 60, 2]])
 
     def test_regular_save_copies_the_previous_database(self):
         store = tinywatch.JsonStore(self.path)
@@ -116,7 +118,9 @@ class JsonStoreTests(unittest.TestCase):
 
         tinywatch._record_history({"local": {"online": True, "metrics": metrics}}, now=int(time.time()))
 
-        self.assertEqual(store.data["history"]["local"], {})
+        series = store.data["history"]["local"]
+        self.assertFalse(set(series) & {"cpu", "memory", "disk", "network", "load"})
+        self.assertEqual(series["observations"][0][1]["collector_errors"], metrics["collector_errors"])
 
     def test_retention_change_prunes_primary_and_backup(self):
         store = tinywatch.JsonStore(self.path)
@@ -129,8 +133,10 @@ class JsonStoreTests(unittest.TestCase):
         with patch.object(tinywatch, "STORE", store):
             handler._save_config(value)
 
-        primary = json.loads(self.path.read_text(encoding="utf-8"))
-        backup = json.loads(self.path.with_name("data.json.bak").read_text(encoding="utf-8"))
+        primary, primary_error = tinywatch.JsonStore._read_database(self.path)
+        backup, backup_error = tinywatch.JsonStore._read_database(self.path.with_name("data.json.bak"))
+        self.assertIsNone(primary_error)
+        self.assertIsNone(backup_error)
         expected = [[now - 60, 2]]
         self.assertEqual(primary["history"]["local"]["cpu"], expected)
         self.assertEqual(backup["history"]["local"]["cpu"], expected)
@@ -150,7 +156,7 @@ class RemoteAssetSafetyTests(unittest.TestCase):
         asset = {"id": "remote-1", "name": "Remote", "url": "http://10.0.0.12:8765", "password": "secret-token"}
         with patch.object(tinywatch.urllib.request, "build_opener") as build_opener:
             build_opener.return_value.open.side_effect = urllib.error.URLError("fixture offline")
-            result = tinywatch._remote_snapshot(asset)
+            result = tinywatch._remote_snapshot_direct(asset)
 
         self.assertFalse(result["online"])
         self.assertIsNone(result["metrics"])
@@ -199,7 +205,7 @@ class RemoteAssetSafetyTests(unittest.TestCase):
 
 
 class SnapshotReliabilityTests(unittest.TestCase):
-    def test_cluster_snapshot_cache_avoids_repeated_remote_fanout(self):
+    def test_cluster_snapshot_reads_asset_cache_without_remote_fanout(self):
         with tempfile.TemporaryDirectory(prefix="tinywatch-cluster-cache-") as directory:
             store = tinywatch.JsonStore(Path(directory) / "data.json")
             store.data["assets"] = [{"id": "remote-1", "name": "Remote",
@@ -210,13 +216,16 @@ class SnapshotReliabilityTests(unittest.TestCase):
             with patch.object(tinywatch, "STORE", store), \
                     patch.object(tinywatch, "collect_snapshot", return_value=local_metrics), \
                     patch.object(tinywatch, "_remote_snapshot", return_value=remote_node) as remote_call, \
-                    patch.object(tinywatch, "CLUSTER_SNAPSHOT_CACHE", {"sampled_at": 0.0, "data": None}):
+                    patch.object(tinywatch, "CLUSTER_SNAPSHOT_CACHE", {"sampled_at": 0.0, "data": None, "generation": 0}), \
+                    patch.object(tinywatch, "ASSET_CACHE", {"remote-1": {
+                        "configuration": store.data["assets"][0], "result": remote_node}}):
                 first = tinywatch.collect_cluster_snapshot(force_refresh=True)
                 second = tinywatch.collect_cluster_snapshot()
 
                 self.assertIs(first, second)
-                self.assertEqual(second["nodes"]["remote-1"], remote_node)
-                remote_call.assert_called_once()
+                self.assertEqual(second["nodes"]["remote-1"]["metrics"], remote_node["metrics"])
+                self.assertTrue(second["nodes"]["remote-1"]["online"])
+                remote_call.assert_not_called()
 
     def test_concurrent_browser_poll_serves_stale_cache_during_refresh(self):
         with tempfile.TemporaryDirectory(prefix="tinywatch-stale-cache-") as directory:
@@ -247,6 +256,53 @@ class SnapshotReliabilityTests(unittest.TestCase):
                     worker.join(timeout=4)
                 self.assertFalse(worker.is_alive())
 
+    def test_refresh_failure_releases_lock_and_can_retry(self):
+        with tempfile.TemporaryDirectory(prefix="tinywatch-refresh-failure-") as directory:
+            store = tinywatch.JsonStore(Path(directory) / "data.json")
+            cache = {"sampled_at": 0.0, "data": None, "generation": 0}
+            lock = threading.Lock()
+            with patch.object(tinywatch, "STORE", store), \
+                    patch.object(tinywatch, "CLUSTER_SNAPSHOT_CACHE", cache), \
+                    patch.object(tinywatch, "CLUSTER_REFRESH_LOCK", lock), \
+                    patch.object(tinywatch, "collect_snapshot", side_effect=[OSError("fixture failure"), {"info": {}}]):
+                with self.assertRaises(OSError):
+                    tinywatch.collect_cluster_snapshot()
+                self.assertFalse(lock.locked())
+                self.assertTrue(tinywatch.collect_cluster_snapshot()["nodes"]["local"]["online"])
+                self.assertFalse(lock.locked())
+
+    def test_invalidation_during_refresh_does_not_publish_old_generation(self):
+        with tempfile.TemporaryDirectory(prefix="tinywatch-refresh-generation-") as directory:
+            store = tinywatch.JsonStore(Path(directory) / "data.json")
+            cache = {"sampled_at": 0.0, "data": None, "generation": 0}
+
+            def sample():
+                tinywatch._invalidate_cluster_snapshot()
+                return {"info": {}}
+
+            with patch.object(tinywatch, "STORE", store), \
+                    patch.object(tinywatch, "CLUSTER_SNAPSHOT_CACHE", cache), \
+                    patch.object(tinywatch, "collect_snapshot", side_effect=sample):
+                tinywatch.collect_cluster_snapshot()
+                self.assertIsNone(cache["data"])
+                self.assertEqual(cache["generation"], 1)
+
+    def test_unsampled_asset_is_pending_without_synchronous_probe(self):
+        with tempfile.TemporaryDirectory(prefix="tinywatch-pending-asset-") as directory:
+            store = tinywatch.JsonStore(Path(directory) / "data.json")
+            store.data["assets"] = [{"id": "remote-1", "name": "Remote", "url": "http://node.example", "password": "token"}]
+            with patch.object(tinywatch, "STORE", store), \
+                    patch.object(tinywatch, "ASSET_CACHE", {}), \
+                    patch.object(tinywatch, "CLUSTER_SNAPSHOT_CACHE", {"sampled_at": 0.0, "data": None, "generation": 0}), \
+                    patch.object(tinywatch, "collect_snapshot", return_value={"info": {}}), \
+                    patch.object(tinywatch, "_remote_snapshot") as probe:
+                result = tinywatch.collect_cluster_snapshot()
+                node = result["nodes"]["remote-1"]
+                self.assertTrue(node["pending"])
+                self.assertEqual(node["status"], "initializing")
+                self.assertIsNone(node["metrics"])
+                probe.assert_not_called()
+
     def test_collector_failure_does_not_fail_the_whole_snapshot(self):
         with patch.object(tinywatch, "_cpu_snapshot", side_effect=RuntimeError("cpu fixture failure")), \
                 patch.object(tinywatch, "_memory_snapshot", return_value={"total": 100, "used": 40,
@@ -261,7 +317,8 @@ class SnapshotReliabilityTests(unittest.TestCase):
                 patch.object(tinywatch, "_processes_linux", return_value=[]), \
                 patch.object(tinywatch, "_login_events", return_value=[]), \
                 patch.object(tinywatch, "_dns_cache", return_value={"source": "test", "count": 0,
-                                                                      "entries": []}):
+                                                                      "entries": []}), \
+                patch.object(tinywatch, "_host_profile", return_value={"hostname": "fixture"}):
             with patch.object(tinywatch.platform, "system", return_value="Linux"):
                 snapshot = tinywatch._collect_snapshot_now()
 
@@ -270,40 +327,23 @@ class SnapshotReliabilityTests(unittest.TestCase):
         self.assertIn("cpu", snapshot["collector_errors"])
 
     def test_remote_failure_reports_last_success_time(self):
-        class Response:
-            status = 200
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *args):
-                return False
-
-            def read(self, _limit):
-                return (b'{"info":{},"cpu":{},"memory":{},"disk":{},"network":{"interfaces":[]},'
-                        b'"load":[],"sampled_at":"2026-09-30T00:00:00+00:00"}')
-
-        class Opener:
-            def open(self, _request, timeout):
-                return Response()
-
-        asset = {"id": "remote-1", "name": "Remote", "url": "https://node.example",
-                 "password": "token"}
+        asset = {"id": "remote-1", "name": "Remote", "url": "https://node.example", "password": "token"}
+        sampled_at = "2026-09-30T00:00:00+00:00"
+        online_result = dict(id=asset["id"], name=asset["name"], online=True,
+                             metrics={}, last_success_at=sampled_at)
+        offline_result = dict(id=asset["id"], name=asset["name"], online=False,
+                              metrics=None, error="offline")
         with patch.object(tinywatch, "REMOTE_LAST_SUCCESS", {}), \
-                patch.object(tinywatch.urllib.request, "build_opener", return_value=Opener()):
+                patch.object(tinywatch, "_bounded_network_probe", side_effect=[online_result, offline_result]) as probe:
             online = tinywatch._remote_snapshot(asset)
-            self.assertTrue(online["online"])
-            with patch.object(Opener, "open", side_effect=urllib.error.URLError("offline")):
-                offline = tinywatch._remote_snapshot(asset)
-
+            offline = tinywatch._remote_snapshot(asset)
+        self.assertTrue(online["online"])
         self.assertFalse(offline["online"])
-        self.assertEqual(offline["last_success_at"], online["last_success_at"])
+        self.assertEqual(offline["last_success_at"], sampled_at)
+        self.assertEqual(probe.call_count, 2)
+        probe.assert_called_with("asset", asset, 12)
 
     def test_remote_failure_uses_persisted_history_after_restart(self):
-        class Opener:
-            def open(self, _request, timeout):
-                raise urllib.error.URLError("offline")
-
         with tempfile.TemporaryDirectory(prefix="tinywatch-remote-history-") as directory:
             store = tinywatch.JsonStore(Path(directory) / "data.json")
             sampled_at = int(time.time()) - 180
@@ -312,7 +352,7 @@ class SnapshotReliabilityTests(unittest.TestCase):
                      "password": "token"}
             with patch.object(tinywatch, "STORE", store), \
                     patch.object(tinywatch, "REMOTE_LAST_SUCCESS", {}), \
-                    patch.object(tinywatch.urllib.request, "build_opener", return_value=Opener()):
+                    patch.object(tinywatch, "_bounded_network_probe", side_effect=OSError("offline")):
                 result = tinywatch._remote_snapshot(asset)
 
         self.assertFalse(result["online"])
@@ -629,6 +669,13 @@ class HistoryCompactionTests(unittest.TestCase):
 
 
 class MonitoringApiTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory(prefix="tinywatch-api-tests-")
+        self.addCleanup(directory.cleanup)
+        store_patch = patch.object(tinywatch, "STORE", tinywatch.JsonStore(Path(directory.name) / "data.json"))
+        store_patch.start()
+        self.addCleanup(store_patch.stop)
+
     def test_rule_configuration_and_incident_acknowledgement_through_handler(self):
         with tempfile.TemporaryDirectory(prefix="tinywatch-alert-api-") as directory:
             store = tinywatch.JsonStore(Path(directory) / "data.json")
@@ -680,7 +727,7 @@ class MonitoringApiTests(unittest.TestCase):
             "old": {"online": True, "metrics": stale},
             "partial": {"online": True, "metrics": partial},
             "off": {"online": False, "error": "fixture offline"}}}, now=now)
-        self.assertEqual([node["status"] for node in report["nodes"]], ["healthy", "stale", "partial", "offline"])
+        self.assertEqual([node["status"] for node in report["nodes"]], ["healthy", "stale", "partial", "connection_failed"])
         self.assertEqual(report["nodes"][2]["issues"][0]["message"], "fixture denied")
 
     def test_missing_timestamp_and_future_node_clock_are_reported(self):

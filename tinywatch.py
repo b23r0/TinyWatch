@@ -2937,31 +2937,43 @@ def collect_cluster_snapshot(force_refresh=False):
     """Combine local metrics with the latest independent asset samples."""
     with CLUSTER_SNAPSHOT_LOCK:
         cached = CLUSTER_SNAPSHOT_CACHE["data"]
-        generation = CLUSTER_SNAPSHOT_CACHE["generation"]
         if not force_refresh and cached is not None and time.monotonic()-CLUSTER_SNAPSHOT_CACHE["sampled_at"] < CLUSTER_CACHE_SECONDS:
             return cached
-    started = time.monotonic()
-    metrics = collect_snapshot()
-    nodes = {"local": {"id": "local", "name": socket.gethostname(), "online": True, "metrics": metrics,
-                        "latency_ms": round((time.monotonic()-started)*1000, 1)}}
-    with STORE.lock:
-        assets = copy.deepcopy(STORE.data.get("assets", []))[:MAX_ASSETS]
-    with ASSET_CACHE_LOCK:
-        for asset in assets:
-            cached = ASSET_CACHE.get(asset["id"])
-            if cached and cached["configuration"] == asset:
-                nodes[asset["id"]] = copy.deepcopy(cached["result"])
-                node = nodes[asset["id"]]
-                age = _sample_age(node, time.time())
-                node["status"] = "connection_failed" if not node["online"] else "stale" if age is None or abs(age) > 120 else "healthy"
-            else:
-                nodes[asset["id"]] = {"id": asset["id"], "name": asset["name"], "online": False,
-                                      "pending": True, "status": "initializing", "metrics": None, "error": "Awaiting first sample", "last_success_at": None}
-    result = {"nodes": nodes, "sampled_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
-    with CLUSTER_SNAPSHOT_LOCK:
-        if CLUSTER_SNAPSHOT_CACHE["generation"] == generation:
-            CLUSTER_SNAPSHOT_CACHE.update(data=result, sampled_at=time.monotonic())
-    return result
+    # Serve the previous sample while another request owns the refresh.
+    acquired = CLUSTER_REFRESH_LOCK.acquire(blocking=force_refresh or cached is None)
+    if not acquired:
+        return cached
+    try:
+        with CLUSTER_SNAPSHOT_LOCK:
+            cached = CLUSTER_SNAPSHOT_CACHE["data"]
+            generation = CLUSTER_SNAPSHOT_CACHE["generation"]
+            if not force_refresh and cached is not None and time.monotonic()-CLUSTER_SNAPSHOT_CACHE["sampled_at"] < CLUSTER_CACHE_SECONDS:
+                return cached
+        started = time.monotonic()
+        metrics = collect_snapshot()
+        nodes = {"local": {"id": "local", "name": socket.gethostname(), "online": True, "metrics": metrics,
+                            "latency_ms": round((time.monotonic()-started)*1000, 1)}}
+        with STORE.lock:
+            assets = copy.deepcopy(STORE.data.get("assets", []))[:MAX_ASSETS]
+        with ASSET_CACHE_LOCK:
+            for asset in assets:
+                cached = ASSET_CACHE.get(asset["id"])
+                if cached and cached["configuration"] == asset:
+                    nodes[asset["id"]] = copy.deepcopy(cached["result"])
+                    node = nodes[asset["id"]]
+                    age = _sample_age(node, time.time())
+                    node["status"] = "connection_failed" if not node["online"] else "stale" if age is None or abs(age) > 120 else "healthy"
+                else:
+                    nodes[asset["id"]] = {"id": asset["id"], "name": asset["name"], "online": False,
+                                          "pending": True, "status": "initializing", "metrics": None, "error": "Awaiting first sample", "last_success_at": None}
+        result = {"nodes": nodes, "sampled_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+        with CLUSTER_SNAPSHOT_LOCK:
+            if CLUSTER_SNAPSHOT_CACHE["generation"] == generation:
+                CLUSTER_SNAPSHOT_CACHE.update(data=result, sampled_at=time.monotonic())
+        return result
+
+    finally:
+        CLUSTER_REFRESH_LOCK.release()
 
 
 def _history_sampler(stop_event):

@@ -64,7 +64,7 @@ def main():
             raise ValueError("expected one application bootstrap call")
         ui_test.write_text(
             "const assert = require('node:assert/strict');\n"
-            "const document = {getElementById: () => ({}), documentElement: {}};\n"
+            "const document = {getElementById: () => ({}), documentElement: {}, addEventListener: () => {}};\n"
             "const localStorage = {getItem: () => null};\n"
             + script.replace("\nboot();", "")
             + "\nfor (const language of ['en','zh','ja','fr','ru','de']) {\n"
