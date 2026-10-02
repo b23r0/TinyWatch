@@ -8,6 +8,7 @@ Run ``python3 tinywatch.py`` and open http://127.0.0.1:8765.
 from __future__ import annotations
 
 import argparse
+import bisect
 import base64
 import copy
 import hashlib
@@ -20,6 +21,11 @@ import re
 import secrets
 import shutil
 import socket
+import ssl
+import tempfile
+import zipfile
+from collections import OrderedDict, deque
+from contextlib import contextmanager
 import statistics
 import subprocess
 import sys
@@ -34,7 +40,7 @@ from http import HTTPStatus
 from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 
 APP_NAME = "TinyWatch"
 APP_VERSION = "1.0.0"
@@ -82,6 +88,9 @@ CLUSTER_REFRESH_LOCK = threading.Lock()
 CLUSTER_SNAPSHOT_CACHE = {"sampled_at": 0.0, "data": None, "generation": 0}
 REMOTE_STATUS_LOCK = threading.Lock()
 REMOTE_LAST_SUCCESS = {}
+ASSET_CACHE = {}
+ASSET_CACHE_LOCK = threading.RLock()
+ASSET_ACTIVITY = {"last_poll": 0.0, "wake": False}
 PREVIOUS = {"cpu": None, "processes": {}, "network_processes": {}, "interfaces": None, "sampled_at": None}
 TICKS_PER_SECOND = None
 PAGE_SIZE = 60
@@ -383,6 +392,14 @@ def _disk_snapshot():
                            "filesystem": _safe_text(fs_type, 80), "total": usage.total,
                            "used": usage.used, "free": usage.free,
                            "percent": round(100.0 * usage.used / usage.total, 1) if usage.total else 0.0})
+            if hasattr(os, "statvfs"):
+                try:
+                    inode = os.statvfs(mount)
+                    if inode.f_files:
+                        result[-1].update(inode_total=inode.f_files, inode_free=inode.f_ffree,
+                                          inode_percent=round(100*(inode.f_files-inode.f_ffree)/inode.f_files, 1))
+                except OSError:
+                    pass
         except (OSError, ValueError):
             continue
     result.sort(key=lambda item: (item["mount"].count(os.sep), item["mount"]))
@@ -998,10 +1015,10 @@ def default_store_path():
 
 
 def empty_database():
-    return {"schema": 1, "password": None, "agent_token": secrets.token_urlsafe(32),
+    return {"schema": 2, "password": None, "agent_token": secrets.token_urlsafe(32),
             "alert_rules": default_alert_rules(), "alert_states": {}, "incidents": [],
             "timeline": [], "node_fingerprints": {},
-            "heartbeats": [], "service_revision": 0, "services": [], "service_states": {}, "service_history": {}, "maintenance": [],
+            "flight_enabled": False, "job_runs": {}, "flight_records": [], "heartbeats": [], "service_revision": 0, "services": [], "service_states": {}, "service_history": {}, "maintenance": [],
             "notifications": {"enabled": False, "url": ""}, "notification_queue": [],
             "assets": [], "history": {}, "history_retention_days": HISTORY_RETENTION_DEFAULT_DAYS, "widgets": [{"id": "local-cpu", "node": "local", "metric": "cpu"},
                                        {"id": "local-memory", "node": "local", "metric": "memory"},
@@ -1013,6 +1030,25 @@ def empty_database():
                                        {"id": "local-dns", "node": "local", "metric": "dns"},
                                        {"id": "local-info", "node": "local", "metric": "info"}],
             "theme": "dark"}
+
+
+def _mark_changed_rows(database, rows, service=False):
+    if STORE is not None and database is STORE.data:
+        for row in rows:
+            STORE.mark_history_dirty(row["bucket"] if service else row[0])
+
+
+def _mark_replaced_rows(database, before, after):
+    if STORE is None or database is not STORE.data:
+        return
+    old, new = {}, {}
+    for row in before:
+        old.setdefault(int(row[0])//86400, []).append(row)
+    for row in after:
+        new.setdefault(int(row[0])//86400, []).append(row)
+    for day in old.keys() | new.keys():
+        if old.get(day) != new.get(day):
+            STORE.mark_history_dirty(day*86400)
 
 
 def _prune_history_database(database, cutoff):
@@ -1028,6 +1064,7 @@ def _prune_history_database(database, cutoff):
                 filtered = [point for point in points
                             if isinstance(point, list) and point and _number(point[0]) >= cutoff]
                 if len(filtered) != len(points):
+                    _mark_changed_rows(database, [point for point in points if isinstance(point, list) and point and _number(point[0]) < cutoff])
                     changed = True
                 if not filtered and metric.startswith("disk@"):
                     del node_series[metric]
@@ -1040,6 +1077,26 @@ def _prune_history_database(database, cutoff):
         if retained != incidents:
             database["incidents"] = retained
             changed = True
+    records = database.get("flight_records", [])
+    kept_records = [record for record in records if record.get("triggered_at", 0) >= cutoff]
+    for record in kept_records:
+        points = [point for point in record.get("points", []) if point["timestamp"] >= cutoff]
+        if len(points) != len(record.get("points", [])):
+            record["points"] = points
+            record["_bytes"] = sum(len(json.dumps(point, ensure_ascii=False).encode("utf-8")) for point in points)
+            changed = True
+    if records != kept_records:
+        database["flight_records"] = kept_records
+        changed = True
+    valid_jobs = {job["id"] for job in database.get("heartbeats", [])}
+    for identity, rows in list(database.get("job_runs", {}).items()):
+        retained_runs = [row for row in rows if row.get("status") == "running" or _number(row.get("finished_at")) >= cutoff]
+        if identity not in valid_jobs:
+            del database["job_runs"][identity]
+            changed = True
+        elif retained_runs != rows:
+            database["job_runs"][identity] = retained_runs
+            changed = True
     events = database.get("timeline", [])
     kept = [event for event in events if isinstance(event, dict) and _number(event.get("timestamp")) >= cutoff]
     if kept != events:
@@ -1048,6 +1105,8 @@ def _prune_history_database(database, cutoff):
     for service_id, buckets in list(database.get("service_history", {}).items()):
         kept = [bucket for bucket in buckets if bucket.get("last_at", 0) >= cutoff][-2048:]
         if kept != buckets:
+            kept_ids = {id(bucket) for bucket in kept}
+            _mark_changed_rows(database, [bucket for bucket in buckets if id(bucket) not in kept_ids], service=True)
             database["service_history"][service_id] = kept
             changed = True
     windows = database.get("maintenance", [])
@@ -1064,26 +1123,39 @@ WORKER_HEALTH = {}
 
 def _worker_tick(name, **fields):
     with WORKER_LOCK:
-        WORKER_HEALTH.setdefault(name, {}).update(last_tick=time.time(), **fields)
+        WORKER_HEALTH.setdefault(name, {}).update(last_tick=time.time(), last_tick_monotonic=time.monotonic(), **fields)
 
 
 def _worker_entry(name, target, stop_event):
-    _worker_tick(name, running=True, failed=False)
-    try:
-        target(stop_event)
-    except Exception:
-        _worker_tick(name, failed=True)
-        sys.stderr.write("TinyWatch background worker stopped: " + name + "\n")
-    finally:
-        with WORKER_LOCK:
-            WORKER_HEALTH[name]["running"] = False
+    failures = []
+    while not stop_event.is_set():
+        _worker_tick(name, running=True, failed=False, restarting=False)
+        try:
+            target(stop_event)
+            break
+        except Exception as exc:
+            now = time.monotonic()
+            failures = [stamp for stamp in failures if now-stamp < 600]
+            failures.append(now)
+            exhausted = len(failures) > 3
+            delay = min(30, 2 ** len(failures))
+            with WORKER_LOCK:
+                record = WORKER_HEALTH[name]
+                record.update(running=False, failed=True, restarting=not exhausted,
+                              restarts=record.get("restarts", 0)+(0 if exhausted else 1),
+                              last_failure_at=int(time.time()), last_error=type(exc).__name__, retry_seconds=delay)
+            sys.stderr.write("TinyWatch worker failure: " + name + " (" + type(exc).__name__ + ")\n")
+            if exhausted or stop_event.wait(delay):
+                break
+    with WORKER_LOCK:
+        WORKER_HEALTH.setdefault(name, {}).update(running=False, restarting=False)
 
 
 def _runtime_health(now):
     with WORKER_LOCK:
         workers = copy.deepcopy(WORKER_HEALTH)
     for name, worker in workers.items():
-        worker["age_seconds"] = max(0, int(now-worker["last_tick"]))
+        worker["age_seconds"] = max(0, int(time.monotonic()-worker.pop("last_tick_monotonic", time.monotonic())))
         worker["stale"] = worker["age_seconds"] > (180 if name in ("history", "details") else 30)
     with STORE.lock:
         pending = [job for job in STORE.data.get("notification_queue", []) if job.get("status") == "pending"]
@@ -1135,6 +1207,48 @@ def _hydrate_history(database, path):
     return database
 
 
+def _validate_runtime_records(database):
+    """Reject damaged task or recording state before accepting a generation."""
+    runs = database.get("job_runs", {})
+    records = database.get("flight_records", [])
+    if (not isinstance(database.get("flight_enabled", False), bool) or not isinstance(runs, dict)
+            or len(runs) > 24 or not isinstance(records, list) or len(records) > 16):
+        raise ValueError("Invalid runtime records")
+    for identity, rows in runs.items():
+        if not isinstance(identity, str) or not isinstance(rows, list) or len(rows) > 50:
+            raise ValueError("Invalid task run history")
+        seen = set()
+        for row in rows:
+            if (not isinstance(row, dict) or not isinstance(row.get("id"), str)
+                    or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,100}", row["id"]) or row["id"] in seen
+                    or row.get("status") not in ("running", "success", "failed", "timeout")
+                    or not isinstance(row.get("message", ""), str) or len(row.get("message", "")) > 240):
+                raise ValueError("Invalid task run record")
+            seen.add(row["id"])
+            if row["status"] == "running" and _finite_value(row.get("started_at")) is None:
+                raise ValueError("Running task has no start time")
+            if row["status"] != "running" and _finite_value(row.get("finished_at")) is None:
+                raise ValueError("Completed task has no finish time")
+        if sum(row["status"] == "running" for row in rows) > 4:
+            raise ValueError("Too many active task runs")
+    for record in records:
+        if (not isinstance(record, dict) or not isinstance(record.get("id"), str)
+                or _finite_value(record.get("triggered_at")) is None or _finite_value(record.get("end")) is None
+                or record.get("status") not in ("recording", "complete", "stopped")
+                or not isinstance(record.get("points"), list) or len(record["points"]) > 211):
+            raise ValueError("Invalid incident recording")
+        for point in record["points"]:
+            if (not isinstance(point, dict) or _finite_value(point.get("timestamp")) is None
+                    or not isinstance(point.get("values"), dict) or not isinstance(point.get("processes"), list)
+                    or len(point["processes"]) > 3 or not isinstance(point.get("errors"), list) or len(point["errors"]) > 8):
+                raise ValueError("Invalid recording sample")
+            if any(value is not None and _finite_value(value) is None for value in point["values"].values()):
+                raise ValueError("Invalid recording value")
+        record["_bytes"] = sum(len(json.dumps(point, ensure_ascii=False).encode("utf-8")) for point in record["points"])
+    if len(json.dumps(records, ensure_ascii=False).encode("utf-8")) > 2*1024*1024:
+        raise ValueError("Recording storage limit exceeded")
+
+
 class JsonStore:
     """Atomic JSON store with one known-good backup and startup recovery."""
 
@@ -1149,6 +1263,12 @@ class JsonStore:
         self.last_success_at = None
         self.write_failures = 0
         self.last_prune_at = 0
+        self.dirty_days = {"*"}
+        self.day_files = {}
+        self.shard_readers = {}
+        self.shard_cache = OrderedDict()
+        self.shard_cache_bytes = 0
+        self.last_encoded_days = 0
         self.encoded_bytes = self.path.stat().st_size if self.path.exists() else 0
         self._known_main_signature = None
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -1184,12 +1304,13 @@ class JsonStore:
             return None, None
         except (OSError, UnicodeError, ValueError) as exc:
             return None, exc
-        if not isinstance(value, dict) or value.get("schema") != 1:
+        if not isinstance(value, dict) or type(value.get("schema")) is not int or value["schema"] not in (1, 2):
             return None, ValueError("unsupported or invalid database schema")
         default = empty_database()
         default.update(value)
         try:
             _hydrate_history(default, path.with_name(path.name[:-4]) if path.name.endswith(".bak") else path)
+            _validate_runtime_records(default)
         except (OSError, UnicodeError, ValueError, TypeError, KeyError) as exc:
             return None, exc
         return default, None
@@ -1267,45 +1388,166 @@ class JsonStore:
         except OSError:
             pass
 
+    def mark_history_dirty(self, stamp=None):
+        self.dirty_days.add("*" if stamp is None else int(stamp)//86400)
+
+    def history_window(self, identity, metric, start, end, shard_cache=None):
+        return self.history_windows(identity, {metric}, start, end, shard_cache).get(metric, [])
+
+    def history_windows(self, identity, metrics, start, end, shard_cache=None):
+        """Snapshot dirty rows and pin immutable files before releasing the lock."""
+        result = {metric: [] for metric in metrics}
+        names = []
+        with self.lock:
+            resident = self.data.get("history", {}).get(identity, {})
+            for day in range(int(start)//86400, int(end)//86400+1):
+                name = self.day_files.get(day)
+                if "*" in self.dirty_days or day in self.dirty_days or not name:
+                    for metric in metrics:
+                        points = resident.get(metric, [])
+                        lower = bisect.bisect_left(points, day*86400, key=lambda point: point[0])
+                        upper = bisect.bisect_left(points, (day+1)*86400, key=lambda point: point[0])
+                        result[metric].extend(copy.deepcopy(points[lower:upper]))
+                else:
+                    names.append(name)
+                    self.shard_readers[name] = self.shard_readers.get(name, 0)+1
+        try:
+            for name in names:
+                records = shard_cache.get(name) if shard_cache is not None else None
+                if records is None:
+                    records = self._read_shard(name)
+                    if shard_cache is not None:
+                        shard_cache[name] = records
+                for kind, node, field, point in records:
+                    if kind == "host" and node == identity and field in metrics:
+                        result[field].append(copy.deepcopy(point))
+            for rows in result.values():
+                rows.sort(key=lambda point: point[0])
+            return result
+        finally:
+            self._unpin_shards(names)
+
+    def _unpin_shards(self, names):
+        with self.lock:
+            for name in names:
+                count = self.shard_readers[name]-1
+                if count:
+                    self.shard_readers[name] = count
+                else:
+                    del self.shard_readers[name]
+
+    def _read_shard(self, name):
+        with self.lock:
+            cached = self.shard_cache.get(name)
+            if cached is not None:
+                self.shard_cache.move_to_end(name)
+                return cached[0]
+        directory = self.path.with_name(self.path.name + ".history")
+        content = (directory/name).read_bytes()
+        if hashlib.sha256(content).hexdigest() != name[11:-6]:
+            raise ValueError("History shard checksum mismatch")
+        records = [json.loads(line) for line in content.splitlines()]
+        # Include a conservative allowance for decoded Python objects.
+        cost = len(content)*8
+        with self.lock:
+            if name not in self.shard_cache and cost <= 32*1024*1024:
+                while self.shard_cache and (len(self.shard_cache) >= 8 or self.shard_cache_bytes+cost > 32*1024*1024):
+                    _, (_, removed) = self.shard_cache.popitem(last=False)
+                    self.shard_cache_bytes -= removed
+                self.shard_cache[name] = (records, cost)
+                self.shard_cache_bytes += cost
+        return records
+
+    @contextmanager
+    def backup_snapshot(self):
+        """Flush and pin both generations for a consistent streaming archive."""
+        with self.lock:
+            self.save()
+            indexes = {"data.json": self.path.read_bytes()}
+            if self.backup_path.exists():
+                indexes["data.json.bak"] = self.backup_path.read_bytes()
+            names = set()
+            for content in indexes.values():
+                names.update(json.loads(content).get("history_files", []))
+            for name in names:
+                if not HISTORY_FILE_PATTERN.fullmatch(name):
+                    raise ValueError("Invalid history manifest")
+            for name in names:
+                self.shard_readers[name] = self.shard_readers.get(name, 0)+1
+        try:
+            yield indexes, sorted(names)
+        finally:
+            self._unpin_shards(names)
+
+    def export_backup(self, output):
+        with self.backup_snapshot() as (indexes, names):
+            with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                directory = self.path.with_name(self.path.name + ".history")
+                sizes = [len(content) for content in indexes.values()]
+                shard_sizes = [(directory/name).stat().st_size for name in names]
+                if (len(names)+len(indexes)+1 > 750 or any(size > 8*1024*1024 for size in sizes)
+                        or any(size > 128*1024*1024 for size in shard_sizes)
+                        or sum(sizes)+sum(shard_sizes) > 512*1024*1024-4096):
+                    raise ValueError("Backup exceeds the 512 MiB archive limit")
+                for name, content in indexes.items():
+                    archive.writestr(name, content)
+                directory = self.path.with_name(self.path.name + ".history")
+                for name in names:
+                    archive.write(directory/name, "data.json.history/"+name)
+                archive.writestr("backup.json", json.dumps({"format": 1, "created_at": int(time.time()),
+                                                          "application": APP_NAME, "version": APP_VERSION}))
+
     def _encode_generation(self, database):
-        """Write daily shards before publishing their index."""
-        days = {}
-        for identity, metrics in database.get("history", {}).items():
-            for metric, points in metrics.items():
-                for point in points:
-                    day = datetime.fromtimestamp(point[0], timezone.utc).strftime("%Y-%m-%d")
-                    days.setdefault(day, []).append(["host", identity, metric, point])
-        for identity, buckets in database.get("service_history", {}).items():
-            for bucket in buckets:
-                day = datetime.fromtimestamp(bucket["bucket"], timezone.utc).strftime("%Y-%m-%d")
-                days.setdefault(day, []).append(["service", identity, "latency", bucket])
+        """Re-encode dirty days; publish the index after their shard writes."""
+        primary = database is self.data
+        dirty = set(self.dirty_days) if primary else {"*"}
+        files = dict(self.day_files) if primary else {}
+        series = [("host", identity, metric, points) for identity, metrics in database.get("history", {}).items()
+                  for metric, points in metrics.items() if points]
+        series.extend(("service", identity, "latency", rows) for identity, rows in database.get("service_history", {}).items() if rows)
+        if "*" in dirty:
+            dirty = set(files)
+            for kind, identity, metric, points in series:
+                key = (lambda point: point[0]) if kind == "host" else (lambda point: point["bucket"])
+                dirty.update(range(int(key(points[0]))//86400, int(key(points[-1]))//86400+1))
         directory = self.path.with_name(self.path.name + ".history")
         directory.mkdir(parents=True, exist_ok=True)
-        manifest = []
-        for day, rows in sorted(days.items()):
+        for day in sorted(dirty):
+            rows = []
+            for kind, identity, metric, points in series:
+                key = (lambda point: point[0]) if kind == "host" else (lambda point: point["bucket"])
+                lower = bisect.bisect_left(points, day*86400, key=key)
+                upper = bisect.bisect_left(points, (day+1)*86400, key=key)
+                rows.extend([kind, identity, metric, point] for point in points[lower:upper])
+            if not rows:
+                files.pop(day, None)
+                continue
             rows.sort(key=lambda row: (row[0], row[1], row[2], row[3][0] if row[0] == "host" else row[3]["bucket"]))
             content = ("\n".join(json.dumps(row, ensure_ascii=False, separators=(",", ":"), sort_keys=True) for row in rows)+"\n").encode("utf-8")
-            name = day + "-" + hashlib.sha256(content).hexdigest() + ".jsonl"
-            target = directory / name
+            date = datetime.fromtimestamp(day*86400, timezone.utc).strftime("%Y-%m-%d")
+            name = date + "-" + hashlib.sha256(content).hexdigest() + ".jsonl"
+            target = directory/name
             if not target.exists():
-                temporary = directory / (name + ".tmp")
+                temporary = directory/(name+".tmp")
                 self._write_synced(temporary, content)
                 os.replace(temporary, target)
-            manifest.append(name)
-        # Sync the shard directory before an index can refer to its new entries.
-        if os.name != "nt":
+            files[day] = name
+        if os.name != "nt" and dirty:
             descriptor = os.open(str(directory), os.O_RDONLY)
             try:
                 os.fsync(descriptor)
             finally:
                 os.close(descriptor)
         index = {key: value for key, value in database.items() if key not in ("history", "service_history", "history_files")}
-        index["history_files"] = manifest
+        index.update(schema=2, history_files=[name for day, name in sorted(files.items())])
+        if primary:
+            self._pending_day_files = files
+            self.last_encoded_days = len(dirty)
         return json.dumps(index, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
 
     def _cleanup_shards(self):
         """Delete only our named shards absent from both committed generations."""
-        referenced = set()
+        referenced = set(self.shard_readers)
         for path in (self.path, self.backup_path):
             if path.exists():
                 with path.open(encoding="utf-8") as stream:
@@ -1314,6 +1556,9 @@ class JsonStore:
         for path in directory.iterdir():
             if HISTORY_FILE_PATTERN.fullmatch(path.name) and path.name not in referenced:
                 path.unlink()
+                cached = self.shard_cache.pop(path.name, None)
+                if cached:
+                    self.shard_cache_bytes -= cached[1]
 
     def save(self, backup_retention_days=None):
         try:
@@ -1355,6 +1600,9 @@ class JsonStore:
             os.replace(temporary, self.path)
             self._known_main_signature = committed_signature
             self.persisted_retention_days = self._retention_days(self.data)
+            self.day_files = self._pending_day_files
+            self.dirty_days.clear()
+            self.data["schema"] = 2
             self._sync_parent_directory()
             self.encoded_bytes = len(encoded)
             self.last_save_ms = round((time.monotonic() - started) * 1000, 1)
@@ -1364,6 +1612,76 @@ class JsonStore:
             except (OSError, ValueError, TypeError):
                 # Garbage collection is best effort; the committed index is valid.
                 pass
+
+
+BACKUP_LOCK = threading.Lock()
+
+
+def restore_backup(archive_path, destination):
+    """Validate an archive in a private directory, then publish a new data directory."""
+    destination = Path(destination).absolute()
+    parent = destination.parent
+    if parent.exists() or not parent.parent.is_dir():
+        raise ValueError("Restore requires a new data directory inside an existing parent directory")
+    if destination.name in ("backup.json", "data.json.history") or not destination.name.endswith(".json"):
+        raise ValueError("Use a .json database filename")
+    with tempfile.TemporaryDirectory(prefix=".tinywatch-restore-", dir=parent.parent) as temporary:
+        staging = Path(temporary)/"data"
+        staging.mkdir(mode=0o700)
+        with zipfile.ZipFile(archive_path) as archive:
+            entries = archive.infolist()
+            names = {entry.filename for entry in entries}
+            if len(entries) > 750 or len(names) != len(entries) or sum(entry.file_size for entry in entries) > 512*1024*1024:
+                raise ValueError("Backup exceeds limits or contains duplicate files")
+            if not {"backup.json", "data.json"} <= names:
+                raise ValueError("Backup index is missing")
+            for entry in entries:
+                name = entry.filename
+                shard = name.removeprefix("data.json.history/")
+                if name not in ("backup.json", "data.json", "data.json.bak") and not (
+                        name.startswith("data.json.history/") and HISTORY_FILE_PATTERN.fullmatch(shard)):
+                    raise ValueError("Unexpected backup filename")
+                limit = 128*1024*1024 if name.startswith("data.json.history/") else 8*1024*1024
+                if entry.file_size > limit or entry.flag_bits & 1:
+                    raise ValueError("Oversized or encrypted backup entry")
+                target = staging/name
+                target.parent.mkdir(exist_ok=True, mode=0o700)
+                with archive.open(entry) as source, target.open("xb") as output:
+                    shutil.copyfileobj(source, output, length=65536)
+                    output.flush()
+                    os.fsync(output.fileno())
+                os.chmod(target, 0o600)
+        metadata = json.loads((staging/"backup.json").read_text(encoding="utf-8"))
+        if not isinstance(metadata, dict) or type(metadata.get("format")) is not int or metadata["format"] != 1:
+            raise ValueError("Unsupported backup format")
+        referenced = set()
+        for filename in ("data.json", "data.json.bak"):
+            path = staging/filename
+            if not path.exists():
+                continue
+            value, error = JsonStore._read_database(path)
+            if error is not None or value is None:
+                raise ValueError("Invalid backup database: "+filename)
+            for field in ("history", "service_history", "alert_states", "service_states"):
+                if not isinstance(value.get(field, {}), dict):
+                    raise ValueError("Invalid backup database structure")
+            for field in ("assets", "widgets", "alert_rules", "services", "heartbeats", "incidents", "timeline"):
+                if not isinstance(value.get(field, []), list):
+                    raise ValueError("Invalid backup database structure")
+            index = json.loads(path.read_text(encoding="utf-8"))
+            referenced.update("data.json.history/"+name for name in index.get("history_files", []))
+        if names - {"backup.json", "data.json", "data.json.bak"} != referenced:
+            raise ValueError("Backup manifest does not match its files")
+        (staging/"backup.json").unlink()
+        if destination.name != "data.json":
+            for suffix in ("", ".bak", ".history"):
+                source = staging/("data.json"+suffix)
+                if source.exists():
+                    source.rename(staging/(destination.name+suffix))
+        if parent.exists():
+            raise ValueError("Restore destination already exists")
+        staging.rename(parent)
+    return destination
 
 
 STORE = None
@@ -1410,6 +1728,7 @@ def _config_for_browser():
         return {"assets": [_public_asset(item) for item in STORE.data.get("assets", [])],
                 "widgets": STORE.data.get("widgets", []), "theme": STORE.data.get("theme", "dark"),
                 "history_retention_days": _history_retention_days(),
+                "flight_enabled": bool(STORE.data.get("flight_enabled", False)),
                 "agent_token": STORE.data.get("agent_token", ""),
                 "storage_recovered": STORE.recovered_from_backup}
 
@@ -1460,8 +1779,9 @@ def _historical_last_success(asset_id):
         series = history.get(asset_id, {}) if isinstance(history, dict) else {}
         if not isinstance(series, dict):
             return None
-        timestamps = [int(_number(point[0])) for points in series.values() if isinstance(points, list)
-                      for point in points if isinstance(point, list) and point and _number(point[0]) > 0]
+        timestamps = [int(_number(points[-1][0])) for points in series.values()
+                      if isinstance(points, list) and points and isinstance(points[-1], list)
+                      and points[-1] and _number(points[-1][0]) > 0]
     if not timestamps:
         return None
     try:
@@ -1470,7 +1790,44 @@ def _historical_last_success(asset_id):
         return None
 
 
+def _bounded_network_probe(kind, configuration, timeout):
+    """A disposable child gives DNS and response reads one wall-clock deadline."""
+    process = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--probe-worker", kind],
+                               stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    try:
+        output, _ = process.communicate(json.dumps(configuration).encode("utf-8"), timeout=timeout)
+        if process.returncode != 0 or len(output) > 4_000_000:
+            raise OSError("Probe worker failed")
+        result = json.loads(output)
+        if not isinstance(result, dict):
+            raise ValueError("Invalid probe result")
+        return result
+    except BaseException:
+        process.kill()
+        process.communicate()
+        raise
+
+
 def _remote_snapshot(asset):
+    started = time.monotonic()
+    with REMOTE_STATUS_LOCK:
+        previous = REMOTE_LAST_SUCCESS.get(asset["id"], {})
+        last_success = previous.get("sampled_at") if previous.get("url") == asset["url"] else None
+    last_success = last_success or _historical_last_success(asset["id"])
+    try:
+        result = _bounded_network_probe("asset", asset, 12)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        result = {"id": asset["id"], "name": asset["name"], "online": False, "metrics": None,
+                  "error": "request_timeout", "latency_ms": round((time.monotonic()-started)*1000, 1)}
+    if result.get("online"):
+        with REMOTE_STATUS_LOCK:
+            REMOTE_LAST_SUCCESS[asset["id"]] = {"url": asset["url"], "sampled_at": result.get("last_success_at")}
+    else:
+        result["last_success_at"] = last_success
+    return result
+
+
+def _remote_snapshot_direct(asset):
     asset_id = asset["id"]
     last_success_at = None
     with REMOTE_STATUS_LOCK:
@@ -1484,7 +1841,7 @@ def _remote_snapshot(asset):
     request = urllib.request.Request(endpoint, headers={"X-TinyWatch-Token": asset["password"],
                                                         "Accept": "application/json", "User-Agent": "TinyWatch/" + APP_VERSION})
     try:
-        opener = urllib.request.build_opener(_RejectRedirectHandler())
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _RejectRedirectHandler())
         with opener.open(request, timeout=10) as response:
             if response.status != 200:
                 raise OSError("HTTP " + str(response.status))
@@ -1594,6 +1951,7 @@ def _compact_history_database(database, now):
                     selected.add(max(values)[1])
                 retained.extend(group[index] for index in sorted(selected))
             if retained != points:
+                _mark_replaced_rows(database, points, retained)
                 series[metric] = retained
                 changed = True
     # Context rows are bounded snapshots, not numeric chart samples.
@@ -1616,6 +1974,7 @@ def _compact_history_database(database, now):
                 buckets[key].append(row)
         retained = [row for bucket in buckets.values() for row in bucket]
         if retained != rows:
+            _mark_replaced_rows(database, rows, retained)
             series["observations"] = retained
             changed = True
     return changed
@@ -1655,6 +2014,8 @@ def _sample_age(node, now):
 
 def _metric_value(node, metric, now, partition="*"):
     """Missing/failed measurements are unknown, never a zero or a recovery."""
+    if node.get("pending"):
+        return None
     if metric == "offline":
         return 0.0 if node.get("online") else 1.0
     if not node.get("online"):
@@ -1711,6 +2072,10 @@ def _baseline_for(node_id, metric, now, minimum_delta):
         value = _historical_value(metric, point)
         if value is not None and math.isfinite(value):
             values.append(value)
+    return _baseline_values(values, minimum_delta)
+
+
+def _baseline_values(values, minimum_delta):
     if len(values) < 30:
         return None
     median = statistics.median(values)
@@ -1769,6 +2134,177 @@ def _validate_alert_rules(value, valid_nodes):
     return rules
 
 
+PREVIEW_LOCK = threading.Lock()
+
+
+def _preview_series(rule, points, start, end):
+    events, missing = [], []
+    pending, active, recovered = None, None, -math.inf
+    previous, previous_known, known_seconds = start, False, 0
+    stamps = [point[0] for point in points]
+    for point in points:
+        stamp = point[0]
+        if stamp < start or stamp > end:
+            continue
+        raw = _point_metadata(point).get("resolution", 60) <= 60
+        value = _historical_value(rule["history_metric"], point) if raw else None
+        baseline = None
+        if rule["mode"] == "baseline" and value is not None:
+            if active:
+                baseline = active["baseline"]
+            else:
+                lo = bisect.bisect_left(stamps, stamp-86400)
+                hi = bisect.bisect_right(stamps, stamp-600)
+                values = [_historical_value(rule["history_metric"], row) for row in points[lo:hi]
+                          if _point_metadata(row).get("resolution", 60) <= 60]
+                values = [item for item in values if item is not None and math.isfinite(item)]
+                baseline = _baseline_values(values, rule["threshold"])
+            if baseline is None:
+                value = None
+        threshold = baseline["threshold"] if baseline else rule["threshold"]
+        recovery = baseline["recovery"] if baseline else rule["recovery"]
+        gap = stamp-previous > HISTORY_GAP_SECONDS or bool(_point_metadata(point).get("gap_before"))
+        valid = value is not None and math.isfinite(value)
+        contiguous = valid and previous_known and not gap
+        if contiguous:
+            known_seconds += stamp-previous
+            if active:
+                active["observed_seconds"] += stamp-previous
+        elif stamp > previous:
+            if len(missing) < 200:
+                if missing and missing[-1][1] == previous:
+                    missing[-1][1] = stamp
+                else:
+                    missing.append([previous, stamp])
+            if active:
+                active["uncertain"] = True
+        if gap or not valid:
+            pending = None
+        previous, previous_known = stamp, valid
+        if not valid:
+            continue
+        if active:
+            active["peak"] = max(active["peak"], value)
+            if value <= recovery:
+                active["resolved_at"] = stamp
+                active["elapsed_seconds"] = stamp-active["triggered_at"]
+                recovered, active = stamp, None
+            continue
+        if value <= threshold or stamp-recovered < rule["cooldown"]:
+            pending = None
+            continue
+        if pending is None:
+            pending = stamp
+        if stamp-pending < rule["duration"]:
+            continue
+        active = {"started_at": pending, "triggered_at": stamp, "resolved_at": None,
+                  "threshold": threshold, "recovery": recovery, "peak": value,
+                  "baseline": baseline, "observed_seconds": 0, "uncertain": False}
+        events.append(active)
+        pending = None
+    if previous < end and len(missing) < 200:
+        missing.append([previous, end])
+        if active:
+            active["uncertain"] = True
+    for event in events:
+        event.setdefault("elapsed_seconds", end-event["triggered_at"])
+    return {"count": len(events), "events": events[-200:], "known_seconds": round(known_seconds),
+            "unknown_seconds": max(0, round(end-start-known_seconds)), "unknown_ranges": missing,
+            "events_truncated": len(events) > 200, "ranges_truncated": len(missing) >= 200}
+
+
+def _preview_rule(value):
+    now = time.time()
+    with STORE.lock:
+        valid_nodes = {"local"} | {asset["id"] for asset in STORE.data.get("assets", [])}
+        rule = _validate_alert_rules([value.get("rule")], valid_nodes)[0]
+        start = _finite_value(value.get("start", max(now-7*86400, now-_history_retention_seconds())))
+        end = _finite_value(value.get("end", now))
+        if start is None or end is None or not now-_history_retention_seconds() <= start < end <= now or end-start > 7*86400:
+            raise ValueError("Choose an interval within retention and no longer than seven days")
+        if rule["metric"] in ("offline", "stale"):
+            raise ValueError("Offline and stale rules have no recorded decision history")
+        metric = rule["metric"]
+        if metric == "disk":
+            metric = "disk_worst" if rule["partition"] == "*" else "disk@"+rule["partition"]
+        rule["history_metric"] = metric
+        identities = sorted(valid_nodes) if rule["node"] == "*" else [rule["node"]]
+    shards = {}
+    histories = {identity: STORE.history_window(identity, metric, start-86400, end, shards) for identity in identities}
+    raw_count = sum(sum(start <= row[0] <= end and _point_metadata(row).get("resolution", 60) <= 60
+                        for row in rows) for rows in histories.values())
+    if raw_count > (3000 if rule["mode"] == "baseline" else 80000):
+        raise ValueError("Preview is too large; choose one asset or a shorter interval")
+    reports = []
+    for identity, points in histories.items():
+        report = _preview_series(rule, points, start, end) if rule["enabled"] else {
+            "count": 0, "events": [], "known_seconds": 0, "unknown_seconds": round(end-start), "unknown_ranges": [[start, end]]}
+        limit = max(1, 200//len(identities))
+        report["events_truncated"] = report.get("events_truncated", False) or len(report["events"]) > limit
+        report["events"] = report["events"][-limit:]
+        reports.append(dict(report, node=identity))
+    return {"start": start, "end": end, "reports": reports, "count": sum(report["count"] for report in reports),
+            "enabled": rule["enabled"], "raw_only": True}
+
+
+def _capacity_estimate(points, now):
+    rows = [point for point in points if len(point) >= 4 and now-7*86400 <= point[0] <= now
+            and all(_finite_value(item) is not None for item in point[:4]) and 0 <= point[1] <= point[2] <= 2**80 and point[2] > 0]
+    result = {"days_remaining": None, "growth_per_day": None, "samples": len(rows), "status": "insufficient"}
+    if not rows:
+        return result
+    if now-rows[-1][0] > 300:
+        return dict(result, status="stale")
+    if any(point[2] != rows[-1][2] for point in rows):
+        return dict(result, status="capacity_changed")
+    if any(right[0]-left[0] > 6*3600 for left, right in zip(rows, rows[1:])):
+        return dict(result, status="data_gap")
+    days = {}
+    for point in rows:
+        day = int(point[0])//86400
+        entry = days.setdefault(day, {"hours": set(), "last": point})
+        entry["hours"].add(int(point[0])//3600)
+        entry["last"] = point
+    daily = [entry["last"] for day, entry in sorted(days.items()) if len(entry["hours"]) >= 12]
+    if len(daily) < 4 or daily[-1][0]-daily[0][0] < 3*86400:
+        return result
+    slopes = [(right[1]-left[1])*86400/(right[0]-left[0])
+              for i, left in enumerate(daily) for right in daily[i+1:]]
+    slope = statistics.median(slopes)
+    result.update(growth_per_day=round(slope), span_days=round((daily[-1][0]-daily[0][0])/86400, 1))
+    if slope <= 0:
+        return dict(result, status="no_growth")
+    mad = statistics.median(abs(value-slope) for value in slopes)
+    origin = daily[0][0]
+    intercept = statistics.median(point[1]-slope*(point[0]-origin)/86400 for point in daily)
+    mean = statistics.mean(point[1] for point in daily)
+    variation = sum((point[1]-mean)**2 for point in daily)
+    residual = sum((point[1]-(intercept+slope*(point[0]-origin)/86400))**2 for point in daily)
+    fit = 1-residual/variation if variation else 0
+    result["fit"] = round(max(0, fit), 3)
+    if mad > slope*.5 or fit < .7:
+        return dict(result, status="unstable")
+    remaining = max(0, rows[-1][2]-rows[-1][1])/slope
+    if remaining > 365:
+        return dict(result, status="long_horizon")
+    return dict(result, status="estimated", days_remaining=round(remaining, 1), last_sample_at=rows[-1][0])
+
+
+def _capacity_forecasts(identity):
+    now = time.time()
+    with STORE.lock:
+        valid = {"local"} | {asset["id"] for asset in STORE.data.get("assets", [])}
+        if identity not in valid:
+            raise ValueError("Unknown asset")
+        metrics = {metric for metric in STORE.data.get("history", {}).get(identity, {}) if metric.startswith("disk@")}
+        if len(metrics) > 120:
+            metrics = set(sorted(metrics)[:120])
+        lower = max(now-7*86400, now-_history_retention_seconds())
+    history = STORE.history_windows(identity, metrics, lower, now)
+    return {"node": identity, "sampled_at": int(now),
+            "partitions": {metric[5:]: _capacity_estimate(rows, now) for metric, rows in history.items()}}
+
+
 def _incident_context(node):
     """Capture bounded process and login context for an incident."""
     metrics = node.get("metrics") or {}
@@ -1792,6 +2328,136 @@ def _incident_context(node):
                              for name in ("cpu", "memory", "disk", "network") if isinstance(metrics.get(name), dict)},
             "collector_status": {name: copy.deepcopy(entry) for name, entry in
                                  metrics.get("collector_status", {}).items() if name in ("processes", "logins", "dns")}}
+
+
+FLIGHT_LOCK = threading.Lock()
+FLIGHT_RING = deque(maxlen=150)
+FLIGHT_RING_BYTES = 0
+
+
+def _flight_sample(metrics):
+    node = {"online": True, "metrics": metrics}
+    now = time.time()
+    age = _sample_age(node, now)
+    if age is None or not 0 <= age <= 10:
+        return None
+    context = _incident_context(node)
+    processes = [dict(item, name=_safe_text(item["name"], 64)) for item in context["processes"]]
+    row = {"timestamp": int(now-age), "values": {metric: _metric_value(node, metric, now)
+           for metric in ("cpu", "memory", "disk", "network", "load")}, "processes": processes,
+           "process_sample_at": metrics.get("collector_status", {}).get("processes", {}).get("sampled_at"),
+           "errors": list(metrics.get("collector_errors", {}))[:8]}
+    if len(json.dumps(row, ensure_ascii=False).encode("utf-8")) > 2048:
+        row["processes"], row["errors"] = [], []
+    return row
+
+
+def _limit_flight_records(now):
+    rows = STORE.data.setdefault("flight_records", [])
+    cutoff = now-_history_retention_seconds()
+    rows[:] = [row for row in rows if row["triggered_at"] >= cutoff]
+    while rows and (len(rows) > 16 or sum((row["_bytes"] if "_bytes" in row else sum(len(json.dumps(point, ensure_ascii=False).encode("utf-8")) for point in row.get("points", []))) for row in rows) > 1_800_000):
+        rows.pop(0)
+
+
+def _start_flight_record(incident):
+    """Called under the data lock; remote incidents keep their ordinary context."""
+    if incident["node"] != "local" or not STORE.data.get("flight_enabled"):
+        return
+    now = incident["triggered_at"]
+    with FLIGHT_LOCK:
+        points = [copy.deepcopy(point) for point, size in FLIGHT_RING if now-300 <= point["timestamp"] <= now]
+    record = {"id": incident["id"], "triggered_at": now, "end": now+120, "status": "recording", "points": points,
+              "interval": 2, "_bytes": sum(len(json.dumps(point, ensure_ascii=False).encode("utf-8")) for point in points)}
+    STORE.data.setdefault("flight_records", []).append(record)
+    _limit_flight_records(now)
+
+
+def _flight_sampler(stop_event):
+    """Reuse cached collectors; persist incident clips at most every thirty seconds."""
+    global FLIGHT_RING_BYTES
+    last_save, dirty = time.monotonic(), False
+    try:
+        while not stop_event.is_set():
+            _worker_tick("flight")
+            with STORE.lock:
+                enabled = bool(STORE.data.get("flight_enabled"))
+            row = _flight_sample(collect_snapshot()) if enabled else None
+            if row:
+                size = len(json.dumps(row, ensure_ascii=False).encode("utf-8"))
+                with FLIGHT_LOCK:
+                    if not FLIGHT_RING or row["timestamp"] > FLIGHT_RING[-1][0]["timestamp"]:
+                        if len(FLIGHT_RING) == FLIGHT_RING.maxlen:
+                            FLIGHT_RING_BYTES -= FLIGHT_RING[0][1]
+                        FLIGHT_RING.append((row, size))
+                        FLIGHT_RING_BYTES += size
+                        while FLIGHT_RING_BYTES > 300_000:
+                            FLIGHT_RING_BYTES -= FLIGHT_RING.popleft()[1]
+            elif not enabled:
+                with FLIGHT_LOCK:
+                    FLIGHT_RING.clear()
+                    FLIGHT_RING_BYTES = 0
+            now = int(time.time())
+            with STORE.lock:
+                for record in STORE.data.get("flight_records", []):
+                    if record["status"] != "recording":
+                        continue
+                    if not enabled or now > record["end"]:
+                        record["status"] = "complete" if enabled else "stopped"
+                        dirty = True
+                    elif row and row["timestamp"] >= record["triggered_at"] and (
+                            not record["points"] or row["timestamp"] > record["points"][-1]["timestamp"]):
+                        record["points"].append(copy.deepcopy(row))
+                        record["_bytes"] += size
+                        if len(record["points"]) > 211:
+                            removed = record["points"].pop(0)
+                            record["_bytes"] -= len(json.dumps(removed, ensure_ascii=False).encode("utf-8"))
+                        dirty = True
+                previous_ids = [record["id"] for record in STORE.data.get("flight_records", [])]
+                _limit_flight_records(now)
+                dirty = dirty or previous_ids != [record["id"] for record in STORE.data.get("flight_records", [])]
+                if dirty and time.monotonic()-last_save >= 30:
+                    try:
+                        STORE.save()
+                        last_save, dirty = time.monotonic(), False
+                    except OSError:
+                        pass
+            stop_event.wait(2)
+    finally:
+        with STORE.lock:
+            for record in STORE.data.get("flight_records", []):
+                if record["status"] == "recording":
+                    record["status"] = "stopped"
+                    dirty = True
+            if dirty:
+                try:
+                    STORE.save()
+                except OSError:
+                    sys.stderr.write("TinyWatch incident recorder: database write failed\n")
+
+
+def _flight_response(identity):
+    with STORE.lock:
+        record = next((row for row in STORE.data.get("flight_records", []) if row["id"] == identity), None)
+        if record is None:
+            raise ValueError("No retained flight record")
+        result = copy.deepcopy(record)
+    result.pop("_bytes", None)
+    points = result["points"]
+    result["start"] = result["triggered_at"]-300
+    covered = sum(right["timestamp"]-left["timestamp"] for left, right in zip(points, points[1:])
+                  if 0 < right["timestamp"]-left["timestamp"] <= 5)
+    result["coverage"] = round(min(1, covered/420)*100, 1)
+    result["gaps"] = [[left["timestamp"], right["timestamp"]] for left, right in zip(points, points[1:])
+                      if right["timestamp"]-left["timestamp"] > 5]
+    if not points:
+        result["gaps"] = [[result["start"], result["end"]]]
+    else:
+        if points[0]["timestamp"] > result["start"]:
+            result["gaps"].insert(0, [result["start"], points[0]["timestamp"]])
+        if points[-1]["timestamp"] < result["end"]:
+            result["gaps"].append([points[-1]["timestamp"], result["end"]])
+    return result
 
 
 def _alert_partition_mount(node, rule):
@@ -1874,6 +2540,7 @@ def _evaluate_alerts(nodes, now):
                         "context": _incident_context(node), "partition": rule.get("partition", "*"),
                         "partition_mount": _alert_partition_mount(node, rule)}
             incidents.append(incident)
+            _start_flight_record(incident)
             _queue_notification(incident, "active", now)
             state["active_id"] = incident["id"]
             state.pop("pending_since", None)
@@ -1895,6 +2562,7 @@ def _alerts_response():
     with STORE.lock:
         incidents = STORE.data.get("incidents", [])
         return copy.deepcopy({"rules": STORE.data.get("alert_rules", []), "states": STORE.data.get("alert_states", {}),
+                "flight_ids": [row["id"] for row in STORE.data.get("flight_records", [])],
                 "incidents": list(reversed(incidents)), "sample_interval": HISTORY_INTERVAL,
                 "active_count": sum(item.get("status") == "active" for item in incidents),
                 "unacknowledged_count": sum(item.get("status") == "active" and not item.get("acknowledged_at")
@@ -1908,10 +2576,19 @@ def _alert_counts():
                 "unacknowledged_count": sum(not item.get("acknowledged_at") for item in active)}
 
 
+def _configuration_candidate(previous):
+    """History rows are immutable here; config changes replace or remove series."""
+    candidate = {key: copy.deepcopy(value) for key, value in previous.items()
+                 if key not in ("history", "service_history")}
+    candidate["history"] = {identity: dict(series) for identity, series in previous.get("history", {}).items()}
+    candidate["service_history"] = dict(previous.get("service_history", {}))
+    return candidate
+
+
 def _save_alert_rules(value):
     with STORE.lock:
         previous = STORE.data
-        STORE.data = copy.deepcopy(previous)
+        STORE.data = _configuration_candidate(previous)
         try:
             return _apply_alert_rules(value)
         except Exception:
@@ -1983,8 +2660,10 @@ def _diagnostics_response(snapshot, now=None):
     for node_id, node in snapshot.get("nodes", {}).items():
         issues, metrics = [], node.get("metrics") or {}
         age = _sample_age(node, now)
-        if not node.get("online"):
-            status = "offline"
+        if node.get("pending"):
+            status = "initializing"
+        elif not node.get("online"):
+            status = "connection_failed"
         elif age is None or age > 120:
             status = "stale"
         else:
@@ -2006,13 +2685,15 @@ def _diagnostics_response(snapshot, now=None):
         reports.append({"id": node_id, "name": node.get("name") or node_id, "status": status,
                         "age_seconds": age, "last_success_at": node.get("last_success_at") or metrics.get("sampled_at"),
                         "latency_ms": node.get("latency_ms"), "issues": issues,
-                        "error": _safe_text(node.get("error"), 180),
+                        "error": "" if node.get("pending") else _safe_text(node.get("error"), 180),
+                        "retry_seconds": node.get("retry_seconds"), "received_at": node.get("received_at"),
+                        "next_retry_at": node.get("next_retry_at"), "consecutive_failures": node.get("consecutive_failures", 0),
                         "platform": _safe_text((metrics.get("info") or {}).get("os"), 40),
                         "collectors": copy.deepcopy(metrics.get("collector_status", {}))})
     return {"runtime": _runtime_health(now), "nodes": reports, "sampled_at": snapshot.get("sampled_at"),
             "history_interval": HISTORY_INTERVAL, "cache_seconds": CLUSTER_CACHE_SECONDS,
             "asset_limit": MAX_ASSETS, "rule_limit": MAX_ALERT_RULES,
-            "storage": {"bytes": getattr(STORE, "encoded_bytes", 0), "last_write_ms": getattr(STORE, "last_save_ms", None)}}
+            "storage": {"bytes": getattr(STORE, "encoded_bytes", 0), "last_write_ms": getattr(STORE, "last_save_ms", None), "encoded_days": STORE.last_encoded_days}}
 
 
 def _record_history(nodes, now=None):
@@ -2036,9 +2717,13 @@ def _record_history(nodes, now=None):
             age = _sample_age(node, now)
             if age is not None and (age > 120 or age < -120):
                 continue
+            sample_time = int(now - (age or 0))
             series = history.setdefault(str(node_id), {})
             if not isinstance(series, dict):
                 series = history[str(node_id)] = {}
+            observations = series.get("observations", [])
+            if observations and sample_time <= observations[-1][0]:
+                continue
             cpu = metrics.get("cpu") or {}
             memory = metrics.get("memory") or {}
             disk = metrics.get("disk") or {}
@@ -2087,12 +2772,13 @@ def _record_history(nodes, now=None):
                 points = series.setdefault(metric, [])
                 if not isinstance(points, list):
                     points = series[metric] = []
-                row = [int(now)] + values
+                row = [sample_time] + values
                 if (metric in ("memory", "disk", "disk_worst") or metric.startswith("disk@")) and points and len(points[-1]) > 2 and points[-1][2] != values[1]:
                     # A resize changes the denominator; start a new chart segment.
                     row.append({"resolution": 60, "gap_before": True})
                 points.append(row)
-            series.setdefault("observations", []).append([int(now), _incident_context(node)])
+            series.setdefault("observations", []).append([sample_time, _incident_context(node)])
+            STORE.mark_history_dirty(sample_time)
             _record_node_changes(node_id, node, now)
         _prune_history_database(STORE.data, cutoff)
         if now - STORE.last_compact_at >= HISTORY_COMPACT_INTERVAL:
@@ -2117,47 +2803,42 @@ def _history_response(node_id, metric, range_name, interface="", start=None, end
     else:
         lower_bound = now - HISTORY_RANGES[range_name]
         upper_bound = now
-    with STORE.lock:
-        all_history = STORE.data.get("history", {})
-        if not isinstance(all_history, dict):
-            all_history = {}
-        node_history = all_history.get(node_id, {})
-        points = node_history.get(history_metric, []) if isinstance(node_history, dict) else []
-        result, gaps = [], []
-        previous_timestamp = None
-        missing_interface = False
-        for point in points:
-            if not isinstance(point, list) or not point:
-                continue
-            timestamp = _number(point[0])
-            metadata = _point_metadata(point)
-            gap = bool(metadata["gap_before"]) if "gap_before" in metadata else (
-                previous_timestamp is not None and timestamp - previous_timestamp > HISTORY_GAP_SECONDS)
-            previous_timestamp = timestamp
-            if timestamp < lower_bound or timestamp > upper_bound:
-                continue
-            before = len(result)
-            if metric == "network":
-                interfaces = point[1] if len(point) > 1 and isinstance(point[1], dict) else {}
-                if interface:
-                    if interface not in interfaces:
-                        missing_interface = True
-                        continue
-                    rates = interfaces[interface]
-                else:
-                    rates = [sum(_number(rate[i]) for rate in interfaces.values()
-                                 if isinstance(rate, list) and len(rate) > i) for i in range(2)]
-                result.append([point[0], round(_number(rates[0]), 2), round(_number(rates[1]), 2)])
-            elif metric in ("cpu", "load"):
-                if len(point) > 1:
-                    result.append([point[0], point[1]])
-            elif metric in ("memory", "disk") and len(point) > 3:
-                result.append([point[0], point[1], point[2], point[3]])
-            if len(result) > before:
-                gaps.append(gap or missing_interface)
-                missing_interface = False
-        original_count = len(result)
-        result, gaps = _limit_history_points(result, gaps, metric)
+    points = STORE.history_window(node_id, history_metric, lower_bound-86400, upper_bound)
+    result, gaps = [], []
+    previous_timestamp = None
+    missing_interface = False
+    for point in points:
+        if not isinstance(point, list) or not point:
+            continue
+        timestamp = _number(point[0])
+        metadata = _point_metadata(point)
+        gap = bool(metadata["gap_before"]) if "gap_before" in metadata else (
+            previous_timestamp is not None and timestamp - previous_timestamp > HISTORY_GAP_SECONDS)
+        previous_timestamp = timestamp
+        if timestamp < lower_bound or timestamp > upper_bound:
+            continue
+        before = len(result)
+        if metric == "network":
+            interfaces = point[1] if len(point) > 1 and isinstance(point[1], dict) else {}
+            if interface:
+                if interface not in interfaces:
+                    missing_interface = True
+                    continue
+                rates = interfaces[interface]
+            else:
+                rates = [sum(_number(rate[i]) for rate in interfaces.values()
+                             if isinstance(rate, list) and len(rate) > i) for i in range(2)]
+            result.append([point[0], round(_number(rates[0]), 2), round(_number(rates[1]), 2)])
+        elif metric in ("cpu", "load"):
+            if len(point) > 1:
+                result.append([point[0], point[1]])
+        elif metric in ("memory", "disk") and len(point) > 3:
+            result.append([point[0], point[1], point[2], point[3]])
+        if len(result) > before:
+            gaps.append(gap or missing_interface)
+            missing_interface = False
+    original_count = len(result)
+    result, gaps = _limit_history_points(result, gaps, metric)
     return {"node": node_id, "metric": metric, "range": range_name, "interface": interface,
             "start": start, "end": end, "partition": partition, "points": result, "gaps": gaps,
             "source_count": original_count, "downsampled": original_count > len(result),
@@ -2171,62 +2852,116 @@ def _invalidate_cluster_snapshot():
         CLUSTER_SNAPSHOT_CACHE["generation"] = CLUSTER_SNAPSHOT_CACHE.get("generation", 0) + 1
 
 
-def collect_cluster_snapshot(force_refresh=False):
-    """Return a short-lived cluster cache so browser polls do not fan out per request."""
-    with CLUSTER_SNAPSHOT_LOCK:
+def _dashboard_activity():
+    with ASSET_CACHE_LOCK:
         now = time.monotonic()
-        cached = CLUSTER_SNAPSHOT_CACHE["data"]
-        cache_age = now - CLUSTER_SNAPSHOT_CACHE["sampled_at"]
-        generation = CLUSTER_SNAPSHOT_CACHE.get("generation", 0)
-        if cached is not None and cache_age < CLUSTER_CACHE_SECONDS:
-            return cached
+        if now-ASSET_ACTIVITY["last_poll"] > 30:
+            ASSET_ACTIVITY["wake"] = True
+        ASSET_ACTIVITY["last_poll"] = now
 
-    acquired = CLUSTER_REFRESH_LOCK.acquire(blocking=False)
-    if not acquired:
-        if cached is not None and not force_refresh:
-            # Keep serving the most recent snapshot while another poll refreshes it.
-            return cached
-        with CLUSTER_REFRESH_LOCK:
-            with CLUSTER_SNAPSHOT_LOCK:
-                refreshed = CLUSTER_SNAPSHOT_CACHE["data"]
-        if refreshed is None:
-            return collect_cluster_snapshot(force_refresh=force_refresh)
-        return refreshed
 
+def _asset_sampler(stop_event):
+    """Keep one outstanding request per asset; publish each completion separately."""
+    due, failures, running, configurations, started = {}, {}, {}, {}, {}
+    pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="tinywatch-asset")
     try:
-        # Recheck after taking the refresh lock; another request may have filled the cache.
-        with CLUSTER_SNAPSHOT_LOCK:
+        while not stop_event.is_set():
+            _worker_tick("assets", requests_used=len(running), requests_limit=8,
+                         requests_overdue=sum(time.monotonic()-stamp > 30 for stamp in started.values()),
+                         requests_oldest_seconds=int(max((time.monotonic()-stamp for stamp in started.values()), default=0)))
+            with STORE.lock:
+                assets = copy.deepcopy(STORE.data.get("assets", []))[:MAX_ASSETS]
+            current = {asset["id"]: asset for asset in assets}
+            for identity, asset in current.items():
+                if configurations.get(identity) != asset:
+                    configurations[identity] = asset
+                    due[identity], failures[identity] = 0, 0
+            with ASSET_CACHE_LOCK:
+                active = time.monotonic()-ASSET_ACTIVITY["last_poll"] <= 30
+                wake = ASSET_ACTIVITY["wake"]
+                ASSET_ACTIVITY["wake"] = False
+            if wake:
+                for identity in current:
+                    if not failures.get(identity):
+                        due[identity] = min(due.get(identity, 0), time.monotonic())
+            for future, asset in list(running.items()):
+                if not future.done():
+                    continue
+                del running[future]
+                started.pop(future, None)
+                result = future.result()
+                with STORE.lock:
+                    latest = next((item for item in STORE.data.get("assets", []) if item["id"] == asset["id"]), None)
+                    if latest != asset:
+                        continue
+                    failures[asset["id"]] = 0 if result["online"] else min(6, failures.get(asset["id"], 0)+1)
+                    delay = min(300, CLUSTER_CACHE_SECONDS * 2 ** failures[asset["id"]]) if failures[asset["id"]] else (CLUSTER_CACHE_SECONDS if active else HISTORY_INTERVAL)
+                    due[asset["id"]] = time.monotonic()+delay
+                    result.update(received_at=int(time.time()), retry_seconds=delay,
+                                  next_retry_at=int(time.time()+delay), consecutive_failures=failures[asset["id"]])
+                    with ASSET_CACHE_LOCK:
+                        ASSET_CACHE[asset["id"]] = {"configuration": asset, "result": result}
+                _invalidate_cluster_snapshot()
+            with ASSET_CACHE_LOCK:
+                for identity in list(ASSET_CACHE):
+                    if ASSET_CACHE[identity]["configuration"] != current.get(identity):
+                        del ASSET_CACHE[identity]
+            for identity in list(due):
+                if identity not in current:
+                    due.pop(identity, None)
+                    failures.pop(identity, None)
+                    configurations.pop(identity, None)
+            busy = {asset["id"] for asset in running.values()}
             now = time.monotonic()
-            cached = CLUSTER_SNAPSHOT_CACHE["data"]
-            generation = CLUSTER_SNAPSHOT_CACHE.get("generation", 0)
-            if cached is not None and now - CLUSTER_SNAPSHOT_CACHE["sampled_at"] < CLUSTER_CACHE_SECONDS:
-                return cached
-        local_started = time.monotonic()
-        local_metrics = collect_snapshot()
-        nodes = {"local": {"id": "local", "name": socket.gethostname(), "online": True,
-                            "metrics": local_metrics,
-                            "latency_ms": round((time.monotonic() - local_started) * 1000, 1)}}
-        with STORE.lock:
-            assets = list(STORE.data.get("assets", []))[:MAX_ASSETS]
-        if assets:
-            with ThreadPoolExecutor(max_workers=min(8, len(assets))) as pool:
-                futures = [pool.submit(_remote_snapshot, item) for item in assets]
-                for future in as_completed(futures):
-                    result = future.result()
-                    nodes[result["id"]] = result
-        active_ids = {item["id"] for item in assets}
-        with REMOTE_STATUS_LOCK:
-            for asset_id in list(REMOTE_LAST_SUCCESS):
-                if asset_id not in active_ids:
-                    del REMOTE_LAST_SUCCESS[asset_id]
-        result = {"nodes": nodes, "sampled_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
-        with CLUSTER_SNAPSHOT_LOCK:
-            if CLUSTER_SNAPSHOT_CACHE.get("generation", 0) == generation:
-                CLUSTER_SNAPSHOT_CACHE["sampled_at"] = time.monotonic()
-                CLUSTER_SNAPSHOT_CACHE["data"] = result
-        return result
+            for asset in sorted(assets, key=lambda item: due.get(item["id"], 0)):
+                identity = asset["id"]
+                with ASSET_CACHE_LOCK:
+                    cached = ASSET_CACHE.get(identity)
+                if cached is None and identity not in busy:
+                    due[identity] = min(due.get(identity, now), now)
+                if identity not in busy and len(running) < 8 and now >= due.get(identity, 0):
+                    future = pool.submit(_remote_snapshot, asset)
+                    running[future] = asset
+                    started[future] = time.monotonic()
+            with REMOTE_STATUS_LOCK:
+                for identity in list(REMOTE_LAST_SUCCESS):
+                    if identity not in current:
+                        del REMOTE_LAST_SUCCESS[identity]
+            stop_event.wait(.5)
     finally:
-        CLUSTER_REFRESH_LOCK.release()
+        # Do not create a replacement pool while old requests still own slots.
+        pool.shutdown(wait=True, cancel_futures=True)
+
+
+def collect_cluster_snapshot(force_refresh=False):
+    """Combine local metrics with the latest independent asset samples."""
+    with CLUSTER_SNAPSHOT_LOCK:
+        cached = CLUSTER_SNAPSHOT_CACHE["data"]
+        generation = CLUSTER_SNAPSHOT_CACHE["generation"]
+        if not force_refresh and cached is not None and time.monotonic()-CLUSTER_SNAPSHOT_CACHE["sampled_at"] < CLUSTER_CACHE_SECONDS:
+            return cached
+    started = time.monotonic()
+    metrics = collect_snapshot()
+    nodes = {"local": {"id": "local", "name": socket.gethostname(), "online": True, "metrics": metrics,
+                        "latency_ms": round((time.monotonic()-started)*1000, 1)}}
+    with STORE.lock:
+        assets = copy.deepcopy(STORE.data.get("assets", []))[:MAX_ASSETS]
+    with ASSET_CACHE_LOCK:
+        for asset in assets:
+            cached = ASSET_CACHE.get(asset["id"])
+            if cached and cached["configuration"] == asset:
+                nodes[asset["id"]] = copy.deepcopy(cached["result"])
+                node = nodes[asset["id"]]
+                age = _sample_age(node, time.time())
+                node["status"] = "connection_failed" if not node["online"] else "stale" if age is None or abs(age) > 120 else "healthy"
+            else:
+                nodes[asset["id"]] = {"id": asset["id"], "name": asset["name"], "online": False,
+                                      "pending": True, "status": "initializing", "metrics": None, "error": "Awaiting first sample", "last_success_at": None}
+    result = {"nodes": nodes, "sampled_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+    with CLUSTER_SNAPSHOT_LOCK:
+        if CLUSTER_SNAPSHOT_CACHE["generation"] == generation:
+            CLUSTER_SNAPSHOT_CACHE.update(data=result, sampled_at=time.monotonic())
+    return result
 
 
 def _history_sampler(stop_event):
@@ -2325,10 +3060,10 @@ def _investigation_response(node_id, start, end, partition=""):
             or start >= end or end > now + 60 or start < now - _history_retention_seconds()
             or end - start > _history_retention_seconds()):
         raise ValueError("Invalid investigation time range")
+    charts = {metric: _history_response(node_id, metric, "custom", start=start, end=end,
+                                        partition=partition if metric == "disk" else "")
+              for metric in ("cpu", "memory", "disk", "network", "load")}
     with STORE.lock:
-        charts = {metric: _history_response(node_id, metric, "custom", start=start, end=end,
-                                            partition=partition if metric == "disk" else "")
-                  for metric in ("cpu", "memory", "disk", "network", "load")}
         events = [copy.deepcopy(item) for item in STORE.data.get("timeline", [])
                   if item["node"] == node_id and start <= item["timestamp"] <= end]
         incidents = [copy.deepcopy(item) for item in STORE.data.get("incidents", [])
@@ -2346,6 +3081,72 @@ def _investigation_response(node_id, start, end, partition=""):
     return {"node": node_id, "name": name, "start": start, "end": min(end, now), "charts": charts,
             "events": events, "incidents": incidents, "observations": observations,
             "generated_at": int(now), "sample_interval": HISTORY_INTERVAL}
+
+
+def _comparison_summary(points, metric, start, end):
+    """Only raw observations support sample medians and measured coverage."""
+    values, valid = [], []
+    for row in points:
+        if not isinstance(row, list) or len(row) < 2:
+            continue
+        metadata = _point_metadata(row)
+        if metadata.get("resolution", 60) > 60:
+            continue
+        if metric == "network":
+            rates = row[1] if isinstance(row[1], dict) else {}
+            value = sum(sum(_number(rate) for rate in pair[:2]) for pair in rates.values() if isinstance(pair, list)) if rates else None
+        else:
+            value = _finite_value(row[3] if len(row) > 3 else None) if metric in ("memory", "disk") else _finite_value(row[1])
+        if value is not None:
+            valid.append((row[0], value, bool(metadata.get("gap_before"))))
+            if start <= row[0] < end:
+                values.append(value)
+    valid.sort()
+    covered = sum(max(0, min(end, right[0])-max(start, left[0]))
+                  for left, right in zip(valid, valid[1:])
+                  if 0 < right[0]-left[0] <= HISTORY_GAP_SECONDS and not right[2])
+    return {"samples": len(values), "median": round(statistics.median(values), 3) if values else None,
+            "peak": round(max(values), 3) if values else None,
+            "coverage": round(min(1, covered/(end-start))*100, 1), "raw_only": True}
+
+
+def _change_comparison(identity, center, span):
+    now = time.time()
+    if (not isinstance(identity, str) or center is None or span is None or not 300 <= span <= 86400
+            or center > now or center-span < now-_history_retention_seconds()):
+        raise ValueError("Choose a change time within retention and a window of five minutes to one day")
+    with STORE.lock:
+        valid = {"local"} | {item["id"] for item in STORE.data.get("assets", [])}
+        if identity not in valid:
+            raise ValueError("Unknown asset")
+        incidents = copy.deepcopy([item for item in STORE.data.get("incidents", []) if item["node"] == identity])
+        services = copy.deepcopy([item for item in STORE.data.get("services", []) if item["node"] == identity])
+        buckets = {item["id"]: copy.deepcopy(STORE.data.get("service_history", {}).get(item["id"], [])) for item in services}
+    histories = STORE.history_windows(identity, {"cpu", "memory", "disk", "network", "load"}, center-span-90, min(now, center+span))
+    windows = {}
+    for side, start, end in (("before", center-span, center), ("after", center, center+span)):
+        resources = {metric: _comparison_summary(rows, metric, start, end) for metric, rows in histories.items()}
+        checks = []
+        for service in services:
+            rows = [row for row in buckets[service["id"]] if start <= row["bucket"] and row["bucket"]+300 <= min(end, now)]
+            samples = sum(row["samples"] for row in rows)
+            duration = sum(row["sum_ms"] for row in rows)
+            covered = sum(min(300, max(0, row["last_at"]-row["first_at"])) for row in rows)
+            checks.append({"id": service["id"], "name": service["name"], "samples": samples,
+                           "failures": sum(row["samples"]-row["successes"] for row in rows),
+                           "mean_ms": round(duration/samples, 1) if samples else None,
+                           "coverage": round(min(1, covered/span)*100, 1)})
+        windows[side] = {"start": start, "end": end, "complete": end <= now, "resources": resources, "services": checks,
+                         "triggered": [item["id"] for item in incidents if start <= item["triggered_at"] < min(end, now)],
+                         "resolved": [item["id"] for item in incidents if item.get("resolved_at") is not None and start <= item["resolved_at"] < min(end, now)],
+                         "active_at_end": [item["id"] for item in incidents if item["triggered_at"] <= min(end, now)
+                                           and (item.get("resolved_at") is None or item["resolved_at"] > min(end, now))]}
+    changes = {}
+    for metric in histories:
+        left, right = windows["before"]["resources"][metric], windows["after"]["resources"][metric]
+        changes[metric] = {"median_delta": round(right["median"]-left["median"], 3) if left["median"] is not None and right["median"] is not None else None,
+                           "sufficient": left["coverage"] >= 80 and right["coverage"] >= 80 and windows["after"]["complete"]}
+    return {"node": identity, "center": center, "span": span, "windows": windows, "changes": changes, "generated_at": int(now)}
 
 
 def _outbound_url(value):
@@ -2403,7 +3204,7 @@ def _queue_notification(incident, kind, now):
 def _service_response():
     with STORE.lock:
         now = time.time()
-        return copy.deepcopy({"revision": STORE.data.get("service_revision", 0), "heartbeats": STORE.data.get("heartbeats", []), "services": STORE.data.get("services", []), "states": STORE.data.get("service_states", {}),
+        return copy.deepcopy({"revision": STORE.data.get("service_revision", 0), "heartbeats": STORE.data.get("heartbeats", []), "runs": STORE.data.get("job_runs", {}), "services": STORE.data.get("services", []), "states": STORE.data.get("service_states", {}),
                 "history": {key: [bucket for bucket in rows if bucket["last_at"] >= now-86400][-288:]
                             for key, rows in STORE.data.get("service_history", {}).items()}, "maintenance": STORE.data.get("maintenance", []),
                 "notifications": STORE.data.get("notifications", {}),
@@ -2422,7 +3223,7 @@ def _save_services(value):
         if type(value.get("revision")) is not int or value["revision"] != revision:
             raise ConfigurationConflict("Configuration changed. Refresh and retry.")
         previous = STORE.data
-        STORE.data = copy.deepcopy(previous)
+        STORE.data = _configuration_candidate(previous)
         try:
             result = _apply_services(value)
         except Exception:
@@ -2473,28 +3274,33 @@ def _apply_services(value):
                     raise ValueError("Invalid heartbeat")
                 identity, node, name = row.get("id"), row.get("node"), row.get("name")
                 interval, grace = row.get("interval"), row.get("grace")
+                max_runtime = row.get("max_runtime", 3600)
                 if (not isinstance(identity, str) or not re.fullmatch(r"job-[A-Za-z0-9_-]{1,90}", identity)
                         or identity in identities or identity in service_ids or not isinstance(node, str) or node not in valid_nodes
                         or not isinstance(name, str) or not name.strip() or len(name) > 80
                         or type(interval) is not int or not 60 <= interval <= 30*86400
-                        or type(grace) is not int or not 0 <= grace <= 7*86400):
+                        or type(grace) is not int or not 0 <= grace <= 7*86400
+                        or type(max_runtime) is not int or not 60 <= max_runtime <= 7*86400):
                     raise ValueError("Invalid heartbeat identity, interval or grace")
                 identities.add(identity)
                 prior = old.get(identity, {})
                 clean.append({"id": identity, "node": node, "name": name.strip(), "interval": interval,
-                              "grace": grace, "token": prior.get("token") or secrets.token_urlsafe(24),
+                              "grace": grace, "max_runtime": max_runtime, "token": prior.get("token") or secrets.token_urlsafe(24),
                               "created_at": prior.get("created_at", int(time.time())),
                               "last_success_at": prior.get("last_success_at"), "last_duration_ms": prior.get("last_duration_ms")})
             removed = set(old)-identities
             moved = {job["id"] for job in clean if job["id"] in old and old[job["id"]]["node"] != job["node"]}
             for identity in moved:
+                STORE.data.get("job_runs", {}).pop(identity, None)
                 STORE.data.get("service_states", {}).pop(identity, None)
             for incident in STORE.data.get("incidents", []):
                 if incident.get("status") == "active" and incident.get("service_id") in removed | moved:
                     _resolve_incident(incident, time.time(), "rule_changed")
             for identity in removed:
+                STORE.data.get("job_runs", {}).pop(identity, None)
                 STORE.data.get("service_states", {}).pop(identity, None)
                 STORE.data.get("service_history", {}).pop(identity, None)
+                STORE.mark_history_dirty()
             STORE.data["heartbeats"] = clean
         elif value.get("action") == "services":
             rows = value.get("services")
@@ -2509,12 +3315,15 @@ def _apply_services(value):
                 interval, timeout = _finite_value(row.get("interval")), _finite_value(row.get("timeout"))
                 failures = _finite_value(row.get("failures"))
                 if (not isinstance(identity, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", identity) or identity in ids or identity.startswith("job-")
-                        or not isinstance(node, str) or node not in valid_nodes or protocol not in ("http", "tcp")
+                        or not isinstance(node, str) or node not in valid_nodes or protocol not in ("http", "tcp", "tls")
                         or not isinstance(name, str) or not name.strip() or len(name) > 80
                         or interval is None or interval != int(interval) or not 30 <= interval <= 3600
                         or timeout is None or not 1 <= timeout <= 10 or failures is None or failures != int(failures) or not 1 <= failures <= 10
                         or not isinstance(match, str) or len(match) > 128 or not isinstance(row.get("enabled", True), bool)):
                     raise ValueError("Invalid service identity or limits")
+                cert_days = row.get("cert_days", 30)
+                if type(cert_days) is not int or cert_days not in (7, 14, 30):
+                    raise ValueError("Certificate warning must be 7, 14 or 30 days")
                 status = row.get("status", 200)
                 if isinstance(status, bool) or not isinstance(status, int) or not 200 <= status <= 599:
                     raise ValueError("Invalid expected HTTP status")
@@ -2528,7 +3337,8 @@ def _apply_services(value):
                 ids.add(identity)
                 clean.append({"id": identity, "node": node, "name": name.strip(), "protocol": protocol,
                               "target": target, "port": port, "match": match, "status": status,
-                              "interval": int(interval), "timeout": timeout, "failures": int(failures), "enabled": row.get("enabled", True)})
+                              "interval": int(interval), "timeout": timeout, "failures": int(failures),
+                              "cert_days": cert_days, "enabled": row.get("enabled", True)})
             old = {item["id"]: item for item in STORE.data.get("services", [])}
             current = {item["id"]: item for item in clean}
             identity_fields = ("node", "protocol", "target", "port", "match", "status")
@@ -2539,11 +3349,12 @@ def _apply_services(value):
             for key in changed:
                 STORE.data.get("service_states", {}).pop(key, None)
                 STORE.data.get("service_history", {}).pop(key, None)
+                STORE.mark_history_dirty()
             for identity, service in current.items():
                 if identity not in old or identity in changed:
                     continue
                 state = STORE.data.get("service_states", {}).get(identity)
-                if state and any(old[identity].get(field) != service.get(field) for field in ("enabled", "failures", "interval", "timeout")):
+                if state and any(old[identity].get(field) != service.get(field) for field in ("enabled", "failures", "interval", "timeout", "cert_days")):
                     state["failed_count"] = 0
                     state.pop("failed_since", None)
                 for incident in STORE.data.get("incidents", []):
@@ -2562,13 +3373,34 @@ def _apply_services(value):
 
 
 def _probe_service(service):
-    """Check the configured target; socket timeouts may not bound DNS resolution."""
     started = time.monotonic()
-    code, error, ok = None, "", False
     try:
-        if service["protocol"] == "tcp":
-            with socket.create_connection((service["target"], service["port"]), timeout=service["timeout"]):
-                ok = True
+        return _bounded_network_probe("service", service, service["timeout"]+2)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return {"sampled_at": int(time.time()), "ok": False, "latency_ms": round((time.monotonic()-started)*1000, 1),
+                "status_code": None, "error": "probe_timeout", "certificate_expires_at": None,
+                "certificate_days_remaining": None}
+
+
+def _probe_service_direct(service):
+    """Probe from the console host; TLS uses hostname and chain verification."""
+    started = time.monotonic()
+    code, error, ok, certificate = None, "", False, {}
+    try:
+        if service["protocol"] in ("tcp", "tls"):
+            with socket.create_connection((service["target"], service["port"]), timeout=service["timeout"]) as connection:
+                if service["protocol"] == "tls":
+                    context = ssl.create_default_context()
+                    with context.wrap_socket(connection, server_hostname=service["target"]) as secured:
+                        peer = secured.getpeercert()
+                        expires = ssl.cert_time_to_seconds(peer["notAfter"])
+                        remaining = (expires-time.time())/86400
+                        certificate = {"certificate_expires_at": int(expires), "certificate_days_remaining": round(remaining, 2)}
+                        ok = remaining > service.get("cert_days", 30)
+                        if not ok:
+                            error = "certificate_expiring"
+                else:
+                    ok = True
         else:
             opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _RejectRedirectHandler())
             request = urllib.request.Request(service["target"], headers={"User-Agent": APP_NAME + "/" + APP_VERSION})
@@ -2582,10 +3414,19 @@ def _probe_service(service):
             ok = code == service["status"] and (not service["match"] or service["match"] in body.decode("utf-8", "replace"))
             if not ok:
                 error = "unexpected_status" if code != service["status"] else "content_mismatch"
+    except ssl.SSLCertVerificationError:
+        error = "certificate_invalid"
+    except ssl.SSLError:
+        error = "tls_failed"
+    except socket.gaierror:
+        error = "dns_failed"
+    except (TimeoutError, socket.timeout):
+        error = "probe_timeout"
     except Exception:
         error = "connection_failed"
     return {"sampled_at": int(time.time()), "ok": ok, "latency_ms": round((time.monotonic()-started)*1000, 1),
-            "status_code": code, "error": error}
+            "status_code": code, "error": error, "certificate_expires_at": certificate.get("certificate_expires_at"),
+            "certificate_days_remaining": certificate.get("certificate_days_remaining")}
 
 
 def _record_probe(service, result):
@@ -2618,17 +3459,22 @@ def _record_probe(service, result):
                     "threshold": 0, "recovery": 0, "duration": now-state.get("failed_since", now), "value": 1, "last_value": 1, "peak": 1,
                     "last_observed_at": now, "baseline": None, "context": {"probe_error": result["error"]}}
         STORE.data.setdefault("incidents", []).append(incident)
+        _start_flight_record(incident)
         state["active_id"] = incident["id"]
         _queue_notification(incident, "active", now)
     buckets = STORE.data.setdefault("service_history", {}).setdefault(identity, [])
     bucket_time = now//300*300
-    if not buckets or buckets[-1]["bucket"] != bucket_time:
-        buckets.append({"bucket": bucket_time, "first_at": now, "last_at": now, "samples": 0, "successes": 0,
-                        "sum_ms": 0, "min_ms": result["latency_ms"], "max_ms": result["latency_ms"]})
-    bucket = buckets[-1]
-    bucket.update(last_at=now, samples=bucket["samples"]+1, successes=bucket["successes"]+int(result["ok"]),
+    index = bisect.bisect_left(buckets, bucket_time, key=lambda item: item["bucket"])
+    if index == len(buckets) or buckets[index]["bucket"] != bucket_time:
+        buckets.insert(index, {"bucket": bucket_time, "first_at": now, "last_at": now, "samples": 0, "successes": 0,
+                               "sum_ms": 0, "min_ms": result["latency_ms"], "max_ms": result["latency_ms"]})
+    bucket = buckets[index]
+    bucket.update(first_at=min(now, bucket["first_at"]), last_at=max(now, bucket["last_at"]),
+                  samples=bucket["samples"]+1, successes=bucket["successes"]+int(result["ok"]),
                   sum_ms=bucket["sum_ms"]+result["latency_ms"], min_ms=min(bucket["min_ms"], result["latency_ms"]),
                   max_ms=max(bucket["max_ms"], result["latency_ms"]))
+    _mark_changed_rows(STORE.data, buckets[:-2048], service=True)
+    STORE.mark_history_dirty(now)
     del buckets[:-2048]
 
 
@@ -2636,47 +3482,114 @@ def _heartbeat_service(job):
     return dict(job, failures=1, timeout=0)
 
 
+def _heartbeat_rollback(identities):
+    previous = STORE.data
+    candidate = {key: (value if key in ("history", "service_history") else copy.deepcopy(value))
+                 for key, value in previous.items()}
+    candidate["service_history"] = dict(previous.get("service_history", {}))
+    for identity in identities:
+        if identity in candidate["service_history"]:
+            candidate["service_history"][identity] = copy.deepcopy(candidate["service_history"][identity])
+    STORE.data = candidate
+    return previous
+
+
+def _prune_job_runs(now):
+    cutoff = now-_history_retention_seconds()
+    runs = STORE.data.setdefault("job_runs", {})
+    valid = {job["id"] for job in STORE.data.get("heartbeats", [])}
+    for identity in list(runs):
+        if identity not in valid:
+            del runs[identity]
+            continue
+        rows = [row for row in runs[identity] if row["status"] == "running" or row.get("finished_at", row.get("started_at", 0)) >= cutoff]
+        active = [row for row in rows if row["status"] == "running"]
+        completed = [row for row in rows if row["status"] != "running"]
+        runs[identity] = sorted(completed[-(50-len(active)):]+active, key=lambda row: row.get("started_at") or row.get("finished_at", 0))
+
+
 def _check_heartbeats():
-    """A missed deadline opens once; only a successful report recovers it."""
+    """Running jobs have a bounded runtime; idle jobs retain the success deadline."""
     now = int(time.time())
     with STORE.lock:
-        changed = False
-        previous = None
+        plans = []
         for job in STORE.data.get("heartbeats", []):
+            runs = STORE.data.get("job_runs", {}).get(job["id"], [])
+            active = [row for row in runs if row["status"] == "running"]
+            expired = [row["id"] for row in active if now > row["started_at"]+job.get("max_runtime", 3600)]
             deadline = (job.get("last_success_at") or job["created_at"])+job["interval"]+job["grace"]
-            state = STORE.data.get("service_states", {}).get(job["id"], {})
-            if now > deadline and not state.get("active_id"):
-                if previous is None:
-                    previous = copy.deepcopy(STORE.data)
-                _record_probe(_heartbeat_service(job), {"sampled_at": now, "ok": False,
-                              "latency_ms": 0, "status_code": None, "error": "heartbeat_overdue"})
-                changed = True
-        if changed:
-            try:
-                STORE.save()
-            except Exception:
-                STORE.data = previous
-                raise
+            missing = not active and now > deadline and not STORE.data.get("service_states", {}).get(job["id"], {}).get("active_id")
+            if expired or missing:
+                plans.append((job["id"], expired))
+        if not plans:
+            return
+        previous = _heartbeat_rollback([identity for identity, _ in plans])
+        try:
+            for identity, expired in plans:
+                job = next(item for item in STORE.data["heartbeats"] if item["id"] == identity)
+                for row in STORE.data.get("job_runs", {}).get(identity, []):
+                    if row["id"] in expired:
+                        row.update(status="timeout", finished_at=now, timed_out_at=now,
+                                   duration_ms=(now-row["started_at"])*1000)
+                _record_probe(_heartbeat_service(job), {"sampled_at": now, "ok": False, "latency_ms": 0,
+                              "status_code": None, "error": "task_timeout" if expired else "heartbeat_overdue"})
+            _prune_job_runs(now)
+            STORE.save()
+        except Exception:
+            STORE.data = previous
+            raise
 
 
 def _receive_heartbeat(value, token):
     if not isinstance(token, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", token):
         return False
     with STORE.lock:
-        job = next((item for item in STORE.data.get("heartbeats", [])
-                    if isinstance(token, str) and hmac.compare_digest(item["token"], token)), None)
+        job = next((item for item in STORE.data.get("heartbeats", []) if secrets.compare_digest(item["token"], token)), None)
         if job is None:
             return False
-        duration = value.get("duration_ms", 0)
-        if isinstance(duration, bool) or not isinstance(duration, (int, float)) or not math.isfinite(duration) or not 0 <= duration <= 30*86400*1000:
+        event, identity = value.get("event", "success"), value.get("run_id")
+        message, duration = value.get("message", ""), value.get("duration_ms")
+        if event not in ("start", "success", "fail"):
+            raise ValueError("Use event start, success or fail")
+        if identity is not None and (not isinstance(identity, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,100}", identity)):
+            raise ValueError("Invalid run_id")
+        if event != "success" and identity is None:
+            raise ValueError("Start and failure reports require run_id")
+        if not isinstance(message, str) or len(message) > 240:
+            raise ValueError("Result message must be at most 240 characters")
+        if duration is not None and (isinstance(duration, bool) or not isinstance(duration, (int, float))
+                or not math.isfinite(duration) or not 0 <= duration <= 30*86400*1000):
             raise ValueError("Invalid task duration")
-        previous = copy.deepcopy(STORE.data)
+        rows = STORE.data.get("job_runs", {}).get(job["id"], [])
+        run = next((row for row in rows if row["id"] == identity), None) if identity else None
+        status = {"start": "running", "success": "success", "fail": "failed"}[event]
+        if run and run["status"] == status:
+            return True
+        if run and run["status"] not in ("running", "timeout"):
+            raise ValueError("Run already completed with a different result")
+        if run and event == "start":
+            raise ValueError("A completed run cannot restart; use a new run_id")
+        if event == "start" and sum(row["status"] == "running" for row in rows) >= 4:
+            raise ValueError("At most four simultaneous runs per task")
+        previous = _heartbeat_rollback([job["id"]])
+        job = next(item for item in STORE.data["heartbeats"] if item["id"] == job["id"])
         try:
             now = int(time.time())
-            job["last_success_at"] = now
-            job["last_duration_ms"] = duration
-            _record_probe(_heartbeat_service(job), {"sampled_at": now, "ok": True, "latency_ms": duration,
-                          "status_code": None, "error": ""})
+            rows = STORE.data.setdefault("job_runs", {}).setdefault(job["id"], [])
+            run = next((row for row in rows if row["id"] == identity), None) if identity else None
+            if run is None:
+                run = {"id": identity or "legacy-"+uuid.uuid4().hex, "started_at": now if event == "start" else None,
+                       "overlap": event == "start" and any(row["status"] == "running" for row in rows)}
+                rows.append(run)
+            run.update(status=status, message=_safe_text(message, 240))
+            if event != "start":
+                duration = duration if duration is not None else max(0, (now-run["started_at"])*1000) if run.get("started_at") else 0
+                run.update(finished_at=now, duration_ms=duration)
+                if event == "success":
+                    job.update(last_success_at=now, last_duration_ms=duration)
+                _record_probe(_heartbeat_service(job), {"sampled_at": now, "ok": event == "success", "latency_ms": duration,
+                              "status_code": None, "error": "" if event == "success" else "task_failed"})
+            _prune_job_runs(now)
             STORE.save()
         except Exception:
             STORE.data = previous
@@ -2763,7 +3676,7 @@ def _service_sampler(stop_event):
                     due[identity] = now+service["interval"]
             stop_event.wait(1)
     finally:
-        pool.shutdown(wait=False, cancel_futures=True)
+        pool.shutdown(wait=True, cancel_futures=True)
         if dirty:
             with STORE.lock:
                 try:
@@ -3295,7 +4208,7 @@ function widgetCard(widget,node,asset){
   else if(!node.online){
     const lastSuccess=node.last_success_at?new Date(node.last_success_at):null;
     const lastSuccessText=lastSuccess&&Number.isFinite(lastSuccess.getTime())?'<div class="metric-sub">'+tr('最后成功采样')+': '+esc(lastSuccess.toLocaleString(LANGUAGE_LOCALE[state.language]||'en-US'))+'</div>':'';
-    content='<div class="asset-error">离线 · '+esc(node.error||'无法连接')+lastSuccessText+'</div>';
+    content='<div class="asset-error">'+esc(ft(node.pending?'initializing':'connection_failed'))+(node.pending?'':' · '+esc(ft(node.error||'')))+lastSuccessText+(node.next_retry_at?'<p class="helper">'+esc(ft('next_retry'))+': '+esc(featureDate(node.next_retry_at))+'</p>':'')+'</div>';
   }
   else{
     const metric=node.metrics;
@@ -3314,6 +4227,7 @@ function widgetCard(widget,node,asset){
       case'info':content=infoCard(metric);break;default:content='<div class="empty">未选择有效监控项</div>';
     }
   }
+  if(node?.online&&node.status==='stale')content='<p class="asset-error">'+esc(ft('stale'))+'</p>'+content;
   const tools=(widget.metric==='network'&&node&&node.metrics?interfaceSelector(node.metrics.network,widget.node):'')+
     (historySelector(widget,node))+
     (widget.metric==='disk'&&node&&node.metrics?partitionSelector(node.metrics.disk,widget.node)+'<button class="select-mini" data-disk="'+esc(widget.node)+'">分区详情</button>':'')+
@@ -3633,7 +4547,23 @@ function bindWidget(el,w){
 async function saveConfig(){await api('/api/config','POST',{assets:state.config.assets,widgets:state.config.widgets,theme:state.config.theme,history_retention_days:state.config.history_retention_days});state.config=await api('/api/config')}
 function modal(content,wide){state.serviceRequest++;state.serviceLoading=false;state.replayRequest++;state.replayController?.abort();state.modalKind='';state.alertRequest++;state.alertLoading=false;const box=document.getElementById('modal');box.className='modal-backdrop open';box.innerHTML='<section class="modal '+(wide?'wide-modal':'')+'">'+content+'</section>';localizeDOM(box);box.onclick=e=>{if(e.target===box)closeModal()};const close=box.querySelectorAll('[data-close]');close.forEach(x=>x.onclick=closeModal);state.modal=box}
 function closeModal(){state.serviceRequest++;state.replayRequest++;state.replayController?.abort();document.getElementById('chart-tooltip')?.classList.remove('visible');state.modalKind='';state.alertRequest++;state.alertLoading=false;const box=document.getElementById('modal');if(box){box.className='modal-backdrop';box.innerHTML=''}state.modal=null}
-function showDisks(id){const node=nodeFor(id);if(!node||!node.metrics)return;const rows=node.metrics.disk.partitions||[];modal('<header class="modal-head"><h3>磁盘与分区 · '+esc(node.name)+'</h3><button class="close" data-close>×</button></header><div style="overflow:auto"><table class="data-table"><thead><tr><th>挂载点</th><th>设备</th><th>文件系统</th><th>已用 / 总量</th><th>使用率</th></tr></thead><tbody>'+rows.map(x=>'<tr><td>'+esc(x.mount)+'</td><td>'+esc(x.device)+'</td><td>'+esc(x.filesystem)+'</td><td>'+fmtBytes(x.used)+' / '+fmtBytes(x.total)+'</td><td>'+x.percent+'%</td></tr>').join('')+'</tbody></table></div>',true)}
+async function showDisks(id){
+  const node=nodeFor(id);if(!node?.metrics)return;
+  const rows=node.metrics.disk.partitions||[];
+  modal(featureHeader(ft('capacity_title')+' · '+node.name,ft('capacity_help'))+
+    '<div class="table-scroll"><table class="data-table"><thead><tr>'+['disk_mount','disk_device','disk_filesystem','disk_space','disk_inodes','capacity_estimated'].map(key=>'<th>'+esc(ft(key))+'</th>').join('')+'</tr></thead><tbody>'+rows.map(part=>'<tr><td>'+esc(part.mount)+'</td><td>'+esc(part.device)+'</td><td>'+esc(part.filesystem)+'</td><td>'+esc(fmtBytes(part.used))+' / '+esc(fmtBytes(part.total))+'<small> · '+esc(part.percent)+'%</small></td><td>'+(part.inode_percent==null?'—':esc(part.inode_percent)+'%')+'</td><td data-capacity="'+esc(part.id||'')+'">'+esc(ft('loading'))+'</td></tr>').join('')+'</tbody></table></div><p id="capacity-error" class="error-message" role="alert"></p>',true);
+  state.modalKind='capacity';const panel=state.modal,request=state.capacityRequest=(state.capacityRequest||0)+1;
+  try{
+    const result=await api('/api/capacity?node='+encodeURIComponent(id));
+    if(state.modal!==panel||state.modalKind!=='capacity'||request!==state.capacityRequest)return;
+    panel.querySelectorAll('[data-capacity]').forEach(cell=>{
+      const estimate=result.partitions[cell.dataset.capacity];
+      cell.textContent=estimate?.status==='estimated'?String(estimate.days_remaining):ft('capacity_'+(estimate?.status||'insufficient'));
+      if(estimate?.growth_per_day!=null){const detail=document.createElement('p');detail.className='helper';detail.textContent=ft('capacity_rate')+': '+(estimate.growth_per_day<0?'−':'')+fmtBytes(Math.abs(estimate.growth_per_day));cell.append(detail)}
+    });
+  }catch(error){if(state.modal===panel&&state.modalKind==='capacity'&&request===state.capacityRequest){panel.querySelectorAll('[data-capacity]').forEach(cell=>cell.textContent='—');document.getElementById('capacity-error').textContent=tr(error.message)}}
+}
+
 function showAddWidget(){const assets=[{id:'local',name:nodeFor('local')?.name||'本机'}].concat(state.config.assets||[]);modal('<header class="modal-head"><h3>添加监控卡片</h3><button class="close" data-close>×</button></header><form id="widget-form"><div class="form-grid"><div class="field full"><label>网络资产</label><select id="widget-node">'+assets.map(a=>'<option value="'+esc(a.id)+'">'+esc(a.name)+'</option>').join('')+'</select></div><div class="field full"><label>监控项目</label><select id="widget-metric">'+Object.entries(metrics).filter(([key])=>key!=='info').map(([k,v])=>'<option value="'+k+'">'+v[0]+'</option>').join('')+'</select></div></div><div class="error-message" id="widget-error"></div><div class="modal-actions"><button type="button" class="button subtle" data-close>取消</button><button class="button primary">添加卡片</button></div></form>');document.getElementById('widget-form').onsubmit=async e=>{e.preventDefault();if(state.config.widgets.length>=32){document.getElementById('widget-error').textContent=tr('最多添加 32 张卡片');return}const node=document.getElementById('widget-node').value,metric=document.getElementById('widget-metric').value;state.config.widgets.push({id:crypto.randomUUID?crypto.randomUUID():('w-'+Date.now()),node:node,metric:metric});closeModal();draw();try{await saveConfig()}catch(err){toast(err.message)}}}
 function showHistorySettings(){showSettings()}
 function showSettings(){
@@ -3641,12 +4571,12 @@ function showSettings(){
   const retention=[1,3,7,14,30].map(value=>'<option value="'+value+'" '+(value===current?'selected':'')+'>'+tr(value+' 天')+'</option>').join('');
   const themes=[['dark','深色'],['light','浅色']].map(([value,label])=>'<option value="'+value+'" '+(state.config.theme===value?'selected':'')+'>'+tr(label)+'</option>').join('');
   const languages=Object.entries(LANGUAGE_NAMES).map(([code,name])=>'<option value="'+code+'" '+(state.language===code?'selected':'')+'>'+name+'</option>').join('');
-  modal('<header class="modal-head"><div><h3>设置</h3><div class="helper">配置语言、外观和历史数据保留期限。</div></div><button class="close" data-close aria-label="Close">×</button></header><form id="settings-form"><div class="form-grid"><div class="field"><label for="settings-language">Language</label><select id="settings-language">'+languages+'</select></div><div class="field"><label for="settings-theme">主题</label><select id="settings-theme">'+themes+'</select></div><div class="field full"><label for="retention-days">数据保留期限 · 保留时间</label><select id="retention-days">'+retention+'</select></div></div><div class="helper">历史样本每分钟保存到本地 JSON 数据库。</div><div class="helper">'+esc(ft('history_policy'))+'</div><div class="helper">缩短保留期限会立即删除超出期限的旧数据。</div><div class="error-message" id="settings-error"></div><div class="modal-actions"><button type="button" class="button subtle" data-close>取消</button><button type="submit" class="button primary">保存设置</button></div></form>');
+  modal('<header class="modal-head"><div><h3>设置</h3><div class="helper">配置语言、外观和历史数据保留期限。</div></div><button class="close" data-close aria-label="Close">×</button></header><form id="settings-form"><div class="form-grid"><div class="field"><label for="settings-language">Language</label><select id="settings-language">'+languages+'</select></div><div class="field"><label for="settings-theme">主题</label><select id="settings-theme">'+themes+'</select></div><div class="field full"><label for="retention-days">数据保留期限 · 保留时间</label><select id="retention-days">'+retention+'</select></div></div><div class="helper">历史样本每分钟保存到本地 JSON 数据库。</div><div class="helper">'+esc(ft('history_policy'))+'</div><div class="helper">缩短保留期限会立即删除超出期限的旧数据。</div><div class="field full"><label class="checkbox-label"><input id="settings-flight" type="checkbox" '+(state.config.flight_enabled?'checked':'')+'>'+esc(ft('flight_enable'))+'</label><p class="helper">'+esc(ft('flight_help'))+'</p></div><div class="field full"><a class="button subtle" href="/api/backup" download="tinywatch-backup.zip">'+esc(ft('download_backup'))+'</a><p class="helper">'+esc(ft('backup_help'))+'</p></div><div class="error-message" id="settings-error"></div><div class="modal-actions"><button type="button" class="button subtle" data-close>取消</button><button type="submit" class="button primary">保存设置</button></div></form>');
   document.getElementById('settings-form').onsubmit=async event=>{
     event.preventDefault();const nextLanguage=document.getElementById('settings-language').value;
     const nextTheme=document.getElementById('settings-theme').value;const nextDays=Number(document.getElementById('retention-days').value);
     try{
-      await api('/api/config','POST',{assets:state.config.assets,widgets:state.config.widgets,theme:nextTheme,history_retention_days:nextDays});
+      await api('/api/config','POST',{assets:state.config.assets,widgets:state.config.widgets,theme:nextTheme,history_retention_days:nextDays,flight_enabled:document.getElementById('settings-flight').checked});
       state.config=await api('/api/config');state.historical={};
       if(nextDays<current){for(const selection of Object.keys(state.historyCustom)){const custom=state.historyCustom[selection];if(custom.start<Date.now()/1000-nextDays*24*60*60){delete state.historyCustom[selection];delete state.historyRanges[selection]}}}
       state.language=LANGUAGE_NAMES[nextLanguage]?nextLanguage:'en';
@@ -3659,8 +4589,8 @@ function showAssets(){
   const assets=state.config.assets||[];
   const rows=assets.map(asset=>{
     const node=nodeFor(asset.id),lastSuccess=node&&node.last_success_at?new Date(node.last_success_at):null;
-    const stateLabel=node?tr(node.online?'在线':'离线'):tr('尚未采样');
-    const status=node?'<span class="tag '+(node.online?'good':'bad')+'">'+stateLabel+'</span>':'<span class="tag">'+stateLabel+'</span>';
+    const stateLabel=node?ft(node.status|| (node.online?'healthy':'connection_failed')):ft('initializing');
+    const status=node?'<span class="tag '+(node.online&&node.status!=='stale'?'good':node.pending?'':'bad')+'">'+esc(stateLabel)+'</span>':'<span class="tag">'+stateLabel+'</span>';
     const sample=lastSuccess&&Number.isFinite(lastSuccess.getTime())?'<div class="metric-sub">'+tr('最后成功采样')+': '+esc(lastSuccess.toLocaleString(LANGUAGE_LOCALE[state.language]||'en-US'))+'</div>':'';
     return '<div class="disk-line"><span><strong>'+esc(asset.name)+'</strong> '+status+
       (asset.secure_transport?'':' <span class="tag">HTTP</span>')+
@@ -3682,6 +4612,84 @@ function showAssets(){
   });
 }
 const FEATURE_MESSAGES = {
+  preview_rule: ["Preview rule", "试算规则", "ルール試算", "Simuler la règle", "Проверить правило", "Regel simulieren"],
+  preview_help: ["Only raw samples are evaluated. Compacted or missing intervals are unknown; historical baselines use earlier data only.", "仅评估原始样本；压缩或缺失时段视为未知，历史基线只使用当时之前的数据。", "元サンプルのみ評価。圧縮・欠測は不明。基準は過去データのみ。", "Seuls les échantillons bruts sont évalués. Intervalles compactés ou absents : inconnus. Référence fondée sur le passé.", "Оцениваются исходные данные. Сжатые и пропущенные интервалы неизвестны. База использует только прошлые данные.", "Nur Rohdaten werden ausgewertet. Verdichtete und fehlende Zeiten sind unbekannt; Basis nur aus früheren Daten."],
+  preview_count: ["Triggers in observed data", "已观测数据中的触发次数", "観測データの発火数", "Déclenchements observés", "Срабатывания по данным", "Auslösungen in beobachteten Daten"],
+  preview_coverage: ["Evaluable coverage", "可评估覆盖率", "評価可能率", "Couverture évaluable", "Доля пригодных данных", "Auswertbare Abdeckung"],
+  preview_unknown: ["Unknown interval", "未知时段", "不明期間", "Intervalle inconnu", "Неизвестный интервал", "Unbekannter Zeitraum"],
+  preview_uncertain: ["Includes unknown intervals", "包含未知时段", "不明期間を含む", "Inclut des intervalles inconnus", "Включает неизвестные интервалы", "Enthält unbekannte Zeiten"],
+  preview_observed: ["Observed duration", "有观测依据的持续时间", "観測された時間", "Durée observée", "Наблюдаемая длительность", "Beobachtete Dauer"],
+  capacity_title: ["Disk capacity outlook", "磁盘容量趋势", "ディスク容量予測", "Prévision de capacité", "Прогноз диска", "Kapazitätsprognose"],
+  capacity_help: ["Uses seven days of retained partition samples. Estimates require four sufficiently sampled days, stable capacity and a consistent growth trend.", "使用近七天分区样本；至少四天采样充分、容量不变且增长趋势稳定时才估算。", "過去7日のサンプル。十分な4日分、不変の容量、安定した増加が必要。", "Utilise sept jours de données. Nécessite quatre jours suffisamment couverts, une capacité fixe et une croissance stable.", "Данные за семь дней. Нужны четыре дня достаточных измерений, постоянная ёмкость и устойчивый рост.", "Sieben Tage Daten. Benötigt vier ausreichend erfasste Tage, konstante Kapazität und stabilen Zuwachs."],
+  capacity_estimated: ["Estimated remaining days", "预计剩余天数", "推定残日数", "Jours restants estimés", "Оценка оставшихся дней", "Geschätzte Resttage"],
+  capacity_insufficient: ["Insufficient history", "历史数据不足", "履歴不足", "Historique insuffisant", "Недостаточно истории", "Zu wenig Verlauf"],
+  percentage_points: ['percentage points', '个百分点', 'ポイント', 'points de pourcentage', 'процентных пунктов', 'Prozentpunkte'],
+  worst_partition: ['Worst partition', '占用最高的分区', '使用率最大のパーティション', 'Partition la plus utilisée', 'Наиболее заполненный раздел', 'Am stärksten belegte Partition'],
+  sample_failures: ["Failed checks", "失败检查次数", "失敗したチェック", "Vérifications échouées", "Неуспешные проверки", "Fehlgeschlagene Prüfungen"],
+  compare_change: ["Compare around cursor", "以光标时间对比", "カーソル前後を比較", "Comparer autour du curseur", "Сравнить вокруг курсора", "Um Cursor vergleichen"],
+  comparison: ["Before and after", "变更前后对比", "変更前後の比較", "Avant et après", "До и после", "Vorher und nachher"],
+  comparison_help: ["Raw resource samples only. Low coverage or an unfinished window limits interpretation. Service statistics use fully contained five-minute buckets and include failed probes. Observed changes do not establish causation.", "资源仅使用原始样本；覆盖不足或窗口未结束时，结论受限。服务统计使用完整落在窗口内的五分钟桶，包含失败探测。变化不等于因果关系。", "リソースは生サンプルのみ。欠測や未完了の期間に注意。サービスは期間内の完全な5分バケットで失敗も含みます。因果関係は示しません。", "Mesures brutes uniquement. Couverture faible ou fenêtre inachevée limite l’analyse. Services : compartiments complets de cinq minutes, échecs inclus. Pas de preuve de causalité.", "Только исходные измерения. Низкое покрытие и незавершённый период ограничивают выводы. Сервисы: полные пятиминутные интервалы, включая сбои. Причинность не устанавливается.", "Nur Rohmesswerte. Geringe Abdeckung oder offene Zeitfenster begrenzen die Aussage. Dienste: vollständige Fünfminutenblöcke mit Fehlversuchen. Keine Kausalitätsaussage."],
+  before: ["Before", "之前", "前", "Avant", "До", "Vorher"],
+  after: ["After", "之后", "後", "Après", "После", "Nachher"],
+  sample_median: ["Sample median", "样本中位数", "サンプル中央値", "Médiane des mesures", "Медиана измерений", "Stichprobenmedian"],
+  peak_value: ["Peak", "峰值", "最大値", "Maximum", "Максимум", "Spitzenwert"],
+  coverage: ["Coverage", "覆盖率", "カバー率", "Couverture", "Покрытие", "Abdeckung"],
+  change_delta: ["Median change", "中位数变化", "中央値の変化", "Variation de médiane", "Изменение медианы", "Medianänderung"],
+  low_coverage: ["Incomplete evidence", "数据依据不足", "データ不足", "Données insuffisantes", "Недостаточно данных", "Unzureichende Daten"],
+  window_minutes: ["Window on each side (minutes)", "前后各取（分钟）", "前後の期間（分）", "Fenêtre de chaque côté (minutes)", "Период с каждой стороны (минуты)", "Zeitraum je Seite (Minuten)"],
+  change_time: ["Change time", "变更时间", "変更時刻", "Heure du changement", "Время изменения", "Änderungszeit"],
+  new_incidents: ["New incidents", "新触发事件", "新規インシデント", "Nouveaux incidents", "Новые инциденты", "Neue Vorfälle"],
+  resolved_incidents: ["Resolved incidents", "恢复事件", "解決したインシデント", "Incidents résolus", "Закрытые инциденты", "Behobene Vorfälle"],
+  flight_record: ["Incident recording", "故障前后记录", "障害前後の記録", "Enregistrement d’incident", "Запись инцидента", "Vorfallaufzeichnung"],
+  flight_help: ["Local only: two-second resource samples, up to five minutes before and two minutes after a trigger. Process values retain their collector timestamp. Missing samples remain gaps. Up to 16 clips within a 2 MiB budget.", "仅本机：资源两秒采样，保留触发前最多五分钟与触发后两分钟。进程数据保留原采样时间，缺失数据保持断点。最多 16 段，存储预算 2 MiB。", "ローカルのみ。2秒サンプル、発生前最大5分・発生後2分。プロセスの収集時刻を保持。欠測は空白。最大16記録、2 MiB以内。", "Local uniquement : mesures toutes les deux secondes, cinq minutes avant et deux après. Horodatage des processus conservé, lacunes visibles. Jusqu’à 16 extraits, budget de 2 MiB.", "Только локально: измерения каждые две секунды, до пяти минут до и двух после события. Время сбора процессов сохраняется, пропуски видны. До 16 записей, бюджет 2 MiB.", "Nur lokal: Messwerte alle zwei Sekunden, bis fünf Minuten davor und zwei danach. Prozesswerte behalten ihren Erfassungszeitpunkt. Lücken bleiben sichtbar. Bis 16 Ausschnitte, Budget 2 MiB."],
+  flight_enable: ["Enable local incident recording", "开启本机故障前后记录", "ローカル障害記録を有効化", "Activer l’enregistrement local", "Включить локальную запись инцидентов", "Lokale Vorfallaufzeichnung aktivieren"],
+  recording: ["Recording", "记录中", "記録中", "Enregistrement", "Запись", "Aufzeichnung"],
+  complete: ["Complete", "已结束", "完了", "Terminé", "Завершено", "Abgeschlossen"],
+  stopped: ["Stopped", "已停止", "停止", "Arrêté", "Остановлено", "Gestoppt"],
+  worker_flight: ["Incident recorder", "故障记录采样", "障害記録", "Enregistreur d’incidents", "Запись инцидентов", "Vorfallaufzeichnung"],
+  max_runtime: ["Maximum runtime (minutes)", "最长运行时间（分钟）", "最大実行時間（分）", "Durée maximale (minutes)", "Максимальное время (минуты)", "Maximale Laufzeit (Minuten)"],
+  run_history: ["Recent runs (up to 50)", "近期运行（最多 50 条）", "最近の実行（最大50件）", "Exécutions récentes (50 maximum)", "Последние запуски (до 50)", "Letzte Ausführungen (bis 50)"],
+  run_running: ["Running", "运行中", "実行中", "En cours", "Выполняется", "Läuft"],
+  run_success: ["Succeeded", "成功", "成功", "Réussite", "Успешно", "Erfolgreich"],
+  run_failed: ["Failed", "失败", "失敗", "Échec", "Ошибка", "Fehlgeschlagen"],
+  run_timeout: ["Timed out", "运行超时", "タイムアウト", "Délai dépassé", "Время истекло", "Zeitüberschreitung"],
+  overlapping: ["Overlapping run", "重叠运行", "重複実行", "Exécution simultanée", "Пересекающийся запуск", "Überlappende Ausführung"],
+  late_completion: ["Completed after timeout", "超时后结束", "タイムアウト後に完了", "Terminé après expiration", "Завершён после тайм-аута", "Nach Zeitlimit abgeschlossen"],
+  run_result: ["Result", "结果", "結果", "Résultat", "Результат", "Ergebnis"],
+  run_duration: ["Duration (ms)", "耗时（毫秒）", "所要時間（ms）", "Durée (ms)", "Длительность (мс)", "Dauer (ms)"],
+  task_failed: ["Task reported failure", "任务上报失败", "タスクが失敗を報告", "Échec signalé par la tâche", "Задача сообщила об ошибке", "Aufgabe meldet Fehler"],
+  task_timeout: ["Task runtime exceeded its limit", "任务运行超时", "最大実行時間を超過", "Durée maximale dépassée", "Превышено время выполнения", "Maximale Laufzeit überschritten"],
+  tls_certificate: ['TLS certificate', 'TLS 证书', 'TLS 証明書', 'Certificat TLS', 'Сертификат TLS', 'TLS-Zertifikat'],
+  request_timeout: ['Asset request exceeded its deadline', '资产请求超出时间限制', 'アセット要求が制限時間を超過', 'Délai de requête de l’hôte dépassé', 'Превышено время запроса узла', 'Zeitlimit der Host-Anfrage überschritten'],
+  initializing: ["Initializing", "初始化中", "初期化中", "Initialisation", "Инициализация", "Initialisierung"],
+  download_backup: ["Download backup", "下载备份", "バックアップをダウンロード", "Télécharger une sauvegarde", "Скачать резервную копию", "Sicherung herunterladen"],
+  backup_help: ["Includes history, configuration and credentials. Restore offline into a new directory with --restore-backup.", "包含历史、配置和凭证。使用 --restore-backup 离线恢复到新目录。", "履歴、設定、認証情報を含みます。--restore-backup で新しいディレクトリに復元してください。", "Contient historique, configuration et identifiants. Restaurer hors ligne dans un nouveau dossier avec --restore-backup.", "Содержит историю, настройки и учётные данные. Восстановление через --restore-backup в новый каталог.", "Enthält Verlauf, Einstellungen und Zugangsdaten. Mit --restore-backup offline in ein neues Verzeichnis wiederherstellen."],
+  next_retry: ["Next attempt", "下次尝试", "次の試行", "Prochaine tentative", "Следующая попытка", "Nächster Versuch"],
+  certificate_expiring: ["Certificate expires soon", "证书即将到期", "証明書の期限が近づいています", "Le certificat expire bientôt", "Сертификат скоро истекает", "Zertifikat läuft bald ab"],
+  certificate_invalid: ["Certificate verification failed", "证书验证失败", "証明書検証に失敗", "Échec de vérification du certificat", "Ошибка проверки сертификата", "Zertifikatsprüfung fehlgeschlagen"],
+  certificate_until: ["Certificate valid until", "证书有效期至", "証明書の有効期限", "Certificat valable jusqu’au", "Сертификат действителен до", "Zertifikat gültig bis"],
+  certificate_warning: ["Warn before expiry (days)", "到期前提醒（天）", "期限前の通知（日）", "Alerte avant expiration (jours)", "Предупредить до истечения (дни)", "Vor Ablauf warnen (Tage)"],
+  days_remaining: ["Days remaining", "剩余天数", "残り日数", "Jours restants", "Осталось дней", "Verbleibende Tage"],
+  dns_failed: ["DNS resolution failed", "DNS 解析失败", "DNS 解決に失敗", "Échec de résolution DNS", "Ошибка разрешения DNS", "DNS-Auflösung fehlgeschlagen"],
+  tls_failed: ["TLS handshake failed", "TLS 握手失败", "TLS ハンドシェイクに失敗", "Échec de négociation TLS", "Ошибка согласования TLS", "TLS-Handshake fehlgeschlagen"],
+  probe_timeout: ["Probe timed out", "检查超时", "チェックがタイムアウト", "Délai de vérification dépassé", "Время проверки истекло", "Zeitüberschreitung der Prüfung"],
+  capacity_capacity_changed: ["Capacity changed", "容量发生变化", "容量変更", "Capacité modifiée", "Ёмкость изменилась", "Kapazität geändert"],
+  capacity_data_gap: ["History has long gaps", "历史存在长时间缺测", "長い欠測あり", "Longues lacunes", "Длительные пропуски", "Lange Datenlücken"],
+  capacity_unstable: ["Unstable growth trend", "增长趋势不稳定", "増加傾向が不安定", "Croissance instable", "Неустойчивый рост", "Instabiler Zuwachs"],
+  capacity_no_growth: ["No sustained growth", "没有持续增长", "継続的増加なし", "Pas de croissance durable", "Нет устойчивого роста", "Kein anhaltender Zuwachs"],
+  capacity_long_horizon: ["Beyond one-year horizon", "超过一年预测范围", "1年の範囲外", "Au-delà d’un an", "За пределами года", "Außerhalb eines Jahres"],
+  capacity_stale: ["Samples are stale", "样本已过期", "古いサンプル", "Échantillons anciens", "Устаревшие данные", "Veraltete Daten"],
+  capacity_rate: ["Growth per day", "每日增长", "1日増加", "Croissance par jour", "Рост в день", "Zuwachs pro Tag"],
+  disk_mount: ["Mount", "挂载点", "マウント", "Montage", "Точка монтирования", "Mountpunkt"],
+  disk_device: ["Device", "设备", "デバイス", "Périphérique", "Устройство", "Gerät"],
+  disk_filesystem: ["Filesystem", "文件系统", "ファイルシステム", "Système de fichiers", "Файловая система", "Dateisystem"],
+  disk_space: ["Used / total", "已用 / 总量", "使用 / 合計", "Utilisé / total", "Использовано / всего", "Belegt / gesamt"],
+  disk_inodes: ["Inode usage", "inode 占用", "inode 使用率", "Utilisation inode", "Использование inode", "Inode-Belegung"],
+  worker_assets: ["Asset sampling", "资产采样", "資産収集", "Collecte des hôtes", "Сбор с узлов", "Hosterfassung"],
+  worker_restarts: ["Restarts", "重试次数", "再起動数", "Redémarrages", "Перезапуски", "Neustarts"],
+  worker_restarting: ["Retrying", "等待重试", "再試行中", "Nouvelle tentative", "Повторная попытка", "Erneuter Versuch"],
+  encoded_days: ["Days encoded in last save", "上次保存编码天数", "前回の符号化日数", "Jours encodés au dernier enregistrement", "Дней обработано при записи", "Zuletzt kodierte Tage"],
+
   heartbeat_overdue: ["Task success report overdue", "任务成功上报已超期", "成功報告の期限超過", "Rapport de réussite en retard", "Просрочен отчёт об успехе", "Erfolgsmeldung überfällig"],
   worker_notifications: ["Notification delivery", "通知投递", "通知送信", "Envoi des notifications", "Доставка уведомлений", "Nachrichtenzustellung"],
   worker_services: ["Service checks", "服务检查", "サービス確認", "Contrôles de service", "Проверки сервисов", "Dienstprüfungen"],
@@ -3689,11 +4697,11 @@ const FEATURE_MESSAGES = {
   worker_history: ["History sampler", "历史采样", "履歴収集", "Collecte historique", "Сбор истории", "Verlaufserfassung"],
   monitor_disabled: ["Monitor disabled", "监控已停用", "監視を無効化", "Moniteur désactivé", "Монитор отключён", "Monitor deaktiviert"],
   heartbeats: ["Scheduled tasks", "定时任务", "定期タスク", "Tâches planifiées", "Плановые задачи", "Geplante Aufgaben"],
-  heartbeat_help: ["Report successful runs with a task token. A missed interval plus grace period opens an incident.", "使用任务令牌上报成功执行；超过周期和宽限期未上报时触发事件。", "トークンで成功を報告。周期と猶予を超えるとアラート。", "Signalez les réussites avec le jeton. Une échéance dépassée déclenche un incident.", "Сообщайте об успехе с токеном. Пропуск срока и отсрочки вызывает инцидент.", "Erfolge mit Token melden. Überschrittene Frist und Toleranz lösen einen Vorfall aus."],
+  heartbeat_help: ["Report start, success or fail with a task token and run_id. Running tasks have a runtime limit; idle tasks retain the expected success deadline.", "使用任务令牌与 run_id 上报开始、成功或失败。运行中的任务有时限，未运行的任务按成功上报周期检查。", "トークンと run_id で start、success、fail を報告。実行時間上限と成功報告期限を監視します。", "Signalez start, success ou fail avec le jeton et run_id. Limite de durée en cours, échéance de réussite au repos.", "Передавайте start, success или fail с токеном и run_id. Для выполнения действует лимит, для ожидания — срок отчёта об успехе.", "Start, success oder fail mit Token und run_id melden. Laufzeitlimit für aktive Aufgaben, Erfolgsfrist für wartende Aufgaben."],
   heartbeat_token: ["Task token", "任务令牌", "タスクトークン", "Jeton de tâche", "Токен задачи", "Aufgaben-Token"],
   heartbeat_grace: ["Grace period (minutes)", "宽限期（分钟）", "猶予（分）", "Tolérance (minutes)", "Отсрочка (минуты)", "Toleranz (Minuten)"],
   heartbeat_interval: ["Expected interval (minutes)", "预期周期（分钟）", "周期（分）", "Intervalle prévu (minutes)", "Ожидаемый интервал (минуты)", "Erwartetes Intervall (Minuten)"],
-  heartbeat_endpoint: ["POST /api/heartbeat with X-TinyWatch-Heartbeat header and JSON {\"duration_ms\":123}. Report only successful completion.", "向 /api/heartbeat 发送 POST，X-TinyWatch-Heartbeat 请求头填写令牌，JSON 为 {\"duration_ms\":123}。仅在成功完成后上报。", "POST /api/heartbeat、ヘッダー X-TinyWatch-Heartbeat、JSON {\"duration_ms\":123}。成功時のみ報告。", "POST /api/heartbeat, en-tête X-TinyWatch-Heartbeat, JSON {\"duration_ms\":123}. Uniquement après réussite.", "POST /api/heartbeat, заголовок X-TinyWatch-Heartbeat, JSON {\"duration_ms\":123}. Только после успеха.", "POST /api/heartbeat mit X-TinyWatch-Heartbeat und JSON {\"duration_ms\":123}. Nur erfolgreiche Abschlüsse melden."],
+  heartbeat_endpoint: ["POST /api/heartbeat with X-TinyWatch-Heartbeat. JSON: {\"event\":\"start\",\"run_id\":\"backup-001\"}; finish with success or fail and the same run_id. Legacy {\"duration_ms\":123} reports still record success.", "POST /api/heartbeat，X-TinyWatch-Heartbeat 填令牌。JSON：{\"event\":\"start\",\"run_id\":\"backup-001\"}；结束时用同一 run_id 报 success 或 fail。旧格式 {\"duration_ms\":123} 仍表示成功。", "POST /api/heartbeat、X-TinyWatch-Heartbeat。{\"event\":\"start\",\"run_id\":\"backup-001\"}。同じ run_id で success または fail。旧形式 {\"duration_ms\":123} は成功。", "POST /api/heartbeat, X-TinyWatch-Heartbeat. {\"event\":\"start\",\"run_id\":\"backup-001\"}, puis success ou fail avec le même run_id. Ancien format {\"duration_ms\":123} = réussite.", "POST /api/heartbeat, X-TinyWatch-Heartbeat. {\"event\":\"start\",\"run_id\":\"backup-001\"}, затем success или fail с тем же run_id. Старый формат {\"duration_ms\":123} означает успех.", "POST /api/heartbeat, X-TinyWatch-Heartbeat. {\"event\":\"start\",\"run_id\":\"backup-001\"}, danach success oder fail mit gleicher run_id. Altes Format {\"duration_ms\":123} meldet Erfolg."],
   runtime_health: ["Monitor health", "监控程序健康", "監視の状態", "État du moniteur", "Состояние монитора", "Monitorzustand"],
   write_failures: ["Write failures", "写盘失败次数", "書き込み失敗", "Échecs d’écriture", "Ошибки записи", "Schreibfehler"],
   queue_age: ["Oldest pending notification", "最早待发通知年龄", "最古の通知", "Âge de notification en attente", "Возраст ожидающего уведомления", "Alter der ältesten Nachricht"],
@@ -3907,13 +4915,14 @@ function updateDiagnostics() {
   reports.sort((left,right) => Number(right.id === state.diagnosticNode)-Number(left.id === state.diagnosticNode));
   const storage=state.data?.diagnostics?.storage;
   const runtime=state.data?.diagnostics?.runtime;
-  const health=runtime?'<article class="diagnostic-card"><strong>'+esc(ft('runtime_health'))+'</strong><p class="helper">'+esc(ft('last_success'))+': '+esc(featureDate(runtime.last_persisted_at))+' · '+esc(ft('write_failures'))+': '+runtime.write_failures+'</p><p class="helper">'+esc(ft('pending_notifications'))+': '+runtime.notification_pending+' · '+esc(ft('queue_age'))+': '+runtime.notification_oldest_seconds+' s · '+esc(ft('storage_size'))+': '+esc(fmtBytes(runtime.history_bytes))+'</p>'+Object.entries(runtime.workers).map(([name,worker])=>'<p class="helper"><span class="tag '+(!worker.running||worker.failed||worker.stale||worker.probes_overdue?'bad':'good')+'">'+esc(ft('worker_'+name))+' · '+esc(ft(!worker.running||worker.failed?'worker_failed':worker.stale||worker.probes_overdue?'stale':'healthy'))+'</span> · '+worker.age_seconds+' s'+(worker.probe_slots_limit?' · '+esc(ft('probe_slots'))+' '+worker.probe_slots_used+'/'+worker.probe_slots_limit+' · '+worker.oldest_probe_seconds+' s':'')+'</p>').join('')+'</article>':'';
-  target.innerHTML = health+(storage?'<p class="helper">'+esc(ft('storage_size'))+': '+esc(fmtBytes(storage.bytes))+' · '+esc(ft('storage_write'))+': '+esc(storage.last_write_ms??'—')+' ms</p>':'')+reports.map(node => {
+  const health=runtime?'<article class="diagnostic-card"><strong>'+esc(ft('runtime_health'))+'</strong><p class="helper">'+esc(ft('last_success'))+': '+esc(featureDate(runtime.last_persisted_at))+' · '+esc(ft('write_failures'))+': '+runtime.write_failures+'</p><p class="helper">'+esc(ft('pending_notifications'))+': '+runtime.notification_pending+' · '+esc(ft('queue_age'))+': '+runtime.notification_oldest_seconds+' s · '+esc(ft('storage_size'))+': '+esc(fmtBytes(runtime.history_bytes))+'</p>'+Object.entries(runtime.workers).map(([name,worker])=>'<p class="helper"><span class="tag '+(!worker.running||worker.failed||worker.stale||worker.probes_overdue||worker.requests_overdue?'bad':'good')+'">'+esc(ft('worker_'+name))+' · '+esc(ft(worker.restarting?'worker_restarting':!worker.running||worker.failed?'worker_failed':worker.stale||worker.probes_overdue||worker.requests_overdue?'stale':'healthy'))+'</span> · '+worker.age_seconds+' s · '+esc(ft('worker_restarts'))+' '+(worker.restarts||0)+(worker.last_error?' · '+esc(worker.last_error):'')+(worker.probe_slots_limit?' · '+esc(ft('probe_slots'))+' '+worker.probe_slots_used+'/'+worker.probe_slots_limit+' · '+worker.oldest_probe_seconds+' s':'')+(worker.requests_limit?' · '+worker.requests_used+'/'+worker.requests_limit+' · '+worker.requests_oldest_seconds+' s':'')+'</p>').join('')+'</article>':'';
+  target.innerHTML = health+(storage?'<p class="helper">'+esc(ft('storage_size'))+': '+esc(fmtBytes(storage.bytes))+' · '+esc(ft('storage_write'))+': '+esc(storage.last_write_ms??'—')+' ms · '+esc(ft('encoded_days'))+': '+esc(storage.encoded_days??'—')+'</p>':'')+reports.map(node => {
     const stamp = node.last_success_at ? new Date(node.last_success_at).toLocaleString(LANGUAGE_LOCALE[state.language] || 'en-US') : ft('unavailable_time');
     const age = node.age_seconds == null ? ft('unavailable_time') : Math.round(node.age_seconds)+' '+ft('seconds');
     return '<article class="diagnostic-card"><div class="feature-card-head"><strong>'+esc(node.name)+'</strong><span class="health-status '+esc(node.status)+'">'+esc(ft(node.status))+'</span></div><dl class="feature-facts"><div><dt>'+esc(ft('last_success'))+'</dt><dd>'+esc(stamp)+'</dd></div><div><dt>'+esc(ft('sample_age'))+'</dt><dd>'+esc(age)+'</dd></div><div><dt>'+esc(ft('latency'))+'</dt><dd>'+(node.latency_ms == null ? '—' : esc(node.latency_ms)+' ms')+'</dd></div></dl>'+
       Object.entries(node.collectors||{}).map(([name,status])=>'<p class="helper">'+esc(alertMetricLabel(name))+': '+esc(featureDate(status.sampled_at))+' · '+esc(ft('cadence'))+' '+esc(status.interval_seconds)+' '+esc(ft('seconds'))+' · '+esc(ft('collection_time'))+' '+esc(status.duration_ms)+' ms</p>').join('')+
       (node.error ? '<p class="asset-error">'+esc(node.error)+'</p>' : '')+
+      (node.next_retry_at?'<p class="helper">'+esc(ft('next_retry'))+': '+esc(featureDate(node.next_retry_at))+' · '+esc(ft('consecutive_failures'))+': '+node.consecutive_failures+'</p>':'')+
       (node.issues.length ? '<ul class="diagnostic-issues">'+node.issues.map(issue => '<li><strong>'+esc(alertMetricLabel(issue.metric))+'</strong> · '+esc(ft(issue.kind))+(issue.message ? '<p>'+esc(issue.message)+'</p>' : '')+'</li>').join('')+'</ul>' : (node.status === 'healthy' ? '<p class="helper">'+esc(ft('no_issues'))+'</p>' : ''))+'</article>';
   }).join('');
 }
@@ -3958,7 +4967,7 @@ function incidentCard(item) {
     (item.status === 'resolved' ? '<p class="helper">'+esc(ft('ended'))+': '+esc(featureDate(item.resolved_at))+' · '+esc(ft(item.resolution_reason || 'recovered'))+'</p>' : '')+
     (item.notification_dropped?'<p class="asset-error">'+esc(ft('notification_dropped'))+'</p>':'')+
     (item.status==='active'&&item.notification_suppressed?'<p class="helper">'+esc(ft('maintenance_active'))+'</p>':'')+
-    '<div class="incident-actions"><button type="button" class="button subtle" data-replay="'+esc(item.id)+'">'+esc(ft('replay'))+'</button>'+(item.acknowledged_at ? '<span class="helper">'+esc(ft('acknowledged'))+' · '+esc(featureDate(item.acknowledged_at))+'</span>' : '<button type="button" class="button subtle" data-ack="'+esc(item.id)+'">'+esc(ft('acknowledge'))+'</button>')+'</div></article>';
+    '<div class="incident-actions">'+((state.alertData?.flight_ids||[]).includes(item.id)?'<button type="button" class="button subtle" data-flight="'+esc(item.id)+'">'+esc(ft('flight_record'))+'</button>':'')+'<button type="button" class="button subtle" data-replay="'+esc(item.id)+'">'+esc(ft('replay'))+'</button>'+(item.acknowledged_at ? '<span class="helper">'+esc(ft('acknowledged'))+' · '+esc(featureDate(item.acknowledged_at))+'</span>' : '<button type="button" class="button subtle" data-ack="'+esc(item.id)+'">'+esc(ft('acknowledge'))+'</button>')+'</div></article>';
 }
 function renderAlertPanel() {
   const target = document.getElementById('alert-panel'), data = state.alertData;
@@ -3998,6 +5007,7 @@ function renderAlertPanel() {
       } catch(error) {button.disabled = false;toast(ft('failed'))}
     });
   }
+  target.querySelectorAll('[data-flight]').forEach(button=>button.onclick=()=>showFlight(button.dataset.flight));
   target.querySelectorAll('[data-replay]').forEach(button=>button.onclick=()=>{const item=data.incidents.find(entry=>entry.id===button.dataset.replay);if(item)showReplay(item.node,item.triggered_at,item.partition!=='*'?item.partition:'')});
   target.querySelectorAll('[data-alert-tab]').forEach(button => button.onclick = () => {state.alertTab = button.dataset.alertTab;renderAlertPanel()});
 }
@@ -4005,7 +5015,8 @@ function editAlertRule(existing) {
   const rule = existing || {id:'r-'+(crypto.randomUUID ? crypto.randomUUID() : Date.now()),name:'',node:'*',metric:'cpu',mode:'threshold',threshold:90,recovery:85,duration:180,cooldown:300,enabled:true};
   const assets = [{id:'*',name:ft('all_nodes')},{id:'local',name:nodeFor('local')?.name || 'Local'}].concat(state.config.assets || []);
   const target = document.getElementById('rule-editor');
-  target.innerHTML = '<form id="alert-rule-form" class="rule-editor"><div class="form-grid"><div class="field full"><label for="rule-name">'+esc(ft('name'))+'</label><input id="rule-name" maxlength="80" value="'+esc(rule.name)+'"></div><div class="field"><label for="rule-node">'+esc(ft('node'))+'</label><select id="rule-node">'+assets.map(asset => '<option value="'+esc(asset.id)+'" '+(rule.node === asset.id ? 'selected' : '')+'>'+esc(asset.name)+'</option>').join('')+'</select></div><div class="field"><label for="rule-metric">'+esc(ft('metric'))+'</label><select id="rule-metric">'+['cpu','memory','disk','network','load','offline','stale'].map(metric => '<option value="'+metric+'" '+(rule.metric === metric ? 'selected' : '')+'>'+esc(alertMetricLabel(metric))+'</option>').join('')+'</select></div><div class="field full" id="rule-partition-field"><label for="rule-partition">'+esc(ft('partition'))+'</label><select id="rule-partition"></select></div><div class="field full"><label for="rule-mode">'+esc(ft('mode'))+'</label><select id="rule-mode">'+['threshold','baseline'].map(mode => '<option value="'+mode+'" '+(rule.mode === mode ? 'selected' : '')+'>'+esc(ft(mode))+'</option>').join('')+'</select></div><div class="field" id="rule-threshold-field"><label for="rule-threshold" id="rule-threshold-label"></label><input id="rule-threshold" type="number" min="0" step="any" required value="'+rule.threshold+'"></div><div class="field" id="rule-recovery-field"><label for="rule-recovery">'+esc(ft('recovery'))+'</label><input id="rule-recovery" type="number" min="0" step="any" required value="'+rule.recovery+'"></div><div class="field"><label for="rule-duration">'+esc(ft('duration'))+'</label><input id="rule-duration" type="number" min="0" max="1440" step="any" required value="'+rule.duration/60+'"></div><div class="field"><label for="rule-cooldown">'+esc(ft('cooldown'))+'</label><input id="rule-cooldown" type="number" min="0" max="10080" step="any" required value="'+rule.cooldown/60+'"></div><div class="field full"><label class="checkbox-label"><input id="rule-enabled" type="checkbox" '+(rule.enabled ? 'checked' : '')+'>'+esc(ft('enabled'))+'</label></div></div><p class="helper hidden" id="rule-baseline-help">'+esc(ft('baseline_help'))+'</p><p class="error-message" id="rule-error" role="alert"></p><div class="modal-actions"><button type="button" class="button subtle" id="rule-cancel">'+esc(ft('cancel'))+'</button><button type="submit" class="button primary">'+esc(ft('save'))+'</button></div></form>';
+  const previewEnd=new Date(),previewStart=new Date(Date.now()-Math.min(7,state.config.history_retention_days||7)*86400000+60000);
+  target.innerHTML = '<form id="alert-rule-form" class="rule-editor"><div class="form-grid"><div class="field full"><label for="rule-name">'+esc(ft('name'))+'</label><input id="rule-name" maxlength="80" value="'+esc(rule.name)+'"></div><div class="field"><label for="rule-node">'+esc(ft('node'))+'</label><select id="rule-node">'+assets.map(asset => '<option value="'+esc(asset.id)+'" '+(rule.node === asset.id ? 'selected' : '')+'>'+esc(asset.name)+'</option>').join('')+'</select></div><div class="field"><label for="rule-metric">'+esc(ft('metric'))+'</label><select id="rule-metric">'+['cpu','memory','disk','network','load','offline','stale'].map(metric => '<option value="'+metric+'" '+(rule.metric === metric ? 'selected' : '')+'>'+esc(alertMetricLabel(metric))+'</option>').join('')+'</select></div><div class="field full" id="rule-partition-field"><label for="rule-partition">'+esc(ft('partition'))+'</label><select id="rule-partition"></select></div><div class="field full"><label for="rule-mode">'+esc(ft('mode'))+'</label><select id="rule-mode">'+['threshold','baseline'].map(mode => '<option value="'+mode+'" '+(rule.mode === mode ? 'selected' : '')+'>'+esc(ft(mode))+'</option>').join('')+'</select></div><div class="field" id="rule-threshold-field"><label for="rule-threshold" id="rule-threshold-label"></label><input id="rule-threshold" type="number" min="0" step="any" required value="'+rule.threshold+'"></div><div class="field" id="rule-recovery-field"><label for="rule-recovery">'+esc(ft('recovery'))+'</label><input id="rule-recovery" type="number" min="0" step="any" required value="'+rule.recovery+'"></div><div class="field"><label for="rule-duration">'+esc(ft('duration'))+'</label><input id="rule-duration" type="number" min="0" max="1440" step="any" required value="'+rule.duration/60+'"></div><div class="field"><label for="rule-cooldown">'+esc(ft('cooldown'))+'</label><input id="rule-cooldown" type="number" min="0" max="10080" step="any" required value="'+rule.cooldown/60+'"></div><div class="field full"><label class="checkbox-label"><input id="rule-enabled" type="checkbox" '+(rule.enabled ? 'checked' : '')+'>'+esc(ft('enabled'))+'</label></div></div><p class="helper hidden" id="rule-baseline-help">'+esc(ft('baseline_help'))+'</p><div class="form-grid"><div class="field"><label for="rule-preview-start">'+esc(ft('from'))+'</label><input type="datetime-local" id="rule-preview-start" value="'+localDateTimeValue(previewStart)+'"></div><div class="field"><label for="rule-preview-end">'+esc(ft('until'))+'</label><input type="datetime-local" id="rule-preview-end" value="'+localDateTimeValue(previewEnd)+'"></div></div><p class="helper">'+esc(ft('preview_help'))+'</p><button type="button" class="button subtle" id="rule-preview">'+esc(ft('preview_rule'))+'</button><div id="rule-preview-result" aria-live="polite"></div><p class="error-message" id="rule-error" role="alert"></p><div class="modal-actions"><button type="button" class="button subtle" id="rule-cancel">'+esc(ft('cancel'))+'</button><button type="submit" class="button primary">'+esc(ft('save'))+'</button></div></form>';
   const mode = document.getElementById('rule-mode'), metric = document.getElementById('rule-metric');
   function updatePartitions(){
     const node=document.getElementById('rule-node').value,select=document.getElementById('rule-partition');
@@ -4035,9 +5046,30 @@ function editAlertRule(existing) {
   mode.onchange = () => updateFields(true); metric.onchange = () => updateFields(true); updateFields(false);
   document.getElementById('rule-cancel').onclick = () => {target.innerHTML = ''};
   document.getElementById('rule-name').focus({preventScroll:true});
+  function readRule(){
+    return {id:rule.id,name:document.getElementById('rule-name').value,node:document.getElementById('rule-node').value,metric:metric.value,partition:metric.value==='disk'?document.getElementById('rule-partition').value:'*',mode:mode.value,threshold:Number(document.getElementById('rule-threshold').value),recovery:mode.value === 'baseline' ? 0 : Number(document.getElementById('rule-recovery').value),duration:Math.round(Number(document.getElementById('rule-duration').value)*60),cooldown:Math.round(Number(document.getElementById('rule-cooldown').value)*60),enabled:document.getElementById('rule-enabled').checked};
+  }
+  let previewGeneration=0;
+  const form=document.getElementById('alert-rule-form'),previewButton=document.getElementById('rule-preview'),previewResult=document.getElementById('rule-preview-result');
+  form.addEventListener('input',()=>{previewGeneration++;previewResult.replaceChildren()});
+  previewButton.onclick=async()=>{
+    if(!form.reportValidity())return;
+    const generation=++previewGeneration;previewButton.disabled=true;
+    try{
+      const result=await api('/api/alerts/preview','POST',{rule:readRule(),start:new Date(document.getElementById('rule-preview-start').value).getTime()/1000,end:new Date(document.getElementById('rule-preview-end').value).getTime()/1000});
+      if(!previewResult.isConnected||generation!==previewGeneration)return;
+      previewResult.innerHTML='<p class="helper">'+esc(ft('preview_count'))+': '+result.count+(result.enabled?'':' · '+esc(ft('disabled')))+'</p>'+result.reports.map(report=>{
+        const coverage=Math.min(100,report.known_seconds/(result.end-result.start)*100);
+        return '<article class="diagnostic-card"><strong>'+esc(nodeFor(report.node)?.name||report.node)+'</strong><p class="helper">'+esc(ft('preview_coverage'))+': '+coverage.toFixed(1)+'% · '+esc(ft('preview_count'))+': '+report.count+'</p>'+report.events.map(event=>'<p class="helper">'+esc(featureDate(event.triggered_at))+' → '+esc(event.resolved_at?featureDate(event.resolved_at):ft('active'))+' · '+esc(ft('preview_observed'))+': '+Math.round(event.observed_seconds/60)+' '+esc(ft('interval_minutes'))+(event.uncertain?' · '+esc(ft('preview_uncertain')):'')+'</p>').join('')+report.unknown_ranges.slice(0,10).map(range=>'<p class="helper">'+esc(ft('preview_unknown'))+': '+esc(featureDate(range[0]))+' — '+esc(featureDate(range[1]))+'</p>').join('')+'</article>';
+      }).join('');
+    }catch(error){if(previewResult.isConnected&&generation===previewGeneration)previewResult.textContent=tr(error.message)}
+    finally{if(previewButton.isConnected)previewButton.disabled=['offline','stale'].includes(metric.value)}
+  };
+  previewButton.disabled=['offline','stale'].includes(metric.value);
+  metric.addEventListener('change',()=>{previewButton.disabled=['offline','stale'].includes(metric.value)});
   document.getElementById('alert-rule-form').onsubmit = async event => {
     event.preventDefault();
-    const next = {id:rule.id,name:document.getElementById('rule-name').value,node:document.getElementById('rule-node').value,metric:metric.value,partition:metric.value==='disk'?document.getElementById('rule-partition').value:'*',mode:mode.value,threshold:Number(document.getElementById('rule-threshold').value),recovery:mode.value === 'baseline' ? 0 : Number(document.getElementById('rule-recovery').value),duration:Math.round(Number(document.getElementById('rule-duration').value)*60),cooldown:Math.round(Number(document.getElementById('rule-cooldown').value)*60),enabled:document.getElementById('rule-enabled').checked};
+    const next = readRule();
     const rules = state.alertData.rules.filter(item => item.id !== rule.id).concat(next);
     const submit = event.target.querySelector('[type=submit]'); submit.disabled = true;
     try {
@@ -4060,6 +5092,105 @@ function replayEventList(data){
     {id:item.id,node:item.node,timestamp:item.triggered_at,kind:'alerts',message:(item.rule_name||alertMetricLabel(item.metric))+' · '+ft('active')},
     ...(item.resolved_at?[{id:item.id+'-resolved',timestamp:item.resolved_at,kind:'alerts',message:(item.rule_name||alertMetricLabel(item.metric))+' · '+ft('resolved')}]:[])
   ])).filter(item=>item.timestamp>=data.start&&item.timestamp<=data.end).sort((a,b)=>a.timestamp-b.timestamp);
+}
+function jobRunsHTML(runs){
+  const rows=runs.slice().reverse();
+  return '<details><summary>'+esc(ft('run_history'))+'</summary><div class="table-scroll"><table class="data-table"><thead><tr><th>Run ID</th><th>'+esc(ft('run_result'))+'</th><th>'+esc(ft('from'))+'</th><th>'+esc(ft('until'))+'</th><th>'+esc(ft('run_duration'))+'</th></tr></thead><tbody>'+rows.map(run=>
+    '<tr><td>'+esc(run.id)+'</td><td>'+esc(ft('run_'+run.status))+(run.overlap?'<p class="helper">'+esc(ft('overlapping'))+'</p>':'')+(run.timed_out_at&&run.status!=='timeout'?'<p class="helper">'+esc(ft('late_completion'))+'</p>':'')+(run.message?'<p class="helper">'+esc(run.message)+'</p>':'')+'</td><td>'+esc(featureDate(run.started_at))+'</td><td>'+esc(featureDate(run.finished_at))+'</td><td>'+esc(run.duration_ms??'—')+'</td></tr>'
+  ).join('')+'</tbody></table></div></details>';
+}
+async function showComparison(node,center){
+  modal(featureHeader(ft('comparison'),ft('comparison_help'))+
+    '<form id="comparison-form"><div class="form-grid"><div class="field"><label for="comparison-center">'+esc(ft('change_time'))+'</label><input id="comparison-center" type="datetime-local" required value="'+localDateTimeValue(new Date(center*1000))+'"></div><div class="field"><label for="comparison-span">'+esc(ft('window_minutes'))+'</label><select id="comparison-span"><option value="300">5</option><option value="1800" selected>30</option><option value="7200">120</option></select></div></div><div class="modal-actions"><button class="button primary" type="submit">'+esc(ft('apply'))+'</button></div></form><div id="comparison-result"></div>',true);
+  state.modalKind='comparison';
+  const comparison=state.comparison={node,center,span:1800,request:0};
+  document.getElementById('comparison-form').onsubmit=event=>{
+    event.preventDefault();
+    comparison.center=new Date(document.getElementById('comparison-center').value).getTime()/1000;
+    comparison.span=Number(document.getElementById('comparison-span').value);
+    loadComparison(comparison);
+  };
+  await loadComparison(comparison);
+}
+async function loadComparison(comparison){
+  const target=document.getElementById('comparison-result'),request=++comparison.request;
+  if(!target)return;
+  target.innerHTML='<p class="helper">'+esc(ft('loading'))+'</p>';
+  try{
+    const query=new URLSearchParams({node:comparison.node,center:comparison.center,span:comparison.span});
+    const data=await api('/api/comparison?'+query);
+    if(state.modalKind!=='comparison'||state.comparison!==comparison||request!==comparison.request)return;
+    const before=data.windows.before,after=data.windows.after;
+    function summary(metric,value){
+      return esc(alertValue(metric,value.median))+' / '+esc(alertValue(metric,value.peak))+' / '+value.coverage+'%';
+    }
+    const rows=Object.keys(before.resources).map(metric=>{
+      const change=data.changes[metric];
+      const delta=change.median_delta;
+      return '<tr><td>'+esc(alertMetricLabel(metric))+'</td><td>'+summary(metric,before.resources[metric])+'</td><td>'+summary(metric,after.resources[metric])+'</td><td>'+(delta==null?'—':(delta<0?'−':delta>0?'+':'')+esc(['cpu','memory','disk'].includes(metric)?new Intl.NumberFormat(LANGUAGE_LOCALE[state.language]||'en-US',{maximumFractionDigits:2}).format(Math.abs(delta))+' '+ft('percentage_points'):alertValue(metric,Math.abs(delta))))+(!change.sufficient?'<p class="helper">'+esc(ft('low_coverage'))+'</p>':'')+'</td></tr>';
+    }).join('');
+    const serviceRows=before.services.map(left=>{
+      const right=after.services.find(item=>item.id===left.id);
+      return '<tr><td>'+esc(left.name)+'</td><td>'+esc(left.mean_ms??'—')+' ms / '+left.failures+' / '+left.coverage+'%</td><td>'+esc(right?.mean_ms??'—')+' ms / '+(right?.failures??0)+' / '+(right?.coverage??0)+'%</td></tr>';
+    }).join('');
+    target.innerHTML='<p class="helper">'+esc(featureDate(before.start))+' — '+esc(featureDate(before.end))+' · '+esc(featureDate(after.start))+' — '+esc(featureDate(after.end))+'</p>'+
+      '<p class="helper">'+esc(ft('sample_median'))+' / '+esc(ft('peak_value'))+' / '+esc(ft('coverage'))+'</p><div class="table-scroll"><table class="data-table"><thead><tr><th>'+esc(ft('metric'))+'</th><th>'+esc(ft('before'))+'</th><th>'+esc(ft('after'))+'</th><th>'+esc(ft('change_delta'))+'</th></tr></thead><tbody>'+rows+'</tbody></table></div>'+
+      '<h4>'+esc(ft('services'))+'</h4><p class="helper">'+esc(ft('latency'))+' / '+esc(ft('sample_failures'))+' / '+esc(ft('coverage'))+'</p><div class="table-scroll"><table class="data-table"><thead><tr><th>'+esc(ft('service_name'))+'</th><th>'+esc(ft('before'))+'</th><th>'+esc(ft('after'))+'</th></tr></thead><tbody>'+serviceRows+'</tbody></table></div>'+
+      '<div class="duo">'+[['before',before],['after',after]].map(([side,window])=>'<div class="duo-box"><strong>'+esc(ft(side))+'</strong><p>'+esc(ft('new_incidents'))+': '+window.triggered.length+'</p><p>'+esc(ft('resolved_incidents'))+': '+window.resolved.length+'</p><p>'+esc(ft('active'))+': '+window.active_at_end.length+'</p></div>').join('')+'</div>';
+  }catch(error){
+    if(state.modalKind==='comparison'&&state.comparison===comparison&&request===comparison.request)target.innerHTML='<p class="asset-error">'+esc(tr(error.message))+'</p>';
+  }
+}
+async function showFlight(id){
+  modal(featureHeader(ft('flight_record'),ft('flight_help'))+'<div id="flight-panel"></div>',true);
+  state.modalKind='flight';
+  const flight=state.flight={id,request:0};
+  await loadFlight(flight);
+}
+async function loadFlight(flight){
+  const target=document.getElementById('flight-panel'),request=++flight.request;
+  if(!target)return;
+  target.innerHTML='<p class="helper">'+esc(ft('loading'))+'</p>';
+  try{
+    const data=await api('/api/flight?incident='+encodeURIComponent(flight.id));
+    if(state.modalKind!=='flight'||state.flight!==flight||request!==flight.request)return;
+    const charts=['cpu','memory','disk','network','load'].map(metric=>{
+      const points=data.points.filter(point=>Number.isFinite(point.values[metric]));
+      const samples=points.map((point,index)=>({timestamp:point.timestamp,value:point.values[metric],gapBefore:index>0&&point.timestamp-points[index-1].timestamp>5}));
+      return '<section class="replay-chart"><h4>'+esc(alertMetricLabel(metric))+(metric==='disk'?' · '+esc(ft('worst_partition')):'')+'</h4>'+sparkline(samples,metric,data)+'</section>';
+    }).join('');
+    target.innerHTML='<div class="feature-toolbar"><span class="tag">'+esc(ft(data.status))+'</span><span>'+esc(ft('coverage'))+': '+data.coverage+'%</span><button type="button" class="button subtle" id="flight-refresh">'+esc(ft('refresh_services'))+'</button></div><p class="helper">'+esc(featureDate(data.start))+' — '+esc(featureDate(data.end))+'</p><div class="replay-charts">'+charts+'</div><div class="field"><label for="flight-cursor">'+esc(ft('cursor'))+'</label><input id="flight-cursor" type="range" min="0" max="'+Math.max(0,data.points.length-1)+'" value="0" '+(!data.points.length?'disabled':'')+'></div><div id="flight-context"></div>';
+    document.getElementById('flight-refresh').onclick=()=>loadFlight(flight);
+    const slider=document.getElementById('flight-cursor');
+    function select(index){
+      const point=data.points[index],context=document.getElementById('flight-context');
+      if(!point){context.innerHTML='<p class="helper">'+esc(ft('unavailable'))+'</p>';return}
+      slider.value=String(index);
+      context.innerHTML='<p class="helper">'+esc(featureDate(point.timestamp))+'</p>'+replayContextHTML([point.timestamp,{processes:point.processes,collector_status:{processes:{sampled_at:point.process_sample_at}}}],point.timestamp)+
+        (point.errors.length?'<p class="helper">'+esc(ft('error'))+': '+esc(point.errors.join(', '))+'</p>':'');
+      for(const chart of target.querySelectorAll('.mini-chart')){
+        let line=chart.querySelector('.replay-marker');
+        if(!line){line=document.createElementNS('http://www.w3.org/2000/svg','line');line.setAttribute('class','replay-marker');chart.appendChild(line)}
+        const x=74+(point.timestamp-data.start)/(data.end-data.start)*240;
+        for(const [key,value] of Object.entries({x1:x,x2:x,y1:9,y2:101}))line.setAttribute(key,String(value));
+      }
+    }
+    slider.oninput=()=>select(Number(slider.value));
+    target.querySelectorAll('.mini-chart').forEach(chart=>{
+      bindChartTooltip(chart);
+      chart.addEventListener('click',event=>{
+        if(!data.points.length)return;
+        const rect=chart.getBoundingClientRect(),ratio=Math.max(0,Math.min(1,((event.clientX-rect.left)*320/rect.width-74)/240));
+        const stamp=data.start+ratio*(data.end-data.start);
+        let closest=0;
+        data.points.forEach((point,index)=>{if(Math.abs(point.timestamp-stamp)<Math.abs(data.points[closest].timestamp-stamp))closest=index});
+        select(closest);
+      });
+    });
+    select(Math.max(0,data.points.findIndex(point=>point.timestamp>=data.triggered_at)));
+  }catch(error){
+    if(state.modalKind==='flight'&&state.flight===flight&&request===flight.request)target.innerHTML='<p class="asset-error">'+esc(tr(error.message))+'</p>';
+  }
 }
 async function showReplay(node='local',center,partition=''){
   const now=Math.floor(Date.now()/1000),cutoff=now-(Number(state.config.history_retention_days)||7)*86400;
@@ -4096,12 +5227,13 @@ function renderReplay(){
   const eventHTML=events.map(item=>'<article class="replay-event '+esc(item.kind)+'">'+
     (item.kind==='annotation'?'<button type="button" class="button subtle" data-remove-annotation="'+esc(item.id)+'">'+esc(ft('remove'))+'</button>':'')+
     '<button type="button" class="button subtle" data-event-time="'+item.timestamp+'">'+esc(featureDate(item.timestamp))+'</button><strong>'+esc(ft(item.kind))+'</strong><p>'+esc(item.message)+'</p></article>').join('');
-  target.innerHTML='<form id="replay-range-form"><div class="form-grid"><div class="field"><label for="replay-node">'+esc(ft('node'))+'</label><select id="replay-node">'+assets.map(asset=>'<option value="'+esc(asset.id)+'" '+(data.node===asset.id?'selected':'')+'>'+esc(asset.name)+'</option>').join('')+'</select></div><div class="field"><label for="replay-partition">'+esc(ft('partition'))+'</label><select id="replay-partition"></select></div><div class="field"><label for="replay-start">'+esc(ft('from'))+'</label><input type="datetime-local" id="replay-start" required value="'+localDateTimeValue(new Date(data.start*1000))+'"></div><div class="field"><label for="replay-end">'+esc(ft('until'))+'</label><input type="datetime-local" id="replay-end" required value="'+localDateTimeValue(new Date(data.end*1000))+'"></div></div><div class="replay-toolbar"><button type="submit" class="button primary">'+esc(ft('apply'))+'</button><button type="button" class="button subtle" id="replay-export">'+esc(ft('export_report'))+'</button></div></form>'+
+  target.innerHTML='<form id="replay-range-form"><div class="form-grid"><div class="field"><label for="replay-node">'+esc(ft('node'))+'</label><select id="replay-node">'+assets.map(asset=>'<option value="'+esc(asset.id)+'" '+(data.node===asset.id?'selected':'')+'>'+esc(asset.name)+'</option>').join('')+'</select></div><div class="field"><label for="replay-partition">'+esc(ft('partition'))+'</label><select id="replay-partition"></select></div><div class="field"><label for="replay-start">'+esc(ft('from'))+'</label><input type="datetime-local" id="replay-start" required value="'+localDateTimeValue(new Date(data.start*1000))+'"></div><div class="field"><label for="replay-end">'+esc(ft('until'))+'</label><input type="datetime-local" id="replay-end" required value="'+localDateTimeValue(new Date(data.end*1000))+'"></div></div><div class="replay-toolbar"><button type="submit" class="button primary">'+esc(ft('apply'))+'</button><button type="button" class="button subtle" id="replay-compare">'+esc(ft('compare_change'))+'</button><button type="button" class="button subtle" id="replay-export">'+esc(ft('export_report'))+'</button></div></form>'+
     '<div class="replay-window-controls">'+[['previous_window','←'],['next_window','→'],['zoom_in','＋'],['zoom_out','−']].map(([key,icon])=>'<button type="button" class="button subtle" data-replay-window="'+key+'" aria-label="'+esc(ft(key))+'" title="'+esc(ft(key))+'">'+icon+'</button>').join('')+'</div>'+
     '<p class="helper">'+esc(ft('sample_resolution'))+'</p><label for="replay-cursor" class="helper">'+esc(ft('cursor'))+'</label><input type="range" id="replay-cursor" min="'+data.start+'" max="'+data.end+'" step="1" value="'+replay.cursor+'" style="width:100%"><p id="replay-cursor-label" class="helper"></p><div class="replay-charts">'+charts+'</div>'+
     '<h4>'+esc(ft('replay_context'))+'</h4><div id="replay-context" class="replay-context"></div><p class="helper">'+esc(ft('context_sampling'))+'</p>'+
     '<h4>'+esc(ft('replay_events'))+'</h4><div class="replay-events">'+(eventHTML||'<p class="helper">'+esc(ft('no_events'))+'</p>')+'</div>'+
     '<form id="annotation-form"><div class="form-grid"><div class="field"><label for="annotation-time">'+esc(ft('cursor'))+'</label><input id="annotation-time" type="datetime-local" required value="'+localDateTimeValue(new Date(replay.cursor*1000))+'"></div><div class="field"><label for="annotation-message">'+esc(ft('annotation_message'))+'</label><input id="annotation-message" maxlength="240" required autocomplete="off"></div></div><p id="annotation-error" class="error-message" role="alert"></p><div class="modal-actions"><button type="submit" class="button primary">'+esc(ft('add_annotation'))+'</button></div></form>';
+  document.getElementById('replay-compare').onclick=()=>showComparison(data.node,replay.cursor);
   const nodeSelect=document.getElementById('replay-node'),partitionSelect=document.getElementById('replay-partition');
   function populatePartitions(){
     const parts=nodeFor(nodeSelect.value)?.metrics?.disk?.partitions||[],selected=nodeSelect.value===data.node?replay.window.partition:'';
@@ -4238,9 +5370,9 @@ function renderServices(){
   let content='';
   if(state.serviceTab==='heartbeats'){
     content='<p class="helper">'+esc(ft('heartbeat_help'))+'</p>'+data.heartbeats.map(job=>{
-      const result=data.states[job.id];
-      return '<article class="diagnostic-card"><div class="feature-card-head"><strong>'+esc(job.name)+'</strong><span class="tag '+(result?.active_id?'bad':'good')+'">'+esc(ft(result?.active_id?'service_down':job.last_success_at?'service_ok':'pending_probe'))+'</span></div><p class="helper">'+esc(ft('last_success'))+': '+esc(featureDate(job.last_success_at))+' · '+esc(ft('cadence'))+': '+job.interval/60+' '+esc(ft('interval_minutes'))+'</p><div class="field"><label>'+esc(ft('heartbeat_token'))+'</label><input readonly aria-label="'+esc(ft('heartbeat_token'))+'" value="'+esc(job.token)+'"></div><div class="modal-actions"><button type="button" class="button" data-edit-job="'+esc(job.id)+'">'+esc(ft('edit'))+'</button><button type="button" class="button danger" data-remove-job="'+esc(job.id)+'">'+esc(ft('remove'))+'</button></div></article>';
-    }).join('')+'<p class="helper">'+esc(ft('heartbeat_endpoint'))+'</p><form id="heartbeat-form"><input id="heartbeat-id" type="hidden"><div class="form-grid"><div class="field"><label for="heartbeat-name">'+esc(ft('service_name'))+'</label><input id="heartbeat-name" required maxlength="80"></div><div class="field"><label for="heartbeat-node">'+esc(ft('node'))+'</label><select id="heartbeat-node">'+serviceAssets().map(asset=>'<option value="'+esc(asset.id)+'">'+esc(asset.name)+'</option>').join('')+'</select></div><div class="field"><label for="heartbeat-interval">'+esc(ft('heartbeat_interval'))+'</label><input id="heartbeat-interval" type="number" min="1" max="43200" required value="1440"></div><div class="field"><label for="heartbeat-grace">'+esc(ft('heartbeat_grace'))+'</label><input id="heartbeat-grace" type="number" min="0" max="10080" required value="10"></div></div><p id="service-error" class="error-message" role="alert"></p><div class="modal-actions"><button class="button primary" type="submit">'+esc(ft('save'))+'</button></div></form>';
+      const result=data.states[job.id],runs=data.runs?.[job.id]||[];
+      return '<article class="diagnostic-card"><div class="feature-card-head"><strong>'+esc(job.name)+'</strong><span class="tag '+(result?.active_id?'bad':'good')+'">'+esc(ft(result?.active_id?'service_down':runs.some(run=>run.status==='running')?'run_running':job.last_success_at?'service_ok':'pending_probe'))+'</span></div><p class="helper">'+esc(ft('last_success'))+': '+esc(featureDate(job.last_success_at))+' · '+esc(ft('cadence'))+': '+job.interval/60+' '+esc(ft('interval_minutes'))+'</p>'+jobRunsHTML(runs)+(result?.error?'<p class="asset-error">'+esc(ft(result.error))+'</p>':'')+'<div class="field"><label>'+esc(ft('heartbeat_token'))+'</label><input readonly aria-label="'+esc(ft('heartbeat_token'))+'" value="'+esc(job.token)+'"></div><div class="modal-actions"><button type="button" class="button" data-edit-job="'+esc(job.id)+'">'+esc(ft('edit'))+'</button><button type="button" class="button danger" data-remove-job="'+esc(job.id)+'">'+esc(ft('remove'))+'</button></div></article>';
+    }).join('')+'<p class="helper">'+esc(ft('heartbeat_endpoint'))+'</p><form id="heartbeat-form"><input id="heartbeat-id" type="hidden"><div class="form-grid"><div class="field"><label for="heartbeat-name">'+esc(ft('service_name'))+'</label><input id="heartbeat-name" required maxlength="80"></div><div class="field"><label for="heartbeat-node">'+esc(ft('node'))+'</label><select id="heartbeat-node">'+serviceAssets().map(asset=>'<option value="'+esc(asset.id)+'">'+esc(asset.name)+'</option>').join('')+'</select></div><div class="field"><label for="heartbeat-interval">'+esc(ft('heartbeat_interval'))+'</label><input id="heartbeat-interval" type="number" min="1" max="43200" required value="1440"></div><div class="field"><label for="heartbeat-runtime">'+esc(ft('max_runtime'))+'</label><input id="heartbeat-runtime" type="number" min="1" max="10080" required value="60"></div><div class="field"><label for="heartbeat-grace">'+esc(ft('heartbeat_grace'))+'</label><input id="heartbeat-grace" type="number" min="0" max="10080" required value="10"></div></div><p id="service-error" class="error-message" role="alert"></p><div class="modal-actions"><button class="button primary" type="submit">'+esc(ft('save'))+'</button></div></form>';
   }else if(state.serviceTab==='monitors'){
     content='<div class="feature-toolbar"><button type="button" class="button primary" id="add-service" '+(data.services.length>=24?'disabled':'')+'>'+esc(ft('add_service'))+'</button><span class="helper">'+esc(ft('service_limits'))+'</span></div><div id="service-editor"></div><div class="service-grid">'+data.services.map(service=>{
       const result=data.states[service.id],buckets=data.history[service.id]||[];
@@ -4248,8 +5380,9 @@ function renderServices(){
       const history=buckets.map((bucket,index)=>({timestamp:bucket.last_at,value:bucket.sum_ms/bucket.samples,
         gapBefore:index>0&&bucket.first_at-buckets[index-1].last_at>service.interval*2+service.timeout}));
       const maintenance=data.maintenance.some(window=>data.active_maintenance.includes(window.id)&&['*',service.node].includes(window.node));
-      return '<article class="diagnostic-card"><div class="feature-card-head"><strong>'+esc(service.name)+'</strong><span class="tag '+(result?.ok?'good':'bad')+'">'+esc(serviceStatus(service,result))+'</span></div><p class="helper">'+esc(service.protocol.toUpperCase())+' · '+esc(service.target)+(service.protocol==='tcp'?':'+service.port:'')+'</p><p class="helper">'+esc(ft('associated_asset'))+': '+esc(serviceAssets().find(asset=>asset.id===service.node)?.name||service.node)+(maintenance?' · '+esc(ft('maintenance_active')):'')+'</p><div class="duo"><div class="duo-box"><label>'+esc(ft('latency'))+'</label><strong>'+(result?esc(result.latency_ms)+' ms':'—')+'</strong></div><div class="duo-box"><label>'+esc(ft('sample_success'))+'</label><strong>'+(samples?(successes/samples*100).toFixed(1)+'%':'—')+'</strong></div></div>'+sparkline(history,'latency')+'<p class="helper">'+esc(ft('last_observed'))+': '+esc(featureDate(result?.sampled_at))+' · '+esc(ft('cadence'))+': '+service.interval+' '+esc(ft('seconds'))+'</p>'+
+      return '<article class="diagnostic-card"><div class="feature-card-head"><strong>'+esc(service.name)+'</strong><span class="tag '+(result?.ok?'good':'bad')+'">'+esc(serviceStatus(service,result))+'</span></div><p class="helper">'+esc(service.protocol.toUpperCase())+' · '+esc(service.target)+(service.protocol!=='http'?':'+service.port:'')+'</p><p class="helper">'+esc(ft('associated_asset'))+': '+esc(serviceAssets().find(asset=>asset.id===service.node)?.name||service.node)+(maintenance?' · '+esc(ft('maintenance_active')):'')+'</p><div class="duo"><div class="duo-box"><label>'+esc(ft('latency'))+'</label><strong>'+(result?esc(result.latency_ms)+' ms':'—')+'</strong></div><div class="duo-box"><label>'+esc(ft('sample_success'))+'</label><strong>'+(samples?(successes/samples*100).toFixed(1)+'%':'—')+'</strong></div></div>'+sparkline(history,'latency')+'<p class="helper">'+esc(ft('last_observed'))+': '+esc(featureDate(result?.sampled_at))+' · '+esc(ft('cadence'))+': '+service.interval+' '+esc(ft('seconds'))+'</p>'+
         (result&&!result.ok?'<p class="asset-error">'+esc(ft(result.error))+(result.status_code?' · HTTP '+result.status_code:'')+' · '+esc(ft('consecutive_failures'))+': '+result.failed_count+'</p>':'')+
+        (service.protocol==='tls'?'<p class="helper">'+esc(ft('certificate_until'))+': '+esc(featureDate(result?.certificate_expires_at))+' · '+esc(ft('days_remaining'))+': '+esc(result?.certificate_days_remaining??'—')+'</p>':'')+
         '<div class="replay-toolbar"><button type="button" class="button subtle" data-edit-service="'+esc(service.id)+'">'+esc(ft('edit'))+'</button><button type="button" class="button danger" data-remove-service="'+esc(service.id)+'">'+esc(ft('remove'))+'</button></div></article>';
     }).join('')+'</div>';
   }else if(state.serviceTab==='notifications'){
@@ -4276,13 +5409,13 @@ function renderServices(){
       const job=data.heartbeats.find(item=>item.id===button.dataset.editJob);
       document.getElementById('heartbeat-id').value=job.id;document.getElementById('heartbeat-name').value=job.name;
       document.getElementById('heartbeat-node').value=job.node;document.getElementById('heartbeat-interval').value=job.interval/60;
-      document.getElementById('heartbeat-grace').value=job.grace/60;state.serviceEditing=true;
+      document.getElementById('heartbeat-grace').value=job.grace/60;document.getElementById('heartbeat-runtime').value=(job.max_runtime||3600)/60;state.serviceEditing=true;
       document.getElementById('heartbeat-name').focus();
     });
     target.querySelectorAll('[data-remove-job]').forEach(button=>button.onclick=async()=>{button.disabled=true;try{await saveServices({action:'heartbeats',heartbeats:data.heartbeats.filter(job=>job.id!==button.dataset.removeJob)})}catch(error){button.disabled=false;toast(error.message)}});
     heartbeatForm.onsubmit=event=>{
       const id=document.getElementById('heartbeat-id').value||'job-'+(crypto.randomUUID?crypto.randomUUID():Date.now());
-      const job={id,name:document.getElementById('heartbeat-name').value,node:document.getElementById('heartbeat-node').value,interval:Number(document.getElementById('heartbeat-interval').value)*60,grace:Number(document.getElementById('heartbeat-grace').value)*60};
+      const job={id,name:document.getElementById('heartbeat-name').value,node:document.getElementById('heartbeat-node').value,interval:Number(document.getElementById('heartbeat-interval').value)*60,grace:Number(document.getElementById('heartbeat-grace').value)*60,max_runtime:Number(document.getElementById('heartbeat-runtime').value)*60};
       submitServiceForm(event,{action:'heartbeats',heartbeats:data.heartbeats.filter(item=>item.id!==id).concat(job)});
     };
   }
@@ -4303,10 +5436,12 @@ function editService(existing){
   state.serviceEditing=true;
   const service=existing||{id:'s-'+(crypto.randomUUID?crypto.randomUUID():Date.now()),name:'',node:'local',protocol:'http',target:'',port:443,status:200,match:'',interval:60,timeout:5,failures:3,enabled:true};
   const target=document.getElementById('service-editor');
-  target.innerHTML='<form id="service-form" class="rule-editor"><div class="form-grid"><div class="field"><label for="service-name">'+esc(ft('service_name'))+'</label><input id="service-name" required maxlength="80" value="'+esc(service.name)+'"></div><div class="field"><label for="service-node">'+esc(ft('associated_asset'))+'</label><select id="service-node">'+serviceAssets().map(asset=>'<option value="'+esc(asset.id)+'" '+(service.node===asset.id?'selected':'')+'>'+esc(asset.name)+'</option>').join('')+'</select></div><div class="field"><label for="service-protocol">'+esc(ft('protocol'))+'</label><select id="service-protocol"><option value="http">HTTP / HTTPS</option><option value="tcp">TCP</option></select></div><div class="field"><label for="service-target">'+esc(ft('target'))+'</label><input id="service-target" required maxlength="1024" value="'+esc(service.target)+'"></div><div class="field" id="service-port-field"><label for="service-port">TCP port</label><input id="service-port" type="number" min="1" max="65535" value="'+service.port+'"></div><div class="field" id="service-status-field"><label for="service-status">'+esc(ft('expected_status'))+'</label><input id="service-status" type="number" min="200" max="599" value="'+service.status+'"></div><div class="field full" id="service-match-field"><label for="service-match">'+esc(ft('content_match'))+'</label><input id="service-match" maxlength="128" value="'+esc(service.match)+'"></div><div class="field"><label for="service-interval">'+esc(ft('interval_seconds'))+'</label><input id="service-interval" type="number" required min="30" max="3600" value="'+service.interval+'"></div><div class="field"><label for="service-timeout">'+esc(ft('timeout_seconds'))+'</label><input id="service-timeout" type="number" required min="1" max="10" step="any" value="'+service.timeout+'"></div><div class="field"><label for="service-failures">'+esc(ft('failure_threshold'))+'</label><input id="service-failures" type="number" required min="1" max="10" value="'+service.failures+'"></div><label class="checkbox-label"><input id="service-enabled" type="checkbox" '+(service.enabled?'checked':'')+'>'+esc(ft('enabled'))+'</label></div><p class="helper">'+esc(ft('probe_help'))+' '+esc(ft('service_edit_help'))+'</p><p id="service-error" class="error-message" role="alert"></p><div class="modal-actions"><button type="button" class="button subtle" id="service-cancel">'+esc(ft('cancel'))+'</button><button type="submit" class="button primary">'+esc(ft('save'))+'</button></div></form>';
+  target.innerHTML='<form id="service-form" class="rule-editor"><div class="form-grid"><div class="field"><label for="service-name">'+esc(ft('service_name'))+'</label><input id="service-name" required maxlength="80" value="'+esc(service.name)+'"></div><div class="field"><label for="service-node">'+esc(ft('associated_asset'))+'</label><select id="service-node">'+serviceAssets().map(asset=>'<option value="'+esc(asset.id)+'" '+(service.node===asset.id?'selected':'')+'>'+esc(asset.name)+'</option>').join('')+'</select></div><div class="field"><label for="service-protocol">'+esc(ft('protocol'))+'</label><select id="service-protocol"><option value="http">HTTP / HTTPS</option><option value="tcp">TCP</option><option value="tls">'+esc(ft('tls_certificate'))+'</option></select></div><div class="field"><label for="service-target">'+esc(ft('target'))+'</label><input id="service-target" required maxlength="1024" value="'+esc(service.target)+'"></div><div class="field" id="service-port-field"><label for="service-port">TCP / TLS port</label><input id="service-port" type="number" min="1" max="65535" value="'+service.port+'"></div><div class="field hidden" id="service-certificate-field"><label for="service-certificate-days">'+esc(ft('certificate_warning'))+'</label><select id="service-certificate-days"><option value="30">30</option><option value="14">14</option><option value="7">7</option></select></div><div class="field" id="service-status-field"><label for="service-status">'+esc(ft('expected_status'))+'</label><input id="service-status" type="number" min="200" max="599" value="'+service.status+'"></div><div class="field full" id="service-match-field"><label for="service-match">'+esc(ft('content_match'))+'</label><input id="service-match" maxlength="128" value="'+esc(service.match)+'"></div><div class="field"><label for="service-interval">'+esc(ft('interval_seconds'))+'</label><input id="service-interval" type="number" required min="30" max="3600" value="'+service.interval+'"></div><div class="field"><label for="service-timeout">'+esc(ft('timeout_seconds'))+'</label><input id="service-timeout" type="number" required min="1" max="10" step="any" value="'+service.timeout+'"></div><div class="field"><label for="service-failures">'+esc(ft('failure_threshold'))+'</label><input id="service-failures" type="number" required min="1" max="10" value="'+service.failures+'"></div><label class="checkbox-label"><input id="service-enabled" type="checkbox" '+(service.enabled?'checked':'')+'>'+esc(ft('enabled'))+'</label></div><p class="helper">'+esc(ft('probe_help'))+' '+esc(ft('service_edit_help'))+'</p><p id="service-error" class="error-message" role="alert"></p><div class="modal-actions"><button type="button" class="button subtle" id="service-cancel">'+esc(ft('cancel'))+'</button><button type="submit" class="button primary">'+esc(ft('save'))+'</button></div></form>';
   const protocol=document.getElementById('service-protocol');protocol.value=service.protocol;
+  document.getElementById('service-certificate-days').value=String(service.cert_days||30);
   function updateFields(){
-    const tcp=protocol.value==='tcp';
+    const tcp=protocol.value!=='http';
+    document.getElementById('service-certificate-field').classList.toggle('hidden',protocol.value!=='tls');
     document.getElementById('service-port-field').classList.toggle('hidden',!tcp);
     document.getElementById('service-status-field').classList.toggle('hidden',tcp);
     document.getElementById('service-match-field').classList.toggle('hidden',tcp);
@@ -4315,7 +5450,7 @@ function editService(existing){
   protocol.onchange=updateFields;updateFields();
   document.getElementById('service-cancel').onclick=()=>{state.serviceEditing=false;renderServices()};
   document.getElementById('service-form').onsubmit=event=>{
-    const next={id:service.id,name:document.getElementById('service-name').value,node:document.getElementById('service-node').value,protocol:protocol.value,target:document.getElementById('service-target').value,port:Number(document.getElementById('service-port').value),status:Number(document.getElementById('service-status').value),match:document.getElementById('service-match').value,interval:Number(document.getElementById('service-interval').value),timeout:Number(document.getElementById('service-timeout').value),failures:Number(document.getElementById('service-failures').value),enabled:document.getElementById('service-enabled').checked};
+    const next={id:service.id,name:document.getElementById('service-name').value,node:document.getElementById('service-node').value,protocol:protocol.value,target:document.getElementById('service-target').value,port:Number(document.getElementById('service-port').value),status:Number(document.getElementById('service-status').value),match:document.getElementById('service-match').value,interval:Number(document.getElementById('service-interval').value),timeout:Number(document.getElementById('service-timeout').value),failures:Number(document.getElementById('service-failures').value),cert_days:Number(document.getElementById('service-certificate-days').value),enabled:document.getElementById('service-enabled').checked};
     submitServiceForm(event,{action:'services',services:state.serviceData.services.filter(item=>item.id!==service.id).concat(next)});
   };
   document.getElementById('service-name').focus({preventScroll:true});
@@ -4470,6 +5605,36 @@ class TinyWatchHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": _safe_text(exc, 180)})
             return
+        if path == "/api/backup":
+            if not self._require_session():
+                return
+            if not BACKUP_LOCK.acquire(blocking=False):
+                self._json(HTTPStatus.TOO_MANY_REQUESTS, {"error": "A backup is already in progress"})
+                return
+            headers_sent = False
+            try:
+                with tempfile.TemporaryFile(dir=STORE.path.parent) as output:
+                    STORE.export_backup(output)
+                    length = output.tell()
+                    output.seek(0)
+                    self.send_response(HTTPStatus.OK)
+                    self.send_header("Content-Type", "application/zip")
+                    self.send_header("Content-Length", str(length))
+                    self.send_header("Content-Disposition", 'attachment; filename="tinywatch-backup.zip"')
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("X-Content-Type-Options", "nosniff")
+                    self.end_headers()
+                    headers_sent = True
+                    shutil.copyfileobj(output, self.wfile, length=65536)
+            except (OSError, ValueError):
+                # A disconnected download must not receive a second HTTP response.
+                if headers_sent:
+                    self.close_connection = True
+                else:
+                    self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "Backup unavailable; check disk space and the 512 MiB limit"})
+            finally:
+                BACKUP_LOCK.release()
+            return
         if path == "/api/config":
             if not self._require_session():
                 return
@@ -4490,6 +5655,7 @@ class TinyWatchHandler(BaseHTTPRequestHandler):
         if path == "/api/metrics":
             if not self._require_session():
                 return
+            _dashboard_activity()
             try:
                 snapshot = collect_cluster_snapshot()
                 self._json(HTTPStatus.OK, dict(snapshot, diagnostics=_diagnostics_response(snapshot),
@@ -4497,9 +5663,37 @@ class TinyWatchHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": _safe_text(exc, 180)})
             return
+        if path == "/api/capacity":
+            if not self._require_session():
+                return
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            try:
+                self._json(HTTPStatus.OK, _capacity_forecasts(query.get("node", ["local"])[0]))
+            except (ValueError, OSError):
+                self._json(HTTPStatus.BAD_REQUEST, {"error": "Capacity history unavailable"})
+            return
         if path == "/api/services":
             if self._require_session():
                 self._json(HTTPStatus.OK, _service_response())
+            return
+        if path == "/api/flight":
+            if not self._require_session():
+                return
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            try:
+                self._json(HTTPStatus.OK, _flight_response(query.get("incident", [""])[0]))
+            except ValueError:
+                self._json(HTTPStatus.NOT_FOUND, {"error": "No retained flight record"})
+            return
+        if path == "/api/comparison":
+            if not self._require_session():
+                return
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            try:
+                self._json(HTTPStatus.OK, _change_comparison(query.get("node", ["local"])[0],
+                           _finite_value(query.get("center", [None])[0]), _finite_value(query.get("span", [1800])[0])))
+            except (ValueError, OSError):
+                self._json(HTTPStatus.BAD_REQUEST, {"error": "Comparison unavailable; check the time and retention window"})
             return
         if path == "/api/investigation":
             if not self._require_session():
@@ -4513,6 +5707,8 @@ class TinyWatchHandler(BaseHTTPRequestHandler):
                            float(query.get("start", [""])[0]), float(query.get("end", [""])[0]), partition))
             except (TypeError, ValueError, OverflowError) as exc:
                 self._json(HTTPStatus.BAD_REQUEST, {"error": _safe_text(exc, 180)})
+            except OSError:
+                self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "History unavailable; check diagnostics"})
             return
         if path == "/api/history":
             if not self._require_session():
@@ -4536,6 +5732,8 @@ class TinyWatchHandler(BaseHTTPRequestHandler):
                 self._json(HTTPStatus.OK, _history_response(node_id, metric, range_name, interface[:120], start, end, partition))
             except (KeyError, TypeError, ValueError, OverflowError) as exc:
                 self._json(HTTPStatus.BAD_REQUEST, {"error": _safe_text(exc, 180)})
+            except OSError:
+                self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "History unavailable; check diagnostics"})
             return
         self._json(HTTPStatus.NOT_FOUND, {"error": "未找到"})
 
@@ -4621,6 +5819,17 @@ class TinyWatchHandler(BaseHTTPRequestHandler):
                 pass
             self._json(HTTPStatus.OK, {"ok": True}, {"Set-Cookie": _session_cookie("", 0)})
             return
+        if path == "/api/alerts/preview":
+            if not PREVIEW_LOCK.acquire(blocking=False):
+                self._json(HTTPStatus.TOO_MANY_REQUESTS, {"error": "A rule preview is already running"})
+                return
+            try:
+                self._json(HTTPStatus.OK, _preview_rule(value))
+            except (ValueError, OSError) as exc:
+                self._json(HTTPStatus.BAD_REQUEST, {"error": _safe_text(exc, 180)})
+            finally:
+                PREVIEW_LOCK.release()
+            return
         if path == "/api/services":
             try:
                 self._json(HTTPStatus.OK, _save_services(value))
@@ -4678,7 +5887,7 @@ class TinyWatchHandler(BaseHTTPRequestHandler):
     def _save_config(self, value):
         with STORE.lock:
             previous = STORE.data
-            STORE.data = copy.deepcopy(previous)
+            STORE.data = _configuration_candidate(previous)
             try:
                 return self._apply_config(value)
             except Exception:
@@ -4692,6 +5901,9 @@ class TinyWatchHandler(BaseHTTPRequestHandler):
             raise ValueError("最多配置 %d 个远程资产" % MAX_ASSETS)
         if not isinstance(raw_widgets, list) or len(raw_widgets) > MAX_WIDGETS:
             raise ValueError("监控卡片最多 %d 张" % MAX_WIDGETS)
+        flight_enabled = value.get("flight_enabled", STORE.data.get("flight_enabled", False))
+        if not isinstance(flight_enabled, bool):
+            raise ValueError("Invalid flight recorder setting")
         retention_days = value.get("history_retention_days", _history_retention_days())
         if isinstance(retention_days, bool) or retention_days not in HISTORY_RETENTION_OPTIONS:
             raise ValueError("历史数据保留天数无效")
@@ -4742,6 +5954,11 @@ class TinyWatchHandler(BaseHTTPRequestHandler):
             STORE.data["widgets"] = widgets
             STORE.data["theme"] = theme
             STORE.data["history_retention_days"] = retention_days
+            STORE.data["flight_enabled"] = flight_enabled
+            if not flight_enabled:
+                for record in STORE.data.get("flight_records", []):
+                    if record["status"] == "recording":
+                        record["status"] = "stopped"
             removed_nodes = set(previous) - identifiers
             for node_id in removed_nodes:
                 STORE.data.get("node_fingerprints", {}).pop(node_id, None)
@@ -4755,6 +5972,7 @@ class TinyWatchHandler(BaseHTTPRequestHandler):
             for identity in removed_services:
                 STORE.data.get("service_states", {}).pop(identity, None)
                 STORE.data.get("service_history", {}).pop(identity, None)
+                STORE.mark_history_dirty()
             for incident in STORE.data.get("incidents", []):
                 if incident.get("status") == "active" and incident.get("node") in removed_nodes:
                     _resolve_incident(incident, time.time(), "asset_removed")
@@ -4804,13 +6022,52 @@ def main(argv=None):
     parser.add_argument("--host", default="127.0.0.1", help="listen address; use 0.0.0.0 for LAN access")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="HTTP listening port (default: %(default)s)")
     parser.add_argument("--data", default=str(default_store_path()), help="JSON database path (default: ~/.tinywatch/data.json)")
+    commands = parser.add_mutually_exclusive_group()
+    commands.add_argument("--backup", metavar="ZIP", help="export a backup and exit; stop the server first")
+    commands.add_argument("--restore-backup", metavar="ZIP", help="restore into a new --data directory and exit")
     parser.add_argument("--secure-cookie", action="store_true",
                         help="mark session cookies Secure when HTTPS is terminated by a trusted proxy")
     parser.add_argument("--version", action="version", version=APP_NAME + " " + APP_VERSION)
+    parser.add_argument("--probe-worker", choices=("asset", "service"), help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+    if args.probe_worker:
+        configuration = json.loads(sys.stdin.buffer.read(32768))
+        if not isinstance(configuration, dict):
+            parser.error("Invalid probe input")
+        result = (_remote_snapshot_direct(configuration) if args.probe_worker == "asset"
+                  else _probe_service_direct(configuration))
+        sys.stdout.write(json.dumps(result, ensure_ascii=False))
+        return 0
     if not 0 <= args.port <= 65535:
         parser.error("--port must be between 0 and 65535")
     global STORE, SETUP_TOKEN, SECURE_COOKIE, DETAILS_RUNNING
+    if args.restore_backup:
+        try:
+            restored = restore_backup(args.restore_backup, args.data)
+        except (OSError, ValueError, zipfile.BadZipFile, EOFError, KeyError, TypeError) as exc:
+            parser.error(str(exc))
+        print("Restored database: " + str(restored))
+        return 0
+    if args.backup:
+        output = Path(args.backup)
+        if not Path(args.data).is_file():
+            parser.error("Backup source database does not exist")
+        if output.exists():
+            parser.error("Backup destination already exists")
+        created = False
+        try:
+            with output.open("xb") as stream:
+                created = True
+                os.chmod(output, 0o600)
+                JsonStore(args.data).export_backup(stream)
+                stream.flush()
+                os.fsync(stream.fileno())
+        except (OSError, ValueError) as exc:
+            if created:
+                output.unlink(missing_ok=True)
+            parser.error(str(exc))
+        print("Backup saved: " + str(output))
+        return 0
     try:
         STORE = JsonStore(args.data)
         SETUP_TOKEN = secrets.token_urlsafe(24) if STORE.data.get("password") is None else None
@@ -4838,7 +6095,8 @@ def main(argv=None):
     DETAILS_RUNNING = True
     workers = [threading.Thread(target=_worker_entry, args=(name[len("tinywatch-"):], target, history_stop), name=name, daemon=True)
                for target, name in ((_details_sampler, "tinywatch-details"), (_service_sampler, "tinywatch-services"),
-                                    (_notification_sampler, "tinywatch-notifications"))]
+                                    (_notification_sampler, "tinywatch-notifications"), (_asset_sampler, "tinywatch-assets"),
+                                    (_flight_sampler, "tinywatch-flight"))]
     for worker in workers:
         worker.start()
     history_thread.start()

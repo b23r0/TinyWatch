@@ -23,10 +23,26 @@ Reports include retained host observations, process names/PIDs, readable login c
 
 ## Explicit outbound monitoring and notification targets
 
-Only authenticated administrators can configure service targets, maintenance windows and webhooks. Private/LAN targets are intentionally supported. Probes originate from the console host and expose no remote command facility. HTTP probes and webhooks disable environment proxy discovery, reject embedded URL credentials and do not follow redirects; HTTPS uses standard certificate verification. Socket timeouts do not provide a portable hard DNS deadline. Webhook URLs can contain secrets and remain in the protected JSON store; worker errors do not print them. A notification payload excludes collector observations and credentials. No test notification is sent during configuration.
+Only authenticated administrators can configure service targets, maintenance windows and webhooks. Private/LAN targets are intentionally supported. Probes originate from the console host and expose no remote command facility. HTTP probes and webhooks disable environment proxy discovery, reject embedded URL credentials and do not follow redirects; HTTPS uses standard certificate verification. Asset and service probes run in bounded disposable subprocesses so DNS resolution cannot occupy a slot indefinitely. Webhook delivery still has a socket timeout without a total DNS deadline. Webhook URLs can contain secrets and remain in the protected JSON store; worker errors do not print them. A notification payload excludes collector observations and credentials. No test notification is sent during configuration.
 
 ### Scheduled task tokens and sharded history
 
 Heartbeat job tokens authorize successful-run reports for one configured job only. They do not grant dashboard/agent access and are excluded from webhook payloads. Administrators can view the tokens; send them in `X-TinyWatch-Heartbeat`, never in URLs. Deleting a job invalidates its token. HTTP transport retains the existing trusted-network tradeoff.
 
 Back up the JSON index, backup index and daily history directory as one stopped-instance snapshot. Checksums detect accidental damage, not malicious modification by a user who can write the data directory. Thirty-two request slots and socket inactivity timeouts bound some resource use; they are not a general hard deadline for DNS resolution or slow-trickle traffic.
+
+### Preview and background recovery
+
+Rule previews and capacity forecasts require an administrator session and read retained observations without remote probes. Preview has a single-flight limit and bounded evaluation/output budgets. Worker diagnostics expose exception types, not exception messages or credentials. Asset collection now disables automatic environment/system proxies, matching service probes and webhooks.
+
+Schema-2 indices are intentionally rejected by older versions. Back up the complete data directory before upgrading; downgrade only with a compatible backup.
+
+## Downloaded backups
+
+Authenticated administrators can download a consistent ZIP containing configuration, credentials and both history generations. Backups are unencrypted. Restore is an offline command: it validates archive paths, size limits, manifests and checksums in a private staging directory, then publishes a new data directory. It never restores over an existing directory.
+
+## Run results and incident recordings
+
+Task tokens authorize start and completion reports, not command execution. Optional result messages are stored locally and escaped in the interface; avoid putting secrets in them. Run-ID deduplication is limited to retained records.
+
+Local incident recording is opt-in. Clips store resource measurements, bounded process information and collector error names. Process details can be sensitive and are included in full data backups. Recording APIs require an authenticated dashboard session; recordings are bounded and expire with history retention.

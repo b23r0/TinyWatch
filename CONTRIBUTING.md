@@ -41,7 +41,7 @@ Describe the user-visible change, its platform impact, and the verification perf
 ## Service/notification worker invariants
 
 - Slow collectors publish immutable cache entries under a short lock and run without the fast resource snapshot lock. Resource requests return the last detail sample with its original timestamp/error, or an explicit pending state.
-- Keep at most four outstanding probes, skip missed ticks, prefer oldest due work, and reject completions from edited/removed monitor configurations. Do not assume DNS has a portable hard timeout.
+- Keep at most four outstanding probes, skip missed ticks, prefer oldest due work, and reject completions from edited/removed monitor configurations. Keep DNS and response reads inside the disposable probe subprocess deadline; kill and reap timed-out children. Do not launch replacement work before the previous slot is released.
 - Probe success ratios describe sampled checks, not time-weighted uptime. Preserve bounded buckets and failure-gap semantics.
 - Deliver webhook transitions outside collector/store locks. Persist stable event IDs, finite retries and expiry. Receivers deduplicate; never claim exactly-once delivery.
 - Maintenance suppresses notifications, not collection or incident tracking. A held job must not starve other assets. Do not add arbitrary command execution to service monitors.
@@ -51,3 +51,19 @@ Describe the user-visible change, its platform impact, and the verification perf
 Keep legacy embedded-history loading, checksum-checked daily shard manifests, atomic index publication, and both generations' shard references intact. No cleanup may delete shards still referenced by the main or backup index. Configuration edits must preserve measurements when only presentation changes, reject stale service revisions, and roll back candidate state on persistence failure. Heartbeat jobs reuse incidents/maintenance and must not execute task commands or expose their token in notification payloads.
 
 Use an isolated data directory for migration and write-failure checks. Cover renamed monitors, stale revisions, shard recovery and heartbeat deadlines; do not use a running instance’s database.
+
+## Sampling and preview behavior
+
+Asset completions publish independently. Keep one request per asset, a bounded shared pool, monotonic retry scheduling, and configuration checks before accepting results. Browser requests must not wait for all remote hosts.
+
+Mark changed history dates for append, pruning, compaction and monitor deletion. Clear dirty dates only after the index commits; readers overlay uncommitted data. Schema 1 remains readable, while new writes use schema 2.
+
+Rule preview is read-only and uses past raw samples only. Do not infer sustained violations from compacted extrema, fill missing intervals with zero, or resolve simulated incidents across unknown data. Capacity estimates require sufficient coverage and stable capacity; keep refusal reasons visible.
+
+History readers pin immutable shard names before leaving the data lock. Cleanup must retain every pinned file. Cache entries are shared read-only; returned points must be copied. Configuration transactions may share immutable history rows, but heartbeat transactions must copy every bucket they update. Backup compression must run outside the data lock, and restore must validate in a new private staging directory before publication.
+
+Change comparison uses raw resource samples for medians and observed intervals for coverage. Do not treat compacted extrema as equally weighted samples or claim that metric changes establish causation. Service comparison must exclude buckets crossing a window boundary.
+
+Run IDs provide deduplication only while their records are retained. Preserve running entries within the per-task cap, keep timeout markers for late completions, and roll back run state with incident and history changes after a failed write. Legacy completion reports remain supported.
+
+Incident recording is local and opt-in. Reuse collector timestamps, preserve missing-data gaps, and keep both the memory ring and persisted clips bounded. The recorder never holds its ring lock while taking the store lock. Shutdown should flush pending frames without starting a new collector.

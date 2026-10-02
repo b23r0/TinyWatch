@@ -44,8 +44,8 @@ Python **3.10 or newer** is required. No build step is needed.
 | History | Date/time selection, chart axes, mouse/touch/keyboard inspection and collection gaps |
 | Alerts | Thresholds, historical baselines, acknowledgement, recovery and trigger context |
 | Investigation | Linked charts, change timeline, notes and offline HTML reports |
-| Services | HTTP/HTTPS and TCP checks, webhook notifications and maintenance windows |
-| Scheduled tasks | Success reports, missed-deadline alerts and recovery notifications |
+| Services | HTTP/HTTPS, TCP and TLS certificate checks, webhook notifications and maintenance windows |
+| Scheduled tasks | Start/success/failure reports, runtime limits, run history and recovery |
 | Diagnostics | Collector errors, sample age, worker status, write failures and notification backlog |
 
 The visible dashboard refreshes every 2.5 seconds; background tabs refresh every 30 seconds. The server records resource history and evaluates resource alerts every minute, including when no browser is open. Slow collectors refresh separately: processes every 10 seconds, disk/host details every 30 seconds, login/DNS details every 60 seconds.
@@ -56,6 +56,8 @@ The visible dashboard refreshes every 2.5 seconds; background tabs refresh every
 2. Sign in to the remote instance and copy its agent token from **Assets**.
 3. In the central instance, add the host name, address and token under **Assets**. An address such as `192.168.1.10:8765` uses HTTP; HTTPS URLs are also accepted.
 4. Add dashboard cards for that host.
+
+Hosts are sampled independently, with up to eight requests in flight and one per host. Successful hosts refresh approximately every five seconds while the dashboard is active, or once a minute when idle. Failures use backoff up to five minutes. Changing a host configuration resets its schedule; cached samples keep their source timestamp. A slow request does not delay completed hosts.
 
 Each node has one shared token. The central instance requests `/api/agent/metrics` with an `X-TinyWatch-Token` header and stores its own history. HTTP sends the token unencrypted; use it on a trusted network. HTTPS verifies certificates. Agent requests do not follow redirects.
 
@@ -81,13 +83,42 @@ Incidents survive restarts. Acknowledgement does not close an incident. Up to 32
 
 Recorded context includes the three busiest processes by CPU, recent readable login records, DNS count/source and collection errors. The timeline records observed reboots, system/interface/partition changes and new login records. These are sampled observations, not a complete audit log. Login timestamps in the timeline indicate when TinyWatch first observed the record.
 
+### Before and after a change
+
+In **Investigate & replay**, move the cursor to a deployment note or another change, then select **Compare around cursor**. Choose a window of 5, 30 or 120 minutes on each side. The comparison includes resource sample medians and peaks, service mean durations and failed-check counts, and incident transitions.
+
+Resource statistics use raw minute samples only; older compacted extrema are excluded. Percentage metric deltas are percentage points. Each side shows observed coverage, and a result is marked incomplete when coverage falls below 80% or the following window has not ended. Service statistics include failures and use only five-minute buckets fully inside the window; coverage is the span between observed checks in those buckets, not an uptime calculation. A change in metrics provides a lead for investigation, not proof that the deployment caused it.
+
+### Incident recordings
+
+Enable **local incident recording** in Settings. It is off by default. While enabled, a bounded memory buffer samples local resources every two seconds. A local incident saves up to five minutes before the trigger and continues for two minutes afterward. Open the recording from the incident card; charts share a cursor, and the process table shows the original process collector timestamp.
+
+The recorder reuses existing collectors and caches. Process values still refresh on their ten-second schedule, and disk values on their thirty-second schedule. It does not execute extra process commands for every frame. Recordings contain resource values (disk use is the most occupied partition), up to three CPU-intensive processes and collector error names; they do not contain DNS entries or login records.
+
+The ring holds at most 150 frames and 300,000 bytes of encoded samples. Stored clips are limited to 16, 211 frames each, and a 2 MiB budget, also subject to history retention. Oldest clips are removed when the budget is reached. Coverage measures recorded timestamps across the intended seven-minute window; missing values remain chart gaps. Frames are persisted at most every thirty seconds by the recorder, and can also be saved by other store writes. Graceful shutdown stops and flushes recordings; abrupt termination may lose recent frames. Remote incidents retain their ordinary trigger context.
+
+### Rule preview
+
+In the rule editor, choose a date/time interval and select **Preview rule** before saving. The result shows triggers, observed durations and intervals that could not be evaluated. Preview does not save rules, create incidents, send notifications or request remote metrics.
+
+Only retained raw samples are evaluated. Compacted extrema cannot reconstruct sustained threshold violations and are marked unknown. Baseline evaluation uses only earlier samples, excluding the preceding ten minutes; an active simulated incident keeps its triggering baseline. Offline/stale rules are unavailable because their decision history is not recorded. A seven-day preview can therefore have low coverage even when charts contain older points.
+
+One preview runs at a time. Intervals are limited to seven days, with a budget of 3,000 raw evaluations for baseline rules or 80,000 for fixed thresholds; choose a smaller interval or one host when needed. Results include at most 200 events across hosts. Unknown intervals make event durations incomplete, so the result is not an exact reconstruction of past alerts.
+
+### Disk capacity outlook
+
+Open disk details to view per-partition growth and estimated remaining days. The estimate uses the last seven days, requiring four days with samples in at least twelve distinct hours each, spanning at least three days. It uses the median of daily endpoint growth rates and rejects inconsistent trends.
+
+No remaining-time estimate is shown after a capacity change, a gap longer than six hours, stale samples, insufficient data, unstable growth, or when the result exceeds one year. Flat/decreasing usage is shown separately. Forecasts assume the current growth trend continues; they are not reserved capacity or a guarantee. Unix hosts also show inode usage where `statvfs` provides it.
+
 ## Service checks and notifications
 
-Open **Services** to configure up to 24 HTTP/HTTPS or TCP monitors. Checks run from the **central instance**, regardless of the associated host. Host association controls incident ownership and maintenance scope.
+Open **Services** to configure up to 24 HTTP/HTTPS, TCP or TLS certificate monitors. Checks run from the **central instance**, regardless of the associated host. Host association controls incident ownership and maintenance scope.
 
 - Interval: 30–3,600 seconds; socket timeout: 1–10 seconds; failure threshold: 1–10 consecutive checks. One successful check resolves the incident.
+- TLS certificate checks verify the hostname and certificate chain, display the expiry date, and alert when validity falls below the selected 7, 14 or 30 days. Invalid certificates fail the check; failed verification does not expose expiry details. Checks use the existing failure threshold, maintenance and notification settings.
 - HTTP checks compare an expected status code and optionally match literal UTF-8 text in the first 64 KiB. Redirects are rejected. TCP checks establish a connection only.
-- Four checks can run concurrently. Missed runs are skipped. DNS resolution can exceed the socket timeout and occupy a worker; diagnostics show overdue checks.
+- Four checks can run concurrently. Missed runs are skipped. Each probe runs in a disposable subprocess with a total deadline of its configured socket timeout plus two seconds, including process startup, DNS and response reads. Asset requests have a twelve-second deadline and eight slots.
 - Renaming preserves history. Interval, timeout and failure-threshold changes reset pending failure counts. Disabling closes the active incident. Changing the target, protocol, host or matching conditions resets that monitor's history.
 - Charts show mean probe duration and sampled success over the latest 24 hours. Failed checks contribute to both statistics. This is not a time-weighted uptime calculation. Each monitor retains up to 2,048 five-minute buckets, also subject to the configured retention.
 
@@ -105,26 +136,54 @@ Create up to 32 one-off windows for one host or all hosts, each lasting at most 
 
 ### Scheduled tasks
 
-Under **Services → Scheduled tasks**, add a job with an expected interval (1 minute–30 days) and grace period (0–7 days). The deadline starts at creation and restarts after each successful report. A missed deadline opens an incident; a successful report resolves it. Jobs use the same notifications and maintenance windows as service checks.
+Under **Services → Scheduled tasks**, add a job with an expected interval (1 minute–30 days), grace period (0–7 days), and maximum runtime (1 minute–7 days, default 60 minutes). Jobs use the existing incident, maintenance and notification settings. TinyWatch tracks reports; it does not execute tasks or parse cron expressions.
 
-After a successful run, report with that job's token:
+Use the task token in `X-TinyWatch-Heartbeat` for `POST /api/heartbeat`. Send a unique `run_id` for each execution:
 
-```bash
-curl --fail -X POST http://127.0.0.1:8765/api/heartbeat \
-  -H 'Content-Type: application/json' \
-  -H 'X-TinyWatch-Heartbeat: YOUR_TASK_TOKEN' \
-  --data '{"duration_ms":123}'
+```json
+{"event":"start","run_id":"backup-20261002-01"}
 ```
 
-Report only successful completion. Invalid tokens return 403; write failures return 503 and can be retried. Each accepted report counts as a new success. TinyWatch checks elapsed intervals; it does not parse cron expressions or execute tasks.
+```json
+{"event":"success","run_id":"backup-20261002-01","duration_ms":1234,"message":"Backup complete"}
+```
+
+Report a failed completion with `"event":"fail"` and the same run ID. Start and failure reports require an ID. Messages are optional and limited to 240 characters; no command output is collected automatically. When duration is omitted, the server measures elapsed time from the accepted start, or records zero for completion-only reports.
+
+A failure or exceeded runtime opens an incident. A success resolves the task incident and resets its expected-success deadline. While executions are running, their runtime limits replace the idle success-deadline check. Starting a task does not resolve an existing incident. Overlapping executions are marked; each job allows up to four simultaneous runs.
+
+Recent executions appear in an expandable table. Each task keeps up to 50 runs within retention, preserving running entries. Repeated reports of the same retained ID and state are idempotent; conflicting completed results are rejected. A timed-out run can accept a late success/failure and retains its timeout marker. After an ID is pruned, it no longer provides deduplication.
+
+The earlier `{"duration_ms":123}` format still reports success; every accepted report creates a separate completion entry. Invalid tokens return 403; invalid reports return 400; write failures return 503 and may be retried. Restarted instances check persisted starts for missed runtime limits.
 
 ## Data and backups
 
-Settings are stored in a JSON index. Resource samples, process context and service buckets are stored in daily JSONL files under `<data-file>.history/`. Shards are written before the index is atomically replaced. A previous index is kept at `<data-file>.bak`; cleanup preserves shards referenced by either index.
+**Settings → Download backup** exports a consistent ZIP while the server runs. The archive contains both index generations and their referenced history files, including stored credentials. Compression runs outside the data lock; referenced shards remain protected from cleanup until the archive is complete. A single browser export runs at a time.
+
+For command-line export, stop the instance first:
+
+```sh
+python3 tinywatch.py --data ./data/data.json --backup ./tinywatch-backup.zip
+```
+
+Restore into a **new directory** whose parent already exists, then start that instance:
+
+```sh
+python3 tinywatch.py --restore-backup ./tinywatch-backup.zip --data ./restored/data.json
+python3 tinywatch.py --data ./restored/data.json
+```
+
+Restore checks filenames, manifests and shard checksums before publishing the directory. It refuses an existing destination directory. Archives are limited to 512 MiB of uncompressed data, 750 files, 8 MiB per index and 128 MiB per shard. For larger stores, use the stopped-instance directory backup below. ZIP backups are not encrypted.
+
+History queries snapshot pending rows under the lock and read committed shards outside it. The shard cache holds up to eight files with a 32 MiB estimated object budget. Configuration changes share immutable history rows; heartbeat updates copy only the affected job buckets. Startup still loads retained history for compaction and baseline evaluation.
+
+Asset diagnostics distinguish initialization, connection failure, stale samples and normal operation, and show consecutive failures and the next scheduled attempt. Initializing nodes are unknown to offline rules until a request completes.
+
+Settings, task executions and bounded incident recordings are stored in a JSON index. Resource samples, process context and service buckets are stored in daily JSONL files under `<data-file>.history/`. Only changed dates are sorted and encoded during ordinary saves; retention, compaction and monitor removal also mark affected dates. Queries read selected days and overlay uncommitted samples. Shards are written before the index is atomically replaced. A previous index is kept at `<data-file>.bak`; cleanup preserves shards referenced by either index.
 
 **Stop TinyWatch before backing up, then copy the JSON file, `.bak` and the entire `.history/` directory together.** Protect these files: they contain tokens, host observations and configuration.
 
-Existing schema-1 databases with embedded history are read automatically and migrated on the next save. Older versions cannot read the new history manifest; do not downgrade against the migrated data. On startup, shard checksums are verified. A damaged generation is recovered from a valid backup; without one, startup stops.
+Schema-1 databases, including embedded history and the earlier shard manifest, are read automatically. The next save writes schema 2; older versions reject that index. Do not downgrade against the migrated data. On startup, shard checksums are verified. A damaged generation is recovered from a valid backup; without one, startup stops.
 
 Retention can be set to **1, 3, 7, 14 or 30 days**, with a default of 7. Reducing it removes expired history from both stored generations.
 
@@ -144,6 +203,8 @@ Retained values keep their actual timestamps. Charts preserve collection gaps an
 | `--port` | `8765` | HTTP port |
 | `--data` | `~/.tinywatch/data.json` | JSON index path |
 | `--secure-cookie` | Off | Mark session cookies Secure when HTTPS is provided by a reverse proxy |
+| `--backup ZIP` | — | Export a stopped-instance backup and exit |
+| `--restore-backup ZIP` | — | Validate and restore into a new data directory, then exit |
 | `--version` | — | Print version and exit |
 
 ```bash
@@ -152,6 +213,10 @@ python3 tinywatch.py --host 0.0.0.0 --port 8765
 ```
 
 `TINYWATCH_DATA` also sets the data path; `--data` takes precedence.
+
+### Worker recovery
+
+Diagnostics show progress, retries, the last exception type, and occupied/overdue request slots. Workers can retry three times within ten minutes, with backoff; a fourth failure stops the worker until a server restart. Exception messages that may contain targets or credentials are not exposed. Asset and service subprocesses are terminated and reaped after their deadlines. Replacement pools wait for existing requests to release their slots. Webhook delivery still uses socket timeouts rather than a subprocess deadline.
 
 ## Platform and deployment notes
 
@@ -177,6 +242,8 @@ python3 tinywatch.py --host 0.0.0.0 --port 8765
 | `GET /api/investigation` | Session; host and exact `start`/`end` interval, optional `partition` |
 | `POST /api/annotations` | Session; add `{node, timestamp, message}` or remove `{action: "remove", id}` |
 | `GET /api/diagnostics` | Session; host and monitor health |
+| `POST /api/alerts/preview` | Session; `{rule, start, end}`; read-only historical rule preview |
+| `GET /api/capacity?node=local` | Session; per-partition capacity forecasts |
 | `GET /api/agent/metrics` | `X-TinyWatch-Token`; local metrics |
 | `POST /api/heartbeat` | `X-TinyWatch-Heartbeat`; task success report |
 
